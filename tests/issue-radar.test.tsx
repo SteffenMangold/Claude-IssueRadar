@@ -143,6 +143,7 @@ function project(on: On, setup: Setup = {}): Project {
   on('session.surfaces', () => ({ value: setup.surfaces ?? ['desktop'] }))
   on('fs.read', () => ({ value: '{ "name": "issue-radar", "version": "9.9.9" }' }))
   on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
   on('prompt.fill', (_, e) => {
     draft = e.mode === 'append' ? draft + e.text : e.text
     filled.push(e.text)

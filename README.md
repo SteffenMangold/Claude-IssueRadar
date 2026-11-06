@@ -7,7 +7,7 @@
 A sidebar mod for [Claude Code](https://claude.com/claude-code) in the Claude desktop app.
 
 [![Claude Code mod](https://img.shields.io/badge/Claude_Code-mod-d97757?style=flat-square)](https://code.claude.com/docs)
-[![Version](https://img.shields.io/badge/version-0.1.0-30a46c?style=flat-square)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.1.1-30a46c?style=flat-square)](.claude-plugin/plugin.json)
 [![License](https://img.shields.io/badge/license-Apache_2.0-4c8ed9?style=flat-square)](LICENSE)
 [![Runs locally](https://img.shields.io/badge/GitHub-via_gh-8b8d98?style=flat-square)](#-privacy)
 
@@ -50,8 +50,9 @@ You need the GitHub CLI `gh`, signed in (`gh auth login`). The pane opens with t
 in a folder that resolves to a GitHub repository; `/issue-radar` or `/issues` opens it any time.
 
 > Built against the Claude Code function-hook declarations of 2.1.317 (the engine the desktop
-> app hosts). The `claude` CLI on the development machine is 2.1.207: it validates the manifest
-> but has no `claude plugin test`; the tests run on a CLI at least as new as the engine. The
+> app hosts), and validated (`--strict`) and tested with that engine's own CLI. An older CLI is
+> not enough: 2.1.207 validates the manifest but not the module the way the engine loads it, and
+> has no `claude plugin test`; check with a CLI at least as new as the engine. The
 > interface is German by default (`language` setting); where this README names something on
 > screen, the German label follows in parentheses.
 

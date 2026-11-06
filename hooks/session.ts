@@ -63,8 +63,8 @@ async function viaMcp($: EngineInterface, server: string, tool: string, args: Re
 async function viaTool($: EngineInterface, server: string, tool: string, args: Record<string, unknown>): Promise<DesktopCall> {
   try {
     // The laid types know the desktop's tools only after the first load; the input is `{ tool, ...arguments }`.
-    const call = $.tool.call as unknown as (input: Record<string, unknown>) => Promise<Record<string, unknown>>
-    const result = await call({ tool: `mcp__${server}__${tool}`, ...args })
+    // The engine requires `$.tool.call(...)` spelled at the call site: the cast goes on the argument and the result.
+    const result = (await $.tool.call({ tool: `mcp__${server}__${tool}`, ...args } as never)) as unknown as Record<string, unknown>
     if (typeof result['deny'] === 'string') return { ok: false, reason: result['deny'], text: '' }
     const text = typeof result['text'] === 'string' ? result['text'] : textOf((result['result'] as { content?: unknown } | undefined)?.content ?? result['result'])
     if (result['isError'] === true) return { ok: false, reason: text.slice(0, 160) || 'the tool reported an error', text }
