@@ -42,13 +42,16 @@ export type StartOutcome = {
 
 /** How long a quiet call may take before it counts as unanswered (A-F4: a desktop call never holds up a refresh). */
 export const QUIET_TIMEOUT_MS = 5_000
-/** How long the mcp route is left alone by quiet calls after it failed at transport level. */
+/** How long quiet calls leave one call's mcp route alone after it failed at transport level. */
 const MCP_RETRY_MS = 10 * 60_000
 
 /** The route that last started a session, for the spike notes; it no longer decides the order of the routes. */
 let knownRoute: DesktopRoute | null = null
-/** Until when quiet calls skip the mcp route, after it failed at transport level. */
-let mcpBrokenUntil = 0
+/**
+ * The calls whose mcp route failed at transport level, by `server/tool`: until when quiet calls skip that route, and
+ * what the failure said. Kept per call, so one server or tool the mod cannot reach never silences another (E19-1).
+ */
+const mcpBroken = new Map<string, { until: number; reason: string }>()
 
 export function routeInUse(): StartRoute {
   return knownRoute ?? 'none'
@@ -167,32 +170,54 @@ function timedOut(via: DesktopRoute, ms: number): DesktopCall {
   return { ok: false, reason: `no answer within ${ms} ms`, text: '', via, isTransport: true }
 }
 
+/** `ms` as the hour and minute of the engine's local time, for a reason that says until when. */
+function clockTime(ms: number): string {
+  const at = new Date(ms)
+
+  return `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+}
+
+export type QuietOptions = {
+  /** How long each attempt may take before it counts as unanswered; QUIET_TIMEOUT_MS when not given. */
+  timeoutMs?: number
+  /** Tries the mcp route even while an earlier transport failure holds it back: the spike measures the route itself. */
+  isMeasurement?: boolean
+}
+
 /**
  * Calls a desktop tool on the mod's own initiative (a refresh, tracking, an issue session reading itself): never an
- * approval card. `$.mcp.call` first, unless it failed at transport level in the last ten minutes; the typed route
- * only when `$.tool.check` answers `allow` for exactly this call. Each attempt is raced against `timeoutMs` on the
- * engine's clock; a timeout reads as no answer (`isTransport`), never as a session that is gone.
+ * approval card. `$.mcp.call` first, unless this very call (server and tool) failed there at transport level in the
+ * last ten minutes; the typed route only when `$.tool.check` answers `allow` for exactly this call. Each attempt is
+ * raced against the timeout on the engine's clock; a timeout reads as no answer (`isTransport`), never as a session
+ * that is gone. A skipped mcp route is named in the reason.
  */
-export async function quietDesktop($: EngineInterface, server: string, tool: string, args: Record<string, unknown>, timeoutMs = QUIET_TIMEOUT_MS): Promise<DesktopCall> {
+export async function quietDesktop($: EngineInterface, server: string, tool: string, args: Record<string, unknown>, options: QuietOptions = {}): Promise<DesktopCall> {
+  const timeoutMs = options.timeoutMs ?? QUIET_TIMEOUT_MS
   const now = await $.clock.now()
-  let first: DesktopCall | null = null
-  if (now >= mcpBrokenUntil) {
+  const key = `${server}/${tool}`
+  const broken = mcpBroken.get(key)
+  let mcpSaid: string
+  if (broken === undefined || now >= broken.until || options.isMeasurement === true) {
     const answer = await withTimeout($, viaMcp($, server, tool, args), timeoutMs)
     if (answer === TIMED_OUT) return timedOut('mcp', timeoutMs)
-    if (answer.ok || !answer.isTransport) return answer
-    mcpBrokenUntil = now + MCP_RETRY_MS
-    first = answer
-  }
+    if (answer.ok || !answer.isTransport) {
+      // The app answered on this route: whatever held it back is over.
+      mcpBroken.delete(key)
+
+      return answer
+    }
+    mcpBroken.set(key, { until: now + MCP_RETRY_MS, reason: answer.reason })
+    mcpSaid = `mcp: ${answer.reason}`
+  } else mcpSaid = `mcp skipped until ${clockTime(broken.until)} after a transport failure (${broken.reason})`
   const verdict = await $.tool.check({ tool: `mcp__${server}__${tool}`, input: args }).catch(() => null)
   const decision = verdict?.decision ?? 'none'
   if (decision !== 'allow') {
-    const why = `the typed route would ${decision === 'none' ? 'not be decided' : decision}`
-
-    return { ok: false, reason: first === null ? why : `mcp: ${first.reason}; ${why}`, text: '', via: 'none', isTransport: true }
+    return { ok: false, reason: `${mcpSaid}; the typed route would ${decision === 'none' ? 'not be decided' : decision}`, text: '', via: 'none', isTransport: true }
   }
   const answer = await withTimeout($, viaTool($, server, tool, args), timeoutMs)
+  if (answer === TIMED_OUT) return timedOut('tool', timeoutMs)
 
-  return answer === TIMED_OUT ? timedOut('tool', timeoutMs) : answer
+  return answer.ok || !answer.isTransport ? answer : { ...answer, reason: `${mcpSaid}; tool: ${answer.reason}` }
 }
 
 /** Reads the new session's id out of what the app answered: a structured field first, then the text. */
@@ -264,16 +289,41 @@ export async function detachSession($: EngineInterface, sessionId: string, conse
 
 export type SessionLook = { exists: true; isArchived: boolean; title: string; link: string | null; state: string } | { exists: false }
 
+/** What the app says of a thing that is not there, after an optional `is`, `was` or `has been`. */
+const GONE = String.raw`(?:(?:is|was|has been) )?(?:not found|could not be found|cannot be found|can't be found|does not exist|doesn't exist|no longer exists|deleted)\b`
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Whether the app's error text says that the session asked about does not exist: "Session local_x not found.",
+ * "No such session", "Unknown session id local_x", "local_x does not exist", "Could not find session local_x". Any
+ * other failure ("An unknown error occurred while reading the session list", "Not found." alone, a refusal) does not:
+ * releasing a mapping on it would let the next press start a second live session for the issue.
+ */
+export function saysSessionGone(text: string, sessionId: string): boolean {
+  const said = text.replace(/\s+/g, ' ')
+  if (/\b(?:no such|unknown) session(?:[ _-]?id)?\b|\bno session (?:with|named|found|matching|exists)\b|\b(?:could not|couldn't|cannot|can't) find (?:a |the )?session\b/i.test(said)) {
+    return true
+  }
+  const id = sessionId === '' ? '' : escapeRegExp(sessionId)
+  const named = id === '' ? '' : String.raw`(?: ["'\`]?${id}["'\`]?)?`
+  // "session" as the subject, with nothing but this session's id between it and the words for gone.
+  if (new RegExp(String.raw`\bsession(?: with)?(?: (?:id|session_id|sessionId))?${named}:? ${GONE}`, 'i').test(said)) return true
+
+  // This session's id as the subject.
+  return id !== '' && new RegExp(String.raw`["'\`]?${id}["'\`]?:? ${GONE}`, 'i').test(said)
+}
+
 /** What the app knows about a session the pane started, read for a press. */
 export async function lookUpSession($: EngineInterface, sessionId: string, consent?: string): Promise<SessionLook> {
   const answer = await callDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: sessionId }, consent)
   if (!answer.ok) {
-    const said = answer.reason.toLowerCase()
     // A failure of the call itself (no such server or tool, a refused route, no answer) says nothing about the
-    // session; only the app's answer about the session releases it. Anything else keeps the mapping.
-    const aboutTransport = answer.isTransport || /\b(server|tool|route|connect|permission)/.test(said)
-    const saysMissing = said.includes('not found') || said.includes('unknown') || said.includes('no session') || said.includes('does not exist')
-    if (!aboutTransport && saysMissing) return { exists: false }
+    // session; only the app's own answer that this session is gone releases it. Anything else keeps the mapping.
+    const aboutTransport = answer.isTransport || /\b(server|tool|route|connect|permission)/i.test(answer.reason)
+    if (!aboutTransport && saysSessionGone(answer.text === '' ? answer.reason : answer.text, sessionId)) return { exists: false }
 
     return { exists: true, isArchived: false, title: '', link: null, state: 'unknown' }
   }

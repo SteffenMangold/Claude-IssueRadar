@@ -1,19 +1,23 @@
 // Batch 0, the foundation: the two desktop routes, the refresh reasons and
 // the background gate, mappings read per refresh and per click, GraphQL's
 // core, the missing-scope state, drawn text made safe, and two V1 fixes.
+import type { EngineInterface } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import { renderBrief } from '../hooks/brief'
 import { classify, scopeIn } from '../hooks/github'
 import type { GhResult } from '../hooks/github'
 import { classifyGraph, graphErrors, graphqlArgs, operationOf, readGraph } from '../hooks/graph'
-import { isTransportText } from '../hooks/session'
-import { clean } from '../hooks/text'
+import { strings } from '../hooks/i18n'
+import { isTransportText, quietDesktop, saysSessionGone } from '../hooks/session'
+import { clean, cleanLine } from '../hooks/text'
 import { offerToast, takeToast } from '../hooks/toasts'
 import { prLabel } from '../hooks/view'
-import { ISSUES, NOW, PANE, ROW_42, SECTION, command, count, issueView, mcpText, project, ran, started, tick } from './harness'
+import type { McpAnswer } from './harness'
+import { ISSUES, NOW, PANE, REPO, ROW_42, SECTION, command, count, issueView, mcpText, project, ran, started, tick } from './harness'
 
 const MAPPED = { [`session:${ROW_42}`]: { sessionId: 'local_abc123', title: '#42 Export fails', startedAt: 1, startedFrom: 'local_pane', detached: true } }
+const DE = strings('de')
 const SCOPE_WALL =
   "GraphQL: Your token has not been granted the required scopes to execute this query. The 'id' field requires one of the following scopes: ['read:project'], but your token has only been granted the: ['gist', 'read:org', 'repo', 'workflow'] scopes."
 const CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/
@@ -22,6 +26,28 @@ type DebugLast = { reason: string }
 
 function lastReason(store: Map<string, unknown>): string | undefined {
   return (store.get('debug:last') as DebugLast | undefined)?.reason
+}
+
+/**
+ * Just what `quietDesktop` touches of `$`, for a unit test of its own bookkeeping: a clock standing at `now` whose
+ * timers never fire, an mcp route `answer` decides ('throw' for a server the engine cannot reach), every check 'ask'.
+ */
+function quietEngine(now: number, answer: (server: string, tool: string) => McpAnswer['value'] | 'throw', calls: string[]): EngineInterface {
+  const fake = {
+    clock: { now: async () => now, after: () => ({ cancel: () => undefined }) },
+    mcp: {
+      call: async (server: string, tool: string) => {
+        calls.push(`${server}/${tool}`)
+        const given = answer(server, tool)
+        if (given === 'throw') throw new Error(`MCP server "${server}" is not connected`)
+
+        return given
+      },
+    },
+    tool: { check: async () => ({ decision: 'ask' }), call: async () => ({ deny: 'no such tool' }) },
+  }
+
+  return fake as unknown as EngineInterface
 }
 
 // Desktop routes ---------------------------------------------------------
@@ -45,6 +71,31 @@ test('a refusal the app answers on the mcp route is the result: no typed retry, 
   expect(toolCalls).toHaveLength(0)
   expect(store.get(`session:${ROW_42}`)).toBeDefined()
   expect(toasts).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('an app error that does not say the session is gone keeps the mapping, so no second session starts', async ($, on) => {
+  const { store, mcp, toolCalls, toasts } = project(on, {
+    stored: MAPPED,
+    mcp: call => {
+      if (call.tool === 'open_session_in') return mcpText('Refused: this session did not start that one; nothing changed.', true)
+      if (call.tool === 'get_session') return mcpText('An unknown error occurred while reading the session list. Try again.', true)
+
+      return mcpText('ok')
+    },
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `work:${ROW_42}` })
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(mcp.filter(call => call.tool === 'get_session')).toHaveLength(2)
+  expect(mcp.find(call => call.tool === 'start_session')).toBeUndefined()
+  expect(toolCalls).toHaveLength(0)
+  expect((store.get(`session:${ROW_42}`) as { sessionId: string }).sessionId).toBe('local_abc123')
+  expect(String((await ui.find({ key: `work:${ROW_42}` }))?.props['label'])).toBe('Zur Session')
+  // Each press says the session runs and where to open it; none says it is gone.
+  expect(toasts).toEqual([DE.openElsewhere('#42 Export fails'), DE.openElsewhere('#42 Export fails')])
   await ui.unmount()
 })
 
@@ -171,6 +222,46 @@ test('a quiet read the app does not answer in time gives up without trying anoth
   expect(text).toContain('no answer within 5000 ms')
 })
 
+test("the spike's quiet read measures the mcp route every time, even right after a transport failure there", async ($, on) => {
+  const { mcp, toolCalls } = project(on, {
+    mcp: call => {
+      if (call.tool === 'get_session' && call.args['session_id'] === 'self') return mcpText('MCP server "ccd_session_mgmt" is not connected', true)
+
+      return call.tool === 'start_session' ? mcpText('Started session local_abc123.') : mcpText('ok')
+    },
+  })
+  await started($, on)
+
+  await command($, 'issue-radar', 'spike')
+  const again = await command($, 'issue-radar', 'spike')
+  expect(mcp.filter(call => call.tool === 'get_session' && call.args['session_id'] === 'self')).toHaveLength(2)
+  expect(toolCalls.filter(call => call['tool'] === 'mcp__ccd_session_mgmt__get_session')).toHaveLength(0)
+  expect(again).toContain('get_session self (quiet): not read (mcp: MCP server "ccd_session_mgmt" is not connected; the typed route would ask)')
+})
+
+test('a transport failure holds back the mcp route of that one call only, and a skipped route says so', async () => {
+  // Names of their own: this file's copy of the module keeps its back-off from test to test.
+  const calls: string[] = []
+  const answer = { content: [{ type: 'text' as const, text: '{"id":"x"}' }], isError: false }
+  const $ = quietEngine(NOW, server => (server === 'bo_sidebar' ? 'throw' : answer), calls)
+
+  const failed = await quietDesktop($, 'bo_sidebar', 'list_groups', {})
+  expect(failed.ok ? 'answered' : failed.reason).toBe('mcp: MCP server "bo_sidebar" is not connected; the typed route would ask')
+  // Another server, and another tool of the same server, still go over mcp.
+  expect((await quietDesktop($, 'bo_mgmt', 'get_session', { session_id: 'self' })).ok).toBe(true)
+  expect((await quietDesktop($, 'bo_sidebar', 'list_sections', {})).ok).toBe(false)
+  expect(calls).toEqual(['bo_sidebar/list_groups', 'bo_mgmt/get_session', 'bo_sidebar/list_sections'])
+
+  // The call that failed skips mcp for ten minutes and names the skip; a measurement tries it anyway.
+  const skipped = await quietDesktop($, 'bo_sidebar', 'list_groups', {})
+  expect(calls).toHaveLength(3)
+  expect(skipped.ok ? 'answered' : skipped.reason).toMatch(/^mcp skipped until \d\d:\d\d after a transport failure \(MCP server "bo_sidebar" is not connected\); the typed route would ask$/)
+  await quietDesktop($, 'bo_sidebar', 'list_groups', {}, { isMeasurement: true })
+  expect(calls).toHaveLength(4)
+  await quietDesktop(quietEngine(NOW + 10 * 60_000, () => answer, calls), 'bo_sidebar', 'list_groups', {})
+  expect(calls).toHaveLength(5)
+})
+
 // Reasons, the background gate, mappings ---------------------------------
 
 test('the ↻ press runs as press, a consent and a retry as manual', async ($, on) => {
@@ -265,6 +356,46 @@ test('the timer refreshes only while the pane is shown', async ($, on) => {
   expect(count(argv, 'issue', 'list')).toBe(2)
 })
 
+test('the timer fetches nothing while no pane was ever opened', { options: { openAtStart: false } }, async ($, on) => {
+  const { argv, opened } = project(on)
+  const clock = await started($, on)
+  expect(opened).toHaveLength(0)
+  expect(count(argv, 'issue', 'list')).toBe(1)
+
+  await tick(clock, 2)
+  expect(count(argv, 'issue', 'list')).toBe(1)
+})
+
+test('the timer fetches nothing once the pane is closed with ✕', async ($, on) => {
+  const { argv, closed } = project(on)
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'close' })
+  await ui.unmount()
+  expect(closed).toEqual(['issue-radar'])
+  const before = count(argv, 'issue', 'list')
+
+  await tick(clock, 2)
+  expect(count(argv, 'issue', 'list')).toBe(before)
+})
+
+test('a pane waiting for a surface is not shown, so the timer waits until the desktop places it', async ($, on) => {
+  let isAttached = false
+  const { argv } = project(on, { surfaces: [], open: () => (isAttached ? { value: { isPlaced: true } } : { value: { isPlaced: false, reason: 'no-surface' } }) })
+  const clock = await started($, on)
+  expect(count(argv, 'issue', 'list')).toBe(1)
+  await tick(clock, 2)
+  expect(count(argv, 'issue', 'list')).toBe(1)
+
+  // The attach opens the pane again, which now places it: the attach refresh lists, and so does the next tick.
+  isAttached = true
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
+  await clock.advance(1_000)
+  expect(count(argv, 'issue', 'list')).toBe(2)
+  await tick(clock)
+  expect(count(argv, 'issue', 'list')).toBe(3)
+})
+
 test('a click reads the mapping from the store: one another pane wrote is opened, one it released is started afresh', async ($, on) => {
   const { store, mcp } = project(on)
   await started($, on)
@@ -283,12 +414,42 @@ test('a click reads the mapping from the store: one another pane wrote is opened
   await ui.unmount()
 })
 
+test('a session whose mapping the store refused is opened on the next press, never started twice, and stored once the store takes it', async ($, on) => {
+  let isFull = true
+  const { store, mcp } = project(on, { storeRefuses: key => isFull && key.startsWith('session:') })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(store.get(`session:${ROW_42}`)).toBeUndefined()
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(mcp.filter(call => call.tool === 'start_session')).toHaveLength(1)
+  expect(mcp.filter(call => call.tool === 'open_session_in')).toHaveLength(1)
+
+  // A refresh keeps it while the store still refuses, and writes it once the store takes it again.
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect(String((await ui.find({ key: `work:${ROW_42}` }))?.props['label'])).toBe('Zur Session')
+  isFull = false
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect(store.get(`session:${ROW_42}`)).toMatchObject({ sessionId: 'local_abc123', startedFrom: 'local_pane', detached: true })
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(mcp.filter(call => call.tool === 'start_session')).toHaveLength(1)
+  expect(mcp.filter(call => call.tool === 'open_session_in')).toHaveLength(2)
+  await ui.unmount()
+})
+
 test('a refresh reads the mappings from the store, and every open of the pane uses the one composed title', async ($, on) => {
   const { store, titles } = project(on, { surfaces: [], open: () => ({ value: { isPlaced: false, reason: 'no-surface' } }) })
   const clock = await started($, on)
   await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
   await clock.advance(1_000)
-  expect(titles).toEqual(['Issues', 'Issues'])
+  await command($, 'issue-radar')
+  await clock.advance(1_000)
+  // The start, the attach and /issue-radar. The composed title equals the bare one until E5 adds its count, so this
+  // pins the three opens only; E5's test asserts the count in each of them.
+  expect(titles).toEqual(['Issues', 'Issues', 'Issues'])
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(String((await ui.find({ key: `work:${ROW_42}` }))?.props['label'])).toBe('Bearbeiten')
 
@@ -308,10 +469,34 @@ test('a missing scope shows its own state with the command that grants it, on de
   for (const surface of ['desktop', 'terminal'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ type: 'Code', text: 'gh auth refresh -s read:project' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: DE.scopeEnv('github.com', 'read:project') })).toBeDefined()
+    expect(await ui.find({ text: /GH_ENTERPRISE_TOKEN/ })).toBeUndefined()
     expect(await ui.find({ key: `retry:${SECTION}` })).toBeDefined()
     expect(await ui.find({ key: `work:${ROW_42}` })).toBeUndefined()
     await ui.unmount()
   }
+})
+
+test('on GitHub Enterprise Server the missing-scope state names the host and GH_ENTERPRISE_TOKEN, on desktop and terminal', async ($, on) => {
+  const ghe = 'ghe.example.com/acme/widgets'
+  project(on, {
+    repo: () => ran(REPO.replace('https://github.com/acme/widgets', 'https://ghe.example.com/acme/widgets')),
+    gh: args => (args[0] === 'issue' && args[1] === 'list' ? ran('', 1, SCOPE_WALL) : undefined),
+  })
+  await started($, on)
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Code', text: 'gh auth refresh -h ghe.example.com -s read:project' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: DE.scopeEnv('ghe.example.com', 'read:project') })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /GH_ENTERPRISE_TOKEN/ })).toBeDefined()
+    expect(await ui.find({ text: /\bGH_TOKEN\b/ })).toBeUndefined()
+    expect(await ui.find({ key: `retry:${ghe}` })).toBeDefined()
+    await ui.unmount()
+  }
+  // A GHE.com tenancy reads GH_TOKEN, as github.com does.
+  expect(strings('en').scopeEnv('octo.ghe.com', 'read:project')).toBe('If the token comes from GH_TOKEN, that token needs the scope read:project.')
+  expect(strings('en').scopeEnv('ghe.example.com', 'read:project')).toBe('If the token comes from GH_ENTERPRISE_TOKEN, that token needs the scope read:project.')
 })
 
 test('control characters from GitHub never reach the drawing, on desktop and terminal', async ($, on) => {
@@ -347,6 +532,42 @@ test('control characters from GitHub never reach the drawing, on desktop and ter
   }
 })
 
+test('image-cell characters from GitHub never get the pane refused, on desktop and terminal', async ($, on) => {
+  // The kitty placeholder in a title, a title and a label that open with a kitty diacritic (U+0305), U+2800 before
+  // one in the body's excerpt, and a body whose fold and trim bare a leading diacritic in the opened row.
+  const issues = (JSON.parse(ISSUES) as Array<Record<string, unknown>>).map(issue =>
+    issue['number'] === 42
+      ? { ...issue, title: 'Export \u{10EEEE}fails for empty folders', labels: [{ name: '\u0305bug', color: 'd73a4a' }] }
+      : { ...issue, title: '\u0305Dark mode for the settings page' },
+  )
+  project(on, {
+    gh: args => {
+      if (args[0] === 'issue' && args[1] === 'list') return ran(JSON.stringify(issues))
+      if (args[0] === 'issue' && args[1] === 'view' && args[2] === '42') {
+        return ran(issueView(42, 'OPEN', { body: ' \u0305Look: \u2800\u0305 here', comments: [{ author: { login: '\u0305maintainer' }, createdAt: '2026-11-04T08:00:00Z', body: '\u2800\u0305 Can reproduce.' }] }))
+      }
+
+      return undefined
+    },
+  })
+  await started($, on)
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.drawn()).toMatchObject({ type: 'Box' })
+    expect(await ui.find({ type: 'Text', text: /^Export fails for empty folders$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Dark mode for the settings page$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Look: \u2800 here/ })).toBeDefined()
+    await ui.press({ key: `row-title:${ROW_42}` })
+    expect(await ui.drawn()).toMatchObject({ type: 'Box' })
+    expect(await ui.find({ type: 'Text', text: /^Look: \u2800 here$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /\u2800 Can reproduce\./ })).toBeDefined()
+    expect(await ui.find({ text: /\u{10EEEE}|\u2800\p{M}/u })).toBeUndefined()
+    await ui.press({ key: `row-title:${ROW_42}` })
+    await ui.unmount()
+  }
+})
+
 test("the opened row names a linked pull request '#n', never '#n ()', on desktop and terminal", async ($, on) => {
   project(on, {
     gh: args =>
@@ -375,6 +596,48 @@ test("the opened row names a linked pull request '#n', never '#n ()', on desktop
 test('clean keeps tab and newline and drops every other control character', () => {
   expect(clean('a\u001b[31mb\u0007c\r\nd\re\tf\u0085g\u007fh\u0000')).toBe('a[31mbc\nd\ne\tfgh')
   expect(clean('plain text, ümlauts and emoji 🚀')).toBe('plain text, ümlauts and emoji 🚀')
+})
+
+test('clean drops what image cells use: the placeholder, marks after U+2800 and leading marks, in an order that leaves no pair behind', () => {
+  expect(clean('Export \u{10EEEE}fails')).toBe('Export fails')
+  expect(clean('\u0305Export fails')).toBe('Export fails')
+  expect(clean('\u0300\u0305Export')).toBe('Export')
+  expect(clean('Look: \u2800\u0305\u030D here')).toBe('Look: \u2800 here')
+  expect(clean('\u2800\u0007\u0305 and \u2800\u{10EEEE}\u0305')).toBe('\u2800 and \u2800')
+  expect(clean('\u0007\u0305x')).toBe('x')
+  expect(clean('\u{10EEEE}\u0305')).toBe('')
+  // Marks after a base character are ordinary text, as is U+2800 on its own.
+  expect(clean('Café e\u0301 \u2800 ⠁')).toBe('Café e\u0301 \u2800 ⠁')
+  expect(cleanLine(' \u0305Look:\r\n\t\u2800\u0305  here ')).toBe('Look: \u2800 here')
+  expect(cleanLine(' \u0007 x')).toBe('x')
+})
+
+test('only an answer that says the session asked about is gone counts as gone', () => {
+  for (const gone of [
+    'Session local_abc123 not found.',
+    'session not found',
+    'No such session: local_abc123',
+    'Unknown session id local_abc123',
+    'No session with id local_abc123',
+    "Session 'local_abc123' does not exist.",
+    'The session with id local_abc123 could not be found.',
+    'local_abc123 does not exist',
+    'Could not find session local_abc123',
+    'Session local_abc123 was deleted.',
+  ]) {
+    expect({ text: gone, isGone: saysSessionGone(gone, 'local_abc123') }).toEqual({ text: gone, isGone: true })
+  }
+  for (const kept of [
+    'An unknown error occurred while reading the session list. Try again.',
+    'Unknown error',
+    'Not found.',
+    'Session list not found',
+    'Session local_abc123 is not on screen.',
+    'Refused: the cursor is in a text field; nothing changed.',
+    'Session local_other1 not found.',
+  ]) {
+    expect({ text: kept, isGone: saysSessionGone(kept, 'local_abc123') }).toEqual({ text: kept, isGone: false })
+  }
 })
 
 test('a GitHub Enterprise brief closes the issue as owner/name#n, the marker keeps the host', () => {

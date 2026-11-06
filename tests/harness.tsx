@@ -127,7 +127,7 @@ export type Setup = {
   stored?: Record<string, unknown>
   /** What `session.surfaces` answers; the default is a desktop. */
   surfaces?: RenderSurface[]
-  /** What `ui.open` answers; the default places the pane. */
+  /** What `ui.open` answers, asked at each open (so whether `$.ui.panes()` lists the pane as placed); the default places it. */
   open?: () => { value: UiOpenResult }
   /** What the desktop answers to `$.mcp.call`; the default starts and reports sessions. A throw stands for a server the engine cannot reach. */
   mcp?: (call: McpCall) => McpAnswer | Promise<McpAnswer>
@@ -137,8 +137,10 @@ export type Setup = {
   check?: (tool: string, input: unknown) => CheckDecision
   /** What `$.session.id()` answers; the default is 'local_pane'. */
   sessionId?: string
-  /** Whether the pane is shown at the start; the default is true. */
+  /** Whether a placed pane is shown at the start (not behind another tab); the default is true. */
   isShown?: boolean
+  /** Which `$.store.set` keys the store refuses, asked at each write (a store past 4 MiB rejects every write); none by default. */
+  storeRefuses?: (key: string) => boolean
 }
 
 export type Project = {
@@ -158,25 +160,36 @@ export type Project = {
   toolCalls: Record<string, unknown>[]
   /** Every `$.tool.check` query (not a typed call's own check). */
   checks: Array<{ tool: string; input: unknown }>
-  /** Shows or hides the pane, as `$.ui.panes()` reports it. */
+  /** The ids of every `ui.close`, in order. */
+  closed: string[]
+  /** Shows or hides a placed pane (another tab in front of it), as `$.ui.panes()` reports it. */
   setShown: (isShown: boolean) => void
 }
 
-/** A desktop session in a checkout of acme/widgets with two open issues. The test's hooks stand for the engine: the first registration of an event answers it. */
+/**
+ * A desktop session in a checkout of acme/widgets with two open issues. The test's hooks stand for the engine: the
+ * first registration of an event answers it. `$.ui.panes()` lists a pane as the engine does: only between its
+ * `ui.open` and its `ui.close`, placed as that open answered, and shown only while placed (and not hidden by
+ * `setShown(false)`); so a pane never opened, closed with ✕, or waiting on `no-surface` is not shown.
+ */
 export function project(on: On, setup: Setup = {}): Project {
   const store = new Map<string, unknown>(Object.entries(setup.stored ?? {}))
   const mcp: McpCall[] = []
   const opened: string[] = []
   const titles: string[] = []
+  const closed: string[] = []
   const filled: string[] = []
   const argv: string[][] = []
   const toasts: string[] = []
   const toolCalls: Record<string, unknown>[] = []
   const checks: Array<{ tool: string; input: unknown }> = []
+  /** The open panes by id: the title and whether the latest open placed them. */
+  const panes = new Map<string, { title: string; isPlaced: boolean }>()
   let isShown = setup.isShown ?? true
   let draft = ''
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
   on('store.set', (_, e) => {
+    if (setup.storeRefuses?.(e.key) === true) throw new Error('the store is over 4 MiB of JSON text')
     store.set(e.key, e.value)
 
     return { value: undefined }
@@ -191,11 +204,20 @@ export function project(on: On, setup: Setup = {}): Project {
   on('ui.open', (_, e) => {
     opened.push(e.id)
     titles.push(e.title ?? '')
+    const answer: { value: UiOpenResult } = setup.open === undefined ? { value: { isPlaced: true } } : setup.open()
+    panes.set(e.id, { title: e.title ?? e.id, isPlaced: answer.value.isPlaced })
 
-    return setup.open === undefined ? { value: { isPlaced: true } } : setup.open()
+    return answer
   })
-  on('ui.close', () => ({ value: undefined }))
-  on('ui.panes', () => ({ value: [{ id: 'issue-radar', title: 'Issues', isShown, isFocused: false, isPlaced: true }] }))
+  on('ui.close', (_, e) => {
+    closed.push(e.id)
+    panes.delete(e.id)
+
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({
+    value: [...panes].map(([id, pane]) => ({ id, title: pane.title, isShown: pane.isPlaced && isShown, isFocused: false, isPlaced: pane.isPlaced })),
+  }))
   on('ui.toast', (_, e) => {
     toasts.push(e.text)
 
@@ -265,6 +287,7 @@ export function project(on: On, setup: Setup = {}): Project {
     toasts,
     toolCalls,
     checks,
+    closed,
     setShown: value => {
       isShown = value
     },

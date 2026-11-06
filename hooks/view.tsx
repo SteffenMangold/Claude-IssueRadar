@@ -3,12 +3,13 @@
 // desktop gets tints, pills and an icon; the terminal the same layout in plain
 // text. Nothing here writes state: every press goes to an action. Every string
 // that came from GitHub, a model or the owner's settings goes through `clean`
-// before it is drawn: one control character would get the whole tree refused.
+// before it is drawn, as the last step: one control character or image-cell
+// mark would get the whole tree refused.
 import type { Elements, RenderElement, RenderSurface, Space } from 'claude-code'
 
 import type { IssueDetails, IssueRow, LinkedPr, Mapping, Options, Recap, RepoSettings, Section, StartRoute } from '../types'
 import type { Strings } from './i18n'
-import { clean } from './text'
+import { clean, cleanLine } from './text'
 
 type Table = Elements[keyof Elements]
 
@@ -286,7 +287,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         case 'missing-scope': {
           const scope = detail ?? 'read:project'
 
-          return [line(S.scopeMissing(scope), INK.warning), <Code source={S.scopeHint(host, scope)} language="bash" />, line(S.scopeEnv(scope), INK.muted), retry]
+          return [line(S.scopeMissing(scope), INK.warning), <Code source={S.scopeHint(host, scope)} language="bash" />, line(S.scopeEnv(host, scope), INK.muted), retry]
         }
         case 'no-access':
           return [line(S.noAccess(detail ?? label), INK.warning), retry]
@@ -426,7 +427,8 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         </Text>
       )
     }
-    const text = clean(details.body).replace(/\s+/g, ' ').trim()
+    // Cleaned after the fold as well: trimming a leading space could bare a combining mark, which gets a tree refused.
+    const text = cleanLine(details.body)
     const body = text === '' ? (details.excerpt === '' ? S.noBody : clean(details.excerpt)) : text.slice(0, 600)
 
     return (

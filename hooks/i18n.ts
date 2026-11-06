@@ -1,6 +1,13 @@
 // The pane's words in both languages. Code, the brief and the store stay English.
 import type { Language } from '../types'
 
+/** The variable gh reads a token from for `host`: GH_TOKEN for github.com and its ghe.com subdomains, GH_ENTERPRISE_TOKEN for an Enterprise Server. */
+function tokenVariable(host: string): string {
+  const name = host.toLowerCase()
+
+  return name === 'github.com' || name.endsWith('.ghe.com') ? 'GH_TOKEN' : 'GH_ENTERPRISE_TOKEN'
+}
+
 const DE = {
   title: 'Issues',
   radar: 'Radar',
@@ -41,7 +48,7 @@ const DE = {
   tokenInvalid: 'Das gh-Token wird von GitHub abgelehnt.',
   scopeMissing: (scope: string) => `Dem gh-Token fehlt der Scope ${scope}.`,
   scopeHint: (host: string, scope: string) => (host === 'github.com' ? `gh auth refresh -s ${scope}` : `gh auth refresh -h ${host} -s ${scope}`),
-  scopeEnv: (scope: string) => `Kommt das Token aus GH_TOKEN, braucht dieses Token den Scope ${scope}.`,
+  scopeEnv: (host: string, scope: string) => `Kommt das Token aus ${tokenVariable(host)}, braucht dieses Token den Scope ${scope}.`,
   noAccess: (repo: string) => `${repo} ist nicht erreichbar: nicht gefunden oder kein Zugriff.`,
   issuesDisabled: (repo: string) => `Issues sind für ${repo} deaktiviert.`,
   archived: (repo: string) => `${repo} ist archiviert.`,
@@ -125,7 +132,7 @@ const EN: typeof DE = {
   tokenInvalid: 'GitHub rejects the gh token.',
   scopeMissing: (scope: string) => `The gh token lacks the scope ${scope}.`,
   scopeHint: (host: string, scope: string) => (host === 'github.com' ? `gh auth refresh -s ${scope}` : `gh auth refresh -h ${host} -s ${scope}`),
-  scopeEnv: (scope: string) => `If the token comes from GH_TOKEN, that token needs the scope ${scope}.`,
+  scopeEnv: (host: string, scope: string) => `If the token comes from ${tokenVariable(host)}, that token needs the scope ${scope}.`,
   noAccess: (repo: string) => `${repo} is not reachable: not found or no access.`,
   issuesDisabled: (repo: string) => `Issues are disabled for ${repo}.`,
   archived: (repo: string) => `${repo} is archived.`,

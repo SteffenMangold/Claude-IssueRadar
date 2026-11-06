@@ -63,6 +63,12 @@ let settingsKey: string | null = null
 let myId = ''
 /** Rows whose "Work on it" is in flight, claimed synchronously so a double press starts one session. */
 const inFlight = new Set<string>()
+/**
+ * Mappings of sessions this pane started whose store write was refused (a full store): the store is otherwise the
+ * only memory of a mapping (A 6c), and without this a press would start a second session for the issue. Each refresh
+ * writes them again; the store wins as soon as it holds a mapping for the row.
+ */
+const unsaved = new Map<string, Mapping>()
 /** The heads of the briefs this session put into its own prompt box: sending one does not make this an issue session. */
 const ownBriefs = new Set<string>()
 
@@ -110,10 +116,17 @@ async function readStore<T>($: EngineInterface, key: string): Promise<T | undefi
   return value === undefined || value === null ? undefined : (value as T)
 }
 
-async function writeStore($: EngineInterface, key: string, value: unknown): Promise<void> {
-  await $.store.set(key, value).catch(error => {
+/** Writes one store key; false when the store refused it (a store past 4 MiB of JSON), which is logged and otherwise borne. */
+async function writeStore($: EngineInterface, key: string, value: unknown): Promise<boolean> {
+  try {
+    await $.store.set(key, value)
+
+    return true
+  } catch (error) {
     $.ui.log(`${PLUGIN}: store write failed for ${key}: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
-  })
+
+    return false
+  }
 }
 
 /** The settings as stored, each one missing or of the wrong type at its default; a stored spec is checked again before it reaches gh. */
@@ -142,8 +155,9 @@ function asMapping(value: unknown): Mapping | undefined {
 }
 
 /**
- * Every issue → session mapping in the store, mirrored into the state. Run at the session's start and on every
- * refresh: another pane (or this project's issue session) may have written or released one since (A 6c).
+ * Every issue → session mapping in the store, and those this pane could not write there, mirrored into the state. Run
+ * at the session's start and on every refresh: another pane (or this project's issue session) may have written or
+ * released one since (A 6c).
  */
 async function loadMappings($: EngineInterface): Promise<Record<string, Mapping>> {
   const keys = await $.store.keys().catch(() => [] as string[])
@@ -152,6 +166,14 @@ async function loadMappings($: EngineInterface): Promise<Record<string, Mapping>
     if (!key.startsWith('session:')) continue
     const value = asMapping(await readStore<unknown>($, key))
     if (value !== undefined) found[key.slice('session:'.length)] = value
+  }
+  // A mapping the store refused stays this pane's, and is written again, until the store holds one for its row.
+  for (const [rowKey, mapping] of unsaved) {
+    if (found[rowKey] === undefined) {
+      found[rowKey] = mapping
+      if (!(await writeStore($, storeKeyOf('session:', rowKey), mapping))) continue
+    }
+    unsaved.delete(rowKey)
   }
   await update($, mappings, current => {
     const next = { ...found }
@@ -168,24 +190,29 @@ async function loadMappings($: EngineInterface): Promise<Record<string, Mapping>
   return found
 }
 
-/** One row's mapping, read from the store for a click and mirrored into the state, so a press never acts on a stale copy. */
+/** One row's mapping, read from the store for a click (else the one the store refused) and mirrored into the state, so a press never acts on a stale copy. */
 async function reloadMapping($: EngineInterface, rowKey: string): Promise<Mapping | undefined> {
   const stored = asMapping(await readStore<unknown>($, storeKeyOf('session:', rowKey)))
+  if (stored !== undefined) unsaved.delete(rowKey)
+  const mapping = stored ?? unsaved.get(rowKey)
   await update($, mappings, current => {
     const next = { ...current }
-    if (stored === undefined) delete next[rowKey]
-    else next[rowKey] = stored
+    if (mapping === undefined) delete next[rowKey]
+    else next[rowKey] = mapping
 
     return next
   })
 
-  return stored
+  return mapping
 }
 
 async function saveMapping($: EngineInterface, rowKey: string, mapping: Mapping | null): Promise<void> {
   const key = storeKeyOf('session:', rowKey)
-  if (mapping === null) await $.store.delete(key).catch(() => undefined)
-  else await writeStore($, key, mapping)
+  if (mapping === null) {
+    unsaved.delete(rowKey)
+    await $.store.delete(key).catch(() => undefined)
+  } else if (await writeStore($, key, mapping)) unsaved.delete(rowKey)
+  else unsaved.set(rowKey, mapping)
   await update($, mappings, current => {
     const next = { ...current }
     if (mapping === null) delete next[rowKey]
@@ -813,6 +840,7 @@ async function resetStore($: EngineInterface): Promise<void> {
   }
   named.clear()
   backoffUntil.clear()
+  unsaved.clear()
   settingsKey = null
   await update($, sections, () => [])
   await update($, details, () => ({}))
@@ -843,8 +871,9 @@ async function runSpike($: EngineInterface, command: string): Promise<string> {
       lines.push(look.exists ? `get_session: state ${look.state || '?'}, title "${look.title}", archived ${look.isArchived}` : 'get_session: not found')
     }
   }
-  // The route the mod's own reads take (S1 for quiet calls) and what the app tells a session about itself (S4).
-  const self = await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: 'self' })
+  // The route the mod's own reads take (S1 for quiet calls) and what the app tells a session about itself (S4). A
+  // measurement: it tries mcp even while an earlier transport failure holds quiet calls back from it.
+  const self = await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: 'self' }, { isMeasurement: true })
   if (self.ok) {
     const keys = Object.keys(parseObject(self.structured, self.text))
     lines.push(`get_session self (quiet, via ${self.via}): ${keys.length === 0 ? 'no JSON' : `keys ${keys.slice(0, 40).join(', ')}`}`)
