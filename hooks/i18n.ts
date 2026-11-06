@@ -59,7 +59,8 @@ const DE = {
   error: (detail: string) => `gh meldet: ${detail}`,
   retry: 'Erneut prüfen',
   consentTitle: (repo: string) => `KI-Recaps für ${repo} einschalten?`,
-  consentDetail: 'Sendet Titel, Autor, Labels, bis zu 4.000 Zeichen des Issue-Texts und die letzten drei Kommentare jedes geänderten Issues über deine Session an Anthropic.',
+  consentDetail:
+    'Sendet Titel, Autor, Labels, bis zu 4.000 Zeichen des Issue-Texts und die letzten drei Kommentare jedes geänderten Issues über deine Session an Anthropic, für eine Kurzfassung und eine Einordnung (Art, Umfang, Lücken).',
   consentOn: 'Einschalten',
   consentOff: 'Nicht für dieses Repo',
   watchTitle: 'Weitere Repositories',
@@ -110,7 +111,7 @@ const DE = {
   noIdParsed: 'Session gestartet, aber ohne erkennbare Id: Doppelstart-Schutz für dieses Issue aus',
   paneOpened: 'Issue-Radar geöffnet.',
   paneWaits: (reason: string) => `Issue-Radar wartet: ${reason}`,
-  storeCleared: 'Issue-Radar-Speicher geleert (Cache, PR-Status, geschlossene und zugewiesene Issues, Recaps, Zuordnungen, Zustimmungen, Ansichten).',
+  storeCleared: 'Issue-Radar-Speicher geleert (Cache, PR-Status, geschlossene und zugewiesene Issues, Recaps, Zuordnungen, Zustimmungen, Ansichten, zuletzt Gesehenes).',
   unsupported: 'Diese Oberfläche zeigt keine Seitenleiste.',
   ago: { now: 'jetzt', m: 'm', h: 'h', d: 'd', w: 'w', mo: 'Mo' },
   // E14: filter, search, saved views
@@ -169,6 +170,25 @@ const DE = {
   closedPlain: 'geschlossen',
   closedAll: 'Alle geschlossenen auf GitHub',
   closedAsOf: (time: string) => `Stand ${time}`,
+  // E5: new since the last visit
+  marks: { new: 'neu', updated: 'geändert', reopened: 'wieder offen' },
+  unread: (n: number) => `${n} ungelesen`,
+  titleWithCount: (n: number) => (n > 0 ? `Issues (${n})` : 'Issues'),
+  sectionMarks: (n: number) => `● ${n}`,
+  arrivedOne: (ref: string, title: string) => `Neues Issue ${ref}: ${title}`,
+  arrivedMany: (n: number, refs: string) => `${n} neue Issues: ${refs}`,
+  // E9: triage
+  kinds: { bug: 'Bug', feature: 'Feature', question: 'Frage', other: 'Sonstiges' },
+  size: (size: string) => `Umfang ${size}`,
+  ready: 'bereit',
+  gapCount: (n: number) => (n === 1 ? '1 Lücke' : `${n} Lücken`),
+  criteriaUnclear: 'Kriterien unklar',
+  gapsTitle: 'Lücken',
+  // E4: hover card
+  cardBy: (author: string, age: string) => `von @${author} · ${age}`,
+  cardMilestone: (title: string) => `Meilenstein ${title}`,
+  cardComments: (shown: number, total: number) => `Letzte Kommentare (${shown} von ${total})`,
+  cardCommentsLater: (n: number) => (n === 1 ? '1 Kommentar · Zeile öffnen zum Lesen' : `${n} Kommentare · Zeile öffnen zum Lesen`),
 }
 
 const EN: typeof DE = {
@@ -222,7 +242,8 @@ const EN: typeof DE = {
   error: (detail: string) => `gh says: ${detail}`,
   retry: 'Check again',
   consentTitle: (repo: string) => `Switch on AI recaps for ${repo}?`,
-  consentDetail: 'Sends the title, author, labels, up to 4,000 characters of the body and the latest three comments of each changed issue to Anthropic through your session.',
+  consentDetail:
+    'Sends the title, author, labels, up to 4,000 characters of the body and the latest three comments of each changed issue to Anthropic through your session, for a recap and a triage guess (kind, size, gaps).',
   consentOn: 'Switch on',
   consentOff: 'Not for this repository',
   watchTitle: 'More repositories',
@@ -273,7 +294,7 @@ const EN: typeof DE = {
   noIdParsed: 'Session started, but its id could not be read: duplicate protection is off for this issue',
   paneOpened: 'Issue Radar opened.',
   paneWaits: (reason: string) => `Issue Radar waits: ${reason}`,
-  storeCleared: 'Issue Radar store cleared (cache, PR states, closed and assigned issues, recaps, mappings, consents, views).',
+  storeCleared: 'Issue Radar store cleared (cache, PR states, closed and assigned issues, recaps, mappings, consents, views, last-seen records).',
   unsupported: 'This surface draws no side pane.',
   ago: { now: 'now', m: 'm', h: 'h', d: 'd', w: 'w', mo: 'mo' },
   // E14: filter, search, saved views
@@ -332,6 +353,25 @@ const EN: typeof DE = {
   closedPlain: 'closed',
   closedAll: 'All closed issues on GitHub',
   closedAsOf: (time: string) => `as of ${time}`,
+  // E5: new since the last visit
+  marks: { new: 'new', updated: 'updated', reopened: 'reopened' },
+  unread: (n: number) => `${n} unread`,
+  titleWithCount: (n: number) => (n > 0 ? `Issues (${n})` : 'Issues'),
+  sectionMarks: (n: number) => `● ${n}`,
+  arrivedOne: (ref: string, title: string) => `New issue ${ref}: ${title}`,
+  arrivedMany: (n: number, refs: string) => `${n} new issues: ${refs}`,
+  // E9: triage
+  kinds: { bug: 'Bug', feature: 'Feature', question: 'Question', other: 'Other' },
+  size: (size: string) => `size ${size}`,
+  ready: 'ready',
+  gapCount: (n: number) => (n === 1 ? '1 gap' : `${n} gaps`),
+  criteriaUnclear: 'criteria unclear',
+  gapsTitle: 'Gaps',
+  // E4: hover card
+  cardBy: (author: string, age: string) => `by @${author} · ${age}`,
+  cardMilestone: (title: string) => `milestone ${title}`,
+  cardComments: (shown: number, total: number) => `Last comments (${shown} of ${total})`,
+  cardCommentsLater: (n: number) => (n === 1 ? '1 comment · open the row to read it' : `${n} comments · open the row to read them`),
 }
 
 export type Strings = typeof DE

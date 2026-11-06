@@ -55,6 +55,18 @@
       "title": "Assigned to me (all repositories)",
       "description": "Adds a collapsed section listing the open issues assigned to you in any repository, from GitHub search; fetched at most every 15 minutes while the pane is shown.",
       "default": false
+    },
+    "hoverCards": {
+      "type": "boolean",
+      "title": "Hover cards",
+      "description": "Show an issue's author, reactions, excerpt, latest comments, pull requests, relations and triage in a card while the pointer rests on its number (desktop).",
+      "default": true
+    },
+    "arrivalToasts": {
+      "type": "boolean",
+      "title": "Arrival toasts",
+      "description": "Show one toast per refresh when new issues arrive while the Issues pane is shown; the marks for new and updated issues stay either way.",
+      "default": true
     }
   }
 }

@@ -17,6 +17,10 @@ export type Options = {
   closedDays: number
   /** Whether the pane adds the collapsed "Assigned to me" section from GitHub search (E11). */
   assignedToMe: boolean
+  /** Whether resting the pointer on an issue's number shows its card (E4, desktop). */
+  hoverCards: boolean
+  /** Whether issues that arrive while the pane is shown raise one toast per refresh (E5); the marks stay either way. */
+  arrivalToasts: boolean
 }
 
 /** A GitHub repository as `gh repo view` resolved it. */
@@ -100,6 +104,9 @@ export type IssueTree = {
   blocking: IssueRef[]
 }
 
+/** An issue's reactions (E4): GitHub's content name (`THUMBS_UP`, `HEART`, …) to how many reacted; only those above 0. */
+export type Reactions = Record<string, number>
+
 /** One open issue as the list call returns it. */
 export type IssueRow = {
   number: number
@@ -114,6 +121,10 @@ export type IssueRow = {
   isPinned: boolean
   /** Its parent, sub-issues and blockers (E17); absent when it has none, or the host does not answer them. */
   relations?: IssueRelations
+  /** `REOPENED` on an open issue that was closed once (E5); absent otherwise. It stays for as long as the issue is open. */
+  stateReason?: string
+  /** Its reactions (E4); absent when it has none, and on rows stored before E4. */
+  reactions?: Reactions
 }
 
 /** A pull request that will close an issue, as gh's view names it; `state` is empty there (gh sends none). */
@@ -147,6 +158,8 @@ export type PrRecord = {
   rows: Record<string, PrLink[]>
   /** Issue number to how many pull requests reference it in all; only issues with at least one. */
   total: Record<string, number>
+  /** The signed-in account's login on the host, as the request answered it (E5: the owner's own new issues are no news). */
+  viewer?: string
 }
 
 /** The pull request the desktop app binds to an issue session (`ccd_pr` `get_status`); field names provisional (S14). */
@@ -210,6 +223,21 @@ export type RecapUsage = {
   cache_creation_input_tokens: number
 }
 
+export type TriageKind = 'bug' | 'feature' | 'question' | 'other'
+export type TriageSize = 'S' | 'M' | 'L'
+export type TriageCriteria = 'stated' | 'partial' | 'missing'
+
+/** E9: a small model's guess from the recap's own call: what the issue is, how large, how ready, what is missing. */
+export type Triage = {
+  kind: TriageKind
+  /** Null when the text allows no estimate. */
+  size: TriageSize | null
+  /** Whether the issue states acceptance criteria. */
+  criteria: TriageCriteria
+  /** At most three short phrases in the owner's language, each at most 60 characters. */
+  gaps: string[]
+}
+
 /** One recap, kept per issue and last-updated time. */
 export type Recap = {
   updatedAt: string
@@ -219,7 +247,35 @@ export type Recap = {
   usage: RecapUsage
   /** Set when the model gave no usable answer; `text` is then empty. */
   error?: string
+  /** What the recap call asked (E9): 2 also asks the triage; absent reads 1 (V1). */
+  v?: number
+  /** The language the recap and the gaps are in (C-E9-5); absent on V1 recaps. */
+  language?: Language
+  /** E9's triage; absent on V1 recaps and when the answer carried none that holds. */
+  triage?: Triage
 }
+
+/** E5: what the owner has seen of one repository, the store's `seen:<repoKey>`, shared by every session. */
+export type SeenRecord = {
+  v: 1
+  /** When it was last written (the local clock). */
+  at: number
+  /** The newest `createdAt` (GitHub's time) among the issues the owner has seen. */
+  newest: string
+  /** Issue number to the `updatedAt` (GitHub's time) the owner last saw it at; the most recently updated, bounded. */
+  rows: Record<string, string>
+  /** The issues the owner saw while GitHub called them reopened (E5-2: the reason stays while the issue is open). */
+  reopened?: Record<string, true>
+}
+
+/** E5: a marked row seen in a look; its mark fades ten minutes later unless the issue changes again. */
+export type Glimpse = { at: number; updatedAt: string }
+
+/** E5: why a row is marked. */
+export type Mark = 'new' | 'updated' | 'reopened'
+
+/** E5: the issue numbers of one repository this session has listed (each `true`). */
+export type ListedNumbers = Record<string, true>
 
 /** The issue session the pane started for an issue. */
 export type Mapping = {
@@ -435,6 +491,12 @@ declare module 'claude-code' {
       closedLoading: Record<string, number>
       /** E22: the last failure per repository key, drawn above the last good rows. */
       closedErrors: Shaped<Record<string, RepoState>>
+      /** E5: per repository key, the seen record as it stood when this session first listed it; marks compare against it. */
+      seenBase: Shaped<Record<string, SeenRecord>>
+      /** E5: per row key, when a look first saw the row's mark at its update time. */
+      glimpsed: Shaped<Record<string, Glimpse>>
+      /** E5: per repository key, the issue numbers this session has listed; an issue never listed before may be an arrival. */
+      listed: Shaped<Record<string, ListedNumbers>>
     }
   }
 }

@@ -3,9 +3,10 @@
 // token; every failure becomes a named state.
 import type { EngineInterface } from 'claude-code'
 
-import type { IssueComment, IssueDetails, IssueMeta, IssueProgress, IssueRef, IssueRelations, IssueRow, IssueTree, LinkedPr, RepoInfo, RepoState, RepoStateKind } from '../types'
+import type { IssueComment, IssueDetails, IssueMeta, IssueProgress, IssueRef, IssueRelations, IssueRow, IssueTree, LinkedPr, Reactions, RepoInfo, RepoState, RepoStateKind } from '../types'
 
-export const LIST_FIELDS = 'number,title,url,createdAt,updatedAt,author,labels,assignees,milestone,isPinned'
+/** A row's fields; `reactionGroups` (E4's card) and `stateReason` (E5's reopened mark) ride along, ~60 B a row, no extra call. */
+export const LIST_FIELDS = 'number,title,url,createdAt,updatedAt,author,labels,assignees,milestone,isPinned,reactionGroups,stateReason'
 /** What a row shows of an issue's relations (E17); gh pages blockers by 50, as the GraphQL row does. */
 export const LIST_RELATIONS = 'parent,subIssuesSummary,blockedBy'
 export const VIEW_FIELDS = 'number,state,body,comments,updatedAt,closedByPullRequestsReferences,url'
@@ -313,6 +314,28 @@ export function parseRelations(data: Json): IssueRelations | undefined {
   return { parent, subIssues, blockedBy: { open: open.length, total, refs: open.slice(0, 2) } }
 }
 
+/** GitHub's reaction contents, in the order its pages show them. */
+export const REACTIONS = ['THUMBS_UP', 'THUMBS_DOWN', 'LAUGH', 'HOORAY', 'CONFUSED', 'HEART', 'ROCKET', 'EYES'] as const
+
+/**
+ * An issue's reactions from `reactionGroups` (gh lists only the contents someone used, GraphQL all eight): content to
+ * count, the counts above 0 only; `users` is what gh asks, `reactors` GraphQL's newer name for the same count.
+ */
+export function reactionsOf(value: unknown): Reactions {
+  const found: Reactions = {}
+  if (!Array.isArray(value)) return found
+  for (const group of value) {
+    if (!isRecord(group)) continue
+    const content = asString(group['content']).toUpperCase()
+    if (!(REACTIONS as readonly string[]).includes(content)) continue
+    const users = group['users'] ?? group['reactors']
+    const count = countOf(isRecord(users) ? users['totalCount'] : undefined) ?? 0
+    if (count > 0) found[content] = count
+  }
+
+  return found
+}
+
 /** One row from an issue record whose labels and assignees are lists (gh) or connections (GraphQL). */
 function rowOf(data: Json): IssueRow | null {
   const number = Number(data['number'])
@@ -340,6 +363,11 @@ function rowOf(data: Json): IssueRow | null {
   }
   const relations = parseRelations(data)
   if (relations !== undefined) row.relations = relations
+  // Kept only when they say something, so the store holds nothing more for most rows (E4, E5).
+  const reason = str(data['stateReason']).toUpperCase()
+  if (reason !== '') row.stateReason = reason
+  const reactions = reactionsOf(data['reactionGroups'])
+  if (Object.keys(reactions).length > 0) row.reactions = reactions
 
   return row
 }

@@ -79,8 +79,11 @@ export function parsePrConnection(value: unknown): PrLinks {
   return { links: links.slice(0, PR_LINKS_MAX), total: Math.max(counted, links.length) }
 }
 
-/** A repository's record from one sweep over `numbers`: only issues with a linked pull request are kept. */
-export function recordOf(links: ReadonlyMap<number, PrLinks>, asOf: string, now: number): PrRecord {
+/**
+ * A repository's record from one sweep over `numbers`: only issues with a linked pull request are kept. `viewer`, the
+ * signed-in account the request answered for (E5), is kept when known.
+ */
+export function recordOf(links: ReadonlyMap<number, PrLinks>, asOf: string, now: number, viewer: string | null = null): PrRecord {
   const rows: Record<string, PrLink[]> = {}
   const total: Record<string, number> = {}
   for (const [number, found] of links) {
@@ -89,7 +92,7 @@ export function recordOf(links: ReadonlyMap<number, PrLinks>, asOf: string, now:
     total[String(number)] = found.total
   }
 
-  return { v: 1, fetchedAt: now, asOf, rows, total }
+  return viewer === null ? { v: 1, fetchedAt: now, asOf, rows, total } : { v: 1, fetchedAt: now, asOf, rows, total, viewer }
 }
 
 /**
@@ -142,7 +145,9 @@ export function asRecord(value: unknown): PrRecord | undefined {
     }
   }
 
-  return { v: 1, fetchedAt: value['fetchedAt'], asOf: asString(value['asOf']), rows, total }
+  const viewer = asString(value['viewer'])
+
+  return viewer === '' ? { v: 1, fetchedAt: value['fetchedAt'], asOf: asString(value['asOf']), rows, total } : { v: 1, fetchedAt: value['fetchedAt'], asOf: asString(value['asOf']), rows, total, viewer }
 }
 
 /**
@@ -262,6 +267,14 @@ export function prRefOf(pr: Pick<ShownPr, 'number' | 'repo'>, sectionRepo: strin
   const name = pr.repo.split('/')[1] ?? pr.repo
 
   return `${name.length > REPO_SHORT ? `${name.slice(0, REPO_SHORT - 1)}…` : name}#${pr.number}`
+}
+
+/** E4's card line for one pull request: `PR #57 · offen · Entwurf · Checks ✓`, the bare `PR #57` while its state is unknown. */
+export function prCardLine(pr: ShownPr, session: SessionPr | undefined, sectionRepo: string, S: Strings): string {
+  const words = prLine(pr, session, S)
+  const ref = S.prRef(prRefOf(pr, sectionRepo, true))
+
+  return words === '' ? ref : `${ref} · ${words}`
 }
 
 /** A chip's text and tone: `PR #57 · Entwurf`, or a neutral `PR #57` while the state is unknown. */

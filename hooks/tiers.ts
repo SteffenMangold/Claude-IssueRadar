@@ -75,6 +75,8 @@ export type TierOutcome =
       details: Map<number, IssueDetails>
       /** Every probed issue's pull requests, when the probe asked for them. */
       links: Map<number, PrLinks> | null
+      /** The signed-in account's login, asked with the pull requests (E5). */
+      viewer: string | null
       /** The newest update time the probe saw. */
       asOf: string
       /** The patched issues' pull requests. */
@@ -159,6 +161,7 @@ export async function runTiers($: EngineInterface, input: TierInput): Promise<Ti
     meta,
     details,
     links: probe.links,
+    viewer: probe.viewer,
     asOf: newest(probe.nodes.map(node => node.updatedAt)),
     patchedLinks,
     patchedAsOf: newest([...details.values()].map(found => found.updatedAt)),

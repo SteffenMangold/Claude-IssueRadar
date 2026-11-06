@@ -7,15 +7,20 @@
 // mark would get the whole tree refused.
 import type { Elements, RenderElement, RenderSurface, Space } from 'claude-code'
 
-import type { Boards, ClosedCache, ClosedRow, Facets, Filter, FilterGroup, FilterSort, Inbox, InboxRow, IssueDetails, IssueRef, IssueRow, Mapping, Options, PrRecord, Recap, RepoSettings, RepoState, Section, SessionPr, StartRoute } from '../types'
-import { BOARD_STATUS_CHARS, boardItemFor, boardOptions, matchesBoard } from './boards'
-import { CLOSED_LOADING_MS, CLOSED_SHOWN, closedCountLabel, sinceDate } from './closed'
-import { ANY, GROUPS, SORTS, VIEWS, cutText, groupRows, isBuiltInView, isDefaultFilter, matchesUrl, sanitizeQuery } from './filter'
+import type { Boards, ClosedCache, ClosedRow, Facets, Filter, FilterGroup, FilterSort, Glimpse, Inbox, InboxRow, IssueDetails, IssueRef, IssueRow, Mapping, Mark, Options, PrRecord, Reactions, Recap, RepoSettings, RepoState, SeenRecord, Section, SessionPr, StartRoute, Triage } from '../types'
+import { BOARD_STATUS_CHARS, boardItemFor, boardOptions } from './boards'
+import { CLOSED_LOADING_MS, closedCountLabel, sinceDate } from './closed'
+import { ANY, GROUPS, SORTS, VIEWS, cutText, isBuiltInView, isDefaultFilter, matchesUrl, sanitizeQuery } from './filter'
+import { REACTIONS, excerptOf } from './github'
 import type { Strings } from './i18n'
 import { INBOX_CAP } from './inbox'
-import { linksOf, prChip, prLine, prRefOf } from './prs'
+import { cardRowsOf, paneLayout, rowKeyOf, unreadCount, visibleMark } from './marks'
+import { linksOf, prCardLine, prChip, prLine, prRefOf } from './prs'
 import type { PrTone, ShownPr } from './prs'
 import { clean, cleanLine } from './text'
+import { labelSays } from './triage'
+
+export { rowKeyOf }
 
 type Table = Elements[keyof Elements]
 
@@ -46,6 +51,9 @@ export type ViewState = {
   closed: Record<string, ClosedCache>
   closedLoading: Record<string, number>
   closedErrors: Record<string, RepoState>
+  /** E5's baselines per repository key and the glimpses per row key: what the marks are drawn from. */
+  seenBase: Record<string, SeenRecord>
+  glimpsed: Record<string, Glimpse>
   options: Options
   strings: Strings
   opened: string
@@ -57,6 +65,8 @@ export type ViewState = {
   now: number
   columns: number
   rows: number
+  /** The first row of the tree the pane's window shows (E4's cards go to the rows near it). */
+  scrollOffset: number
   surface: RenderSurface
   route: StartRoute
 }
@@ -94,6 +104,8 @@ export type ViewActions = {
   showInSection: (rowKey: string) => void
   /** E22: a repository's "recently closed" header. */
   toggleClosed: (sectionKey: string) => void
+  /** E5: the title bar's unread pill marks every row of every section seen. */
+  markAllSeen: () => void
 }
 
 /** Text colors: the theme's own keys, so the pane follows the app's light or dark mode. */
@@ -141,8 +153,6 @@ const PR_HUE: Record<PrTone | 'neutral', string> = {
 
 /** A color of no ink: a border that keeps its room without showing. */
 const CLEAR = '#00000000'
-/** The most rows one drawing holds; the engine refuses a tree of more than 20,000 elements. */
-const ROW_BUDGET = 200
 /** How many label chips a row shows before the rest is counted; one fewer once another pill shows (plan 4.6). */
 const LABELS_SHOWN = 4
 /** The longest text a chip-line pill draws (plan 4.6). */
@@ -151,9 +161,31 @@ const PILL_CHARS = 24
 const PR_CHIPS = 2
 /** How many pull requests the opened row lists. */
 const PR_LINES = 3
+/** E4: the most characters one hover card holds; its body is cut last to stay within it (E4-1). */
+const CARD_CHARS = 600
+/** E4: no more cards once the drawing's text before a row (visible and hidden) passes this (E4-4: the tree draws 100,000). */
+const CARD_TEXT_STOP = 60_000
+/** E4: how many comments and pull requests a card lists, one line each. */
+const CARD_COMMENTS = 2
+const CARD_PRS = 2
+/** E4: reactions as emoji, the most first, at most four. */
+const REACTION_GLYPH: Record<string, string> = { THUMBS_UP: '👍', THUMBS_DOWN: '👎', LAUGH: '😄', HOORAY: '🎉', CONFUSED: '😕', HEART: '❤️', ROCKET: '🚀', EYES: '👀' }
+/** E9: the kind chip's hue. */
+const KIND_HUE: Record<Triage['kind'], string> = { bug: HUE.red, feature: HUE.blue, question: HUE.amber, other: HUE.gray }
 
-export function rowKeyOf(sectionKey: string, number: number): string {
-  return `${sectionKey}#${number}`
+/** E4: `👍 3 😄 1`, the most first (GitHub's order between equals), at most `max`; empty without reactions. */
+export function reactionsText(reactions: Reactions | undefined, max = 4): string {
+  return REACTIONS.map(content => ({ content, count: reactions?.[content] ?? 0 }))
+    .filter(found => found.count > 0)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, max)
+    .map(found => `${REACTION_GLYPH[found.content] ?? ''} ${found.count}`)
+    .join(' ')
+}
+
+/** `text` cut to `max` characters, an ellipsis marking the cut. */
+function cut(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text
 }
 
 /** `text` cut to the pill's room, an ellipsis marking the cut. */
@@ -230,13 +262,24 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const savedViews = settings.views ?? []
   /** E18's facet while the feature is on; empty keeps every row. */
   const boardFacet = settings.boards === true ? state.filter.board : ''
+  // The rows drawn, in order, within the row budget, and where each sits: the one rule a look (E5) and the cards (E4)
+  // read too, so they always agree with the drawing.
+  const { plan, tops } = paneLayout(state)
+  const planOf = new Map(plan.sections.map(drawn => [drawn.section.key, drawn]))
   /** E14-5: a section listed for another filter than the current one is drawn as loading until its own list comes. */
-  const isStale = (section: Section) => section.info !== null && section.state.kind === 'ok' && section.filterKey !== state.filterKey
+  const isStale = (section: Section) => planOf.get(section.key)?.isStale ?? false
   const listedOf = (section: Section): IssueRow[] => (isStale(section) ? [] : section.rows)
   /** The rows a section draws: its listed rows, those the board facet picks (E18). */
-  const shownOf = (section: Section): IssueRow[] =>
-    boardFacet === '' ? listedOf(section) : listedOf(section).filter(item => matchesBoard(state.boards.items[rowKeyOf(section.key, item.number)], boardFacet))
+  const shownOf = (section: Section): IssueRow[] => planOf.get(section.key)?.shown ?? []
   const isFiltered = (section: Section) => section.query !== undefined
+  // E4: the hover cards, desktop only, on the rows near the pane's window (never the first drawn), each within its
+  // characters and all of them while the drawing's text before a row stays well under the tree's 100,000 (E4-4).
+  const canHover = state.surface === 'desktop'
+  const cardKeys = new Set(canHover && options.hoverCards ? cardRowsOf(tops, state.scrollOffset, state.rows).map(found => found.key) : [])
+  let textSoFar = 0
+  // E5: every row's mark, and how many rows show one.
+  const markOfRow = (section: Section, item: IssueRow): Mark | null => visibleMark(item, state.seenBase[section.key], state.glimpsed[rowKeyOf(section.key, item.number)], state.now)
+  const unread = unreadCount(plan, state.seenBase, state.glimpsed, state.now)
   /** One line of words for a failed state, as the state blocks word it. */
   const stateText = (failed: RepoState): string => {
     const host = clean(failed.host ?? 'github.com')
@@ -318,6 +361,12 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           {S.title}
         </Text>
         {pill(S.radar, INK.brand, HUE.brand, true)}
+        {/* E5: how many rows are marked; a press marks every row of every section seen. A hover needs its keyed Box. */}
+        {unread > 0 && (
+          <Box key="tool:seen-all" flexShrink={0}>
+            <Button key="seen-all" plain label={S.unread(unread)} hover={{ color: INK.brand }} onPress={actions.markAllSeen} />
+          </Box>
+        )}
       </Box>
       <Box flexDirection="row" alignItems="center" columnGap={step('xs', 1)}>
         {tool('refresh', state.isRefreshing ? '…' : '↻', S.refresh, actions.refresh)}
@@ -650,16 +699,46 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   )
 
   /**
-   * The chip line (plan 4.6, line 2): E17's blocked pill, the labels (at most four, three once another pill shows,
-   * then `+n`), E17's progress and parent pills, the facts text last.
+   * E9: the triage a row shows, where the repository consented to recaps and the recap call brought one; while a newer
+   * recap is pending, the last one, drawn muted. Undefined where there is none to show.
    */
-  const chips = (section: Section, row: IssueRow, details: IssueDetails | undefined) => {
+  const triageOf = (section: Section, row: IssueRow, recap: Recap | undefined): { triage: Triage; isStale: boolean } | undefined => {
+    if (!options.recaps || settings.consent[section.key] !== true || recap === undefined || recap.error !== undefined || recap.triage === undefined) return undefined
+
+    return { triage: recap.triage, isStale: recap.updatedAt < row.updatedAt }
+  }
+
+  /** E9's chips: the kind (unless a label says it, never `other`), the size when known, and how ready the issue is. */
+  const triagePills = (section: Section, row: IssueRow, recap: Recap | undefined): RenderElement[] => {
+    const shown = triageOf(section, row, recap)
+    if (shown === undefined) return []
+    const { triage, isStale } = shown
+    const key = rowKeyOf(section.key, row.number)
+    const ink = (live: string) => (isStale ? INK.muted : live)
+    const parts: RenderElement[] = []
+    if (!labelSays(triage.kind, row.labels)) parts.push(keyedPill(`triage:${key}:kind`, S.kinds[triage.kind], ink(INK.text), KIND_HUE[triage.kind]))
+    if (triage.size !== null) parts.push(keyedPill(`triage:${key}:size`, S.size(triage.size), ink(INK.secondary), HUE.gray))
+    if (triage.gaps.length > 0) parts.push(keyedPill(`triage:${key}:readiness`, S.gapCount(triage.gaps.length), ink(INK.warning), HUE.amber))
+    else if (triage.criteria === 'stated') parts.push(keyedPill(`triage:${key}:readiness`, S.ready, ink(INK.success), HUE.green))
+    else parts.push(keyedPill(`triage:${key}:readiness`, S.criteriaUnclear, ink(INK.warning), HUE.amber))
+
+    return parts
+  }
+
+  /**
+   * The chip line (plan 4.6, line 2): E5's mark, E17's blocked pill, E18's board status, E9's triage, the labels (at
+   * most four, three once another pill shows, then `+n`), E17's progress and parent pills, the facts text last.
+   */
+  const chips = (section: Section, row: IssueRow, details: IssueDetails | undefined, recap: Recap | undefined) => {
     const key = rowKeyOf(section.key, row.number)
     const sectionRepo = repoOfSection(section)
     // Rows come from the store too: every part of the relations is read as possibly absent.
     const relations = row.relations
     const lead: RenderElement[] = []
     const tail: RenderElement[] = []
+    // E5: new or changed since the last visit; tests find it by key (E5-1).
+    const mark = markOfRow(section, row)
+    if (mark !== null) lead.push(keyedPill(`mark:${key}`, S.marks[mark], mark === 'new' ? INK.brand : INK.accent, mark === 'new' ? HUE.brand : HUE.blue))
     const open = relations?.blockedBy?.open ?? 0
     const firstBlocker = relations?.blockedBy?.refs?.[0]
     if (open > 0 && firstBlocker !== undefined) {
@@ -668,6 +747,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     // E18: the board status, right after the blocked pill: in the project the facet picked, else the first open project.
     const onBoard = settings.boards === true ? boardItemFor(state.boards.items[key], boardFacet) : null
     if (onBoard !== null && onBoard.status !== null) lead.push(keyedPill(`board:${key}`, S.boardChip(cutText(onBoard.status, BOARD_STATUS_CHARS)), INK.accent, HUE.blue))
+    lead.push(...triagePills(section, row, recap))
     const subIssues = relations?.subIssues ?? null
     if (subIssues !== null) {
       const isDone = subIssues.completed >= subIssues.total
@@ -862,13 +942,124 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     )
   }
 
-  const openedBlock = (section: Section, item: IssueRow, details: IssueDetails | undefined) => {
+  /** E4: who opened the issue and when, its milestone and its reactions: the card's first line and the opened row's. */
+  const bylineOf = (item: IssueRow): string => {
+    const parts = [S.cardBy(item.author, shortAgo(item.createdAt, state.now, S.ago))]
+    if (item.milestone !== null && item.milestone !== '') parts.push(S.cardMilestone(item.milestone))
+    const reactions = reactionsText(item.reactions)
+    if (reactions !== '') parts.push(reactions)
+
+    return cleanLine(parts.join(' · '))
+  }
+
+  /** E9: the opened row's gaps, one chip each (never sections); none without a triage that names any. */
+  const gapsOf = (section: Section, item: IssueRow, recap: Recap | undefined) => {
+    const shown = triageOf(section, item, recap)
+    if (shown === undefined || shown.triage.gaps.length === 0) return null
+    const key = rowKeyOf(section.key, item.number)
+
+    return (
+      <Box key={`gaps:${key}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} rowGap={step('xs', 0)}>
+        <Text size="caption" weight="semibold" color={INK.secondary}>
+          {S.gapsTitle}
+        </Text>
+        {shown.triage.gaps.map(gap => {
+          const said = cleanLine(gap)
+
+          return pill(isRich ? said : `[${said}]`, shown.isStale ? INK.muted : INK.warning, HUE.amber, false, true)
+        })}
+      </Box>
+    )
+  }
+
+  /**
+   * E4's hover card for a collapsed row, drawn hidden and revealed while the pointer rests on the row's number (no hook
+   * runs on hover, so it holds only what the session has): the byline, up to two lines of the body, the last two
+   * comments or where they are, up to two pull requests with their state, the relations and the triage. It sits above
+   * the number and right of it, growing upward to fit what it holds (E4-1), so the column above the number stays free and
+   * moving the pointer up leaves the scope (E4-2). No key (a keyed card would be a scope of its own and never reveal), no
+   * Button or Link (a hidden element must never take the focus or a stray click), no Markdown.
+   */
+  const cardOf = (section: Section, item: IssueRow, details: IssueDetails | undefined, recap: Recap | undefined) => {
+    const width = Math.max(20, Math.min(56, state.columns - 10))
+    const inner = Math.max(12, width - 4)
+    const lineOf = (text: string) => cut(cleanLine(text), inner)
+    // The byline and the body may take two lines each; every other line is one, cut at its end.
+    type CardLine = { text: string; ink: string; isHeading?: boolean; wraps?: boolean }
+    const lines: CardLine[] = [{ text: cut(bylineOf(item), 2 * inner), ink: INK.secondary, wraps: true }]
+    const comments = details !== undefined && details.fetchedAt !== 0 ? details.comments.slice(-CARD_COMMENTS) : []
+    const tail: CardLine[] = []
+    if (comments.length > 0) {
+      tail.push({ text: lineOf(S.cardComments(comments.length, Math.max(details?.commentCount ?? 0, comments.length))), ink: INK.secondary, isHeading: true })
+      for (const comment of comments) tail.push({ text: lineOf(`${comment.author} · ${shortAgo(comment.createdAt, state.now, S.ago)} · ${comment.body}`), ink: INK.text })
+    } else if (details !== undefined) tail.push({ text: lineOf(details.commentCount > 0 ? S.cardCommentsLater(details.commentCount) : S.noComments), ink: INK.muted })
+    const { session, sectionRepo, links } = prsOf(section, item, details)
+    for (const pr of links.slice(0, CARD_PRS)) tail.push({ text: lineOf(prCardLine(pr, session, sectionRepo, S)), ink: pr.state === 'CLOSED' ? INK.muted : INK.secondary })
+    const relations = item.relations
+    const related: string[] = []
+    if (relations?.parent !== undefined && relations.parent !== null) related.push(S.partOf(refLabel(relations.parent, sectionRepo)))
+    const blocker = relations?.blockedBy?.refs?.[0]
+    if ((relations?.blockedBy?.open ?? 0) > 0 && blocker !== undefined) related.push(S.blockedChip(refLabel(blocker, sectionRepo), (relations?.blockedBy?.open ?? 1) - 1))
+    if (relations?.subIssues !== undefined && relations.subIssues !== null) related.push(S.subProgress(relations.subIssues.completed, relations.subIssues.total))
+    if (related.length > 0) tail.push({ text: lineOf(related.join(' · ')), ink: INK.secondary })
+    const shown = triageOf(section, item, recap)
+    if (shown !== undefined) {
+      const { triage } = shown
+      const readiness = triage.gaps.length > 0 ? `${S.gapsTitle}: ${triage.gaps.join(', ')}` : triage.criteria === 'stated' ? S.ready : S.criteriaUnclear
+      const words = [S.kinds[triage.kind], ...(triage.size === null ? [] : [S.size(triage.size)]), readiness]
+      tail.push({ text: lineOf(words.join(' · ')), ink: shown.isStale ? INK.muted : INK.secondary })
+    }
+    // The body last, in what the card's characters leave: two lines' worth at most (E4-1).
+    const others = [...lines, ...tail].reduce((sum, line) => sum + line.text.length, 0)
+    const room = Math.min(2 * inner, Math.max(inner, CARD_CHARS - others))
+    const body = details === undefined ? '…' : details.fetchedAt !== 0 && details.body.trim() !== '' ? excerptOf(details.body, room) : details.excerpt !== '' ? details.excerpt : S.noBody
+    lines.push({ text: cut(cleanLine(body), room), ink: INK.text, wraps: true })
+    const all = [...lines, ...tail]
+    textSoFar += all.reduce((sum, line) => sum + line.text.length, 0)
+
+    return (
+      <Box
+        position="absolute"
+        bottom={1}
+        left={String(item.number).length + 2}
+        width={width}
+        display="none"
+        hover={{ display: 'flex' }}
+        flexDirection="column"
+        borderStyle="round"
+        borderColor={tint(HUE.gray, 0.5)}
+        backgroundColor="inverseText"
+      >
+        <Box flexDirection="column" paddingX="sm" backgroundColor={tint(HUE.gray, 0.06)}>
+          {all.map(line => (
+            <Text size="caption" weight={line.isHeading === true ? 'semibold' : undefined} color={line.ink} wrap={line.wraps === true ? 'wrap' : 'truncate-end'}>
+              {line.text}
+            </Text>
+          ))}
+        </Box>
+      </Box>
+    )
+  }
+
+  const openedBlock = (section: Section, item: IssueRow, details: IssueDetails | undefined, recap: Recap | undefined) => {
+    const key = rowKeyOf(section.key, item.number)
+    // E4: the card's first line opens the opened row on every surface (the terminal has no card).
+    const byline = (
+      <Box key={`byline:${key}`} flexDirection="column">
+        <Text size="caption" color={INK.secondary} wrap="wrap">
+          {bylineOf(item)}
+        </Text>
+      </Box>
+    )
     // A seeded entry has no body or comments yet: the opened row reads as loading until the details land.
     if (details === undefined || details.fetchedAt === 0) {
       return (
-        <Text size="caption" color={INK.muted}>
-          …
-        </Text>
+        <Box flexDirection="column">
+          {byline}
+          <Text size="caption" color={INK.muted}>
+            …
+          </Text>
+        </Box>
       )
     }
     // Cleaned after the fold as well: trimming a leading space could bare a combining mark, which gets a tree refused.
@@ -877,6 +1068,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
 
     return (
       <Box flexDirection="column" rowGap={step('xs', 0)} paddingX={step('sm', 1)} paddingY={step('xs', 0)} borderStyle="round" backgroundColor={wash(HUE.gray, 0.05)}>
+        {byline}
         <Text size="caption" wrap="wrap">
           {body}
           {text.length > 600 ? ' …' : ''}
@@ -904,6 +1096,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         })}
         {prLinesOf(section, item, details)}
         {relationsOf(section, item)}
+        {gapsOf(section, item, recap)}
       </Box>
     )
   }
@@ -916,6 +1109,10 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     const isOpen = state.opened === key
     const isStarting = state.starting[key] === true
     const workLabel = isStarting ? S.starting : mapping !== undefined ? S.openSession : S.workOnIt
+    // E4: the card goes before the row's own text in the tree, so it is drawn while the text before it stays well
+    // under the tree's budget (E4-4); the row's visible text counts toward that too, by a rough measure.
+    const card = cardKeys.has(key) && !isOpen && textSoFar < CARD_TEXT_STOP ? cardOf(section, item, details, recap) : null
+    textSoFar += item.title.length + (recap?.text.length ?? details?.excerpt.length ?? 0) + 120
 
     return (
       <Box
@@ -929,12 +1126,28 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         backgroundColor={isOpen ? wash(HUE.brand, 0.04) : undefined}
         hover={isRich ? { backgroundColor: tint(HUE.gray, 0.08) } : undefined}
       >
-        <Button key={`row-title:${key}`} plain onPress={() => actions.toggleRow(key)}>
-          <Text color={INK.muted}>#{item.number} </Text>
-          <Text weight="semibold">{clean(item.title)}</Text>
-        </Button>
-        {chips(section, item, details)}
-        {isOpen ? openedBlock(section, item, details) : recapLine(section, item, details, recap)}
+        {/* The title line (plan 4.6): the number is E4's hover scope and holds the card; the Button holds the title. */}
+        <Box flexDirection="row" alignItems="flex-start" columnGap={step('xs', 1)}>
+          <Box key={`peek:${key}`} flexShrink={0}>
+            <Text color={INK.muted} hover={canHover ? { color: INK.brand, underline: true } : undefined}>
+              #{item.number}
+            </Text>
+            {card}
+          </Box>
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Button key={`row-title:${key}`} plain onPress={() => actions.toggleRow(key)}>
+              <Text weight="semibold">{clean(item.title)}</Text>
+            </Button>
+          </Box>
+        </Box>
+        {chips(section, item, details, recap)}
+        {isOpen ? (
+          openedBlock(section, item, details, recap)
+        ) : (
+          <Box key={`recap:${key}`} flexDirection="column">
+            {recapLine(section, item, details, recap)}
+          </Box>
+        )}
         {mapping !== undefined && (
           <Text size="caption" color={INK.muted} wrap="truncate-end">
             {S.sessionLine(clean(mapping.title), fmtTime(mapping.startedAt))}
@@ -962,7 +1175,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   }
 
   // Sections -------------------------------------------------------------
-  let rowsLeft = ROW_BUDGET
+  // The row budget is the plan's (marks.ts drawnRowsOf): rows, closed rows and the assigned section's rows share it.
 
   /**
    * The pointer to the rest on GitHub (E7): `… +382 weitere auf GitHub ↗` once the open count is known and exceeds the
@@ -1071,8 +1284,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     // Loading while a fetch runs, and while the part holds no list of this window and nothing failed: the next refresh
     // that may fetch brings one (B2-BEH-4), so an expanded part is never a bare header.
     const isLoading = (loadingAt !== undefined && state.now - loadingAt < CLOSED_LOADING_MS) || (failed === undefined && (cache === undefined || cache.since !== since))
-    const drawn = (cache?.rows ?? []).slice(0, Math.min(CLOSED_SHOWN, Math.max(0, rowsLeft)))
-    rowsLeft -= drawn.length
+    const drawn = (cache?.rows ?? []).slice(0, planOf.get(key)?.closed ?? 0)
 
     return (
       <Box key={`closed-part:${key}`} flexDirection="column" rowGap={step('xs', 0)}>
@@ -1104,33 +1316,30 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   }
 
   /** The rows of a section, in E14's groups when grouping: a caption per group (`bug · 3`), the empty group last. */
-  const groupedRows = (section: Section, shown: readonly IssueRow[]) => {
+  const groupedRows = (section: Section) => {
     const group = state.filter.group
     const parts: RenderElement[] = []
-    let drawnCount = 0
-    for (const found of groupRows(shown, group)) {
-      const drawn = found.rows.slice(0, Math.max(0, rowsLeft))
-      rowsLeft -= drawn.length
-      drawnCount += drawn.length
+    const planned = planOf.get(section.key)
+    for (const found of planned?.groups ?? []) {
       if (group === 'none') {
-        parts.push(...drawn.map(item => row(section, item)))
+        parts.push(...found.rows.map(item => row(section, item)))
         continue
       }
-      if (drawn.length === 0) continue
+      if (found.rows.length === 0) continue
       const name = found.id === '' ? S.groupEmpty[group] : cutText(clean(found.id), 40)
       parts.push(
         <Box key={`group:${section.key}:${found.id === '' ? '-' : found.id}`} flexDirection="column" rowGap={step('xs', 0)}>
           <Box paddingX={step('sm', 1)}>
             <Text size="caption" weight="semibold" color={INK.secondary}>
-              {`${name} · ${found.rows.length}`}
+              {`${name} · ${found.count}`}
             </Text>
           </Box>
-          {drawn.map(item => row(section, item))}
+          {found.rows.map(item => row(section, item))}
         </Box>,
       )
     }
 
-    return { parts, rest: shown.length - drawnCount }
+    return { parts, rest: planned?.rest ?? 0 }
   }
 
   const sectionBlock = (section: Section) => {
@@ -1140,6 +1349,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     const listed = listedOf(section)
     const shown = shownOf(section)
     const count = shown.length
+    const marked = isCollapsed ? shown.filter(item => markOfRow(section, item) !== null).length : 0
     // A filtered list counts its matches, the board facet the rows it keeps (E18-3); the default list E7's count.
     const counted = isLoading ? '…' : !isFiltered(section) && boardFacet === '' && section.total !== undefined && section.total > count ? `${count}/${section.total}` : String(count)
     const header = (
@@ -1153,6 +1363,12 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             {section.info?.isFork === true ? <Text color={INK.muted}> (fork)</Text> : null}
           </Button>
         </Box>
+        {/* E5: a collapsed section says how many of its rows are marked, before its count. */}
+        {isCollapsed && marked > 0 && (
+          <Box key={`marks:${section.key}`} flexShrink={0}>
+            {pill(S.sectionMarks(marked), INK.brand, HUE.brand)}
+          </Box>
+        )}
         {section.state.kind === 'ok' && (
           <Box key={`count:${section.key}`} flexShrink={0}>
             {pill(counted, count > 0 ? INK.text : INK.muted, HUE.gray)}
@@ -1167,7 +1383,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         </Box>
       )
     }
-    const { parts, rest } = groupedRows(section, shown)
+    const { parts, rest } = groupedRows(section)
 
     return (
       <Box key={`sec:${section.key}`} flexDirection="column" rowGap={step('xs', 0)}>
@@ -1260,8 +1476,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         </Box>
       )
     }
-    const drawn = box.rows.slice(0, Math.max(0, rowsLeft))
-    rowsLeft -= drawn.length
+    const drawn = box.rows.slice(0, plan.left)
 
     return (
       <Box key="sec:inbox" flexDirection="column" rowGap={step('xs', 0)}>

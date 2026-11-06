@@ -166,9 +166,12 @@ const RELATIONS = 'parent { number state title url } subIssuesSummary { complete
 const DETAILS = 'fragment Details on Issue { body comments(last: 3) { totalCount nodes { author { login } createdAt body } } }'
 const WINDOW = 'issues(states: OPEN, first: $first, orderBy: {field: UPDATED_AT, direction: DESC})'
 const LIMIT = 'rateLimit { cost remaining resetAt }'
+/** The signed-in account (E5: an arrival the owner filed is no news); no extra point. */
+const VIEWER = 'viewer { login }'
 
 function rowFragment(withRelations: boolean): string {
-  return `fragment Row on Issue { number title url createdAt updatedAt state isPinned author { login } labels(first: 100) { nodes { name color } } assignees(first: 20) { nodes { login } } milestone { title }${withRelations ? ` ${RELATIONS}` : ''} }`
+  // stateReason (E5's reopened mark) and the reactions (E4's card), as gh's list asks them (`users`, measured live).
+  return `fragment Row on Issue { number title url createdAt updatedAt state stateReason isPinned author { login } labels(first: 100) { nodes { name color } } assignees(first: 20) { nodes { login } } milestone { title } reactionGroups { content users { totalCount } }${withRelations ? ` ${RELATIONS}` : ''} }`
 }
 
 /** Issue numbers as a query may name them: whole, positive, each once, in the order given. */
@@ -185,7 +188,7 @@ export function probeQuery(mapped: readonly number[], withLinks: boolean): strin
     .map(number => ` m${number}: issue(number: ${number}) { number state }`)
     .join('')
 
-  return `query IssueRadarProbe($owner: String!, $name: String!, $first: Int!) { repository(owner: $owner, name: $name) { ${WINDOW} { totalCount nodes { number updatedAt comments { totalCount }${withLinks ? ' ...Links' : ''} } }${aliases} } ${LIMIT} }${withLinks ? ` ${LINKS}` : ''}`
+  return `query IssueRadarProbe($owner: String!, $name: String!, $first: Int!) { repository(owner: $owner, name: $name) { ${WINDOW} { totalCount nodes { number updatedAt comments { totalCount }${withLinks ? ' ...Links' : ''} } }${aliases} } ${withLinks ? `${VIEWER} ` : ''}${LIMIT} }${withLinks ? ` ${LINKS}` : ''}`
 }
 
 /** Tier 2's patch (E7): rows, details and pull requests of exactly the issues the probe found new or changed. */
@@ -225,7 +228,15 @@ export function prsQuery(numbers: readonly number[]): string {
     .map(number => ` i${number}: issue(number: ${number}) { number ...Links }`)
     .join('')
 
-  return `query IssueRadarPrs($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {${aliases} } ${LIMIT} } ${LINKS}`
+  return `query IssueRadarPrs($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {${aliases} } ${VIEWER} ${LIMIT} } ${LINKS}`
+}
+
+/** The signed-in account's login an answer carries (`viewer { login }`); null when it carries none. */
+export function viewerOf(data: Readonly<Record<string, unknown>>): string | null {
+  const viewer = data['viewer']
+  const login = isRecord(viewer) ? viewer['login'] : undefined
+
+  return typeof login === 'string' && login !== '' ? login : null
 }
 
 export type ProbeNode = { number: number; updatedAt: string; comments: number }
@@ -240,6 +251,8 @@ export type Probe = {
   mapped: Map<number, MappedState>
   /** The probed issues' pull requests, when the probe asked for them. */
   links: Map<number, PrLinks> | null
+  /** The signed-in account's login, asked with the pull requests (E5). */
+  viewer: string | null
   cost: number | null
   remaining: number | null
 }
@@ -279,7 +292,7 @@ export async function probeIssues($: EngineInterface, info: RepoInfo, first: num
     else if (value === null && missed(answer.errors, alias)) states.set(number, 'GONE')
   }
 
-  return { total: countOf(issues['totalCount']) ?? nodes.length, nodes, mapped: states, links, cost: answer.cost, remaining: remainingOf(answer.data) }
+  return { total: countOf(issues['totalCount']) ?? nodes.length, nodes, mapped: states, links, viewer: viewerOf(answer.data), cost: answer.cost, remaining: remainingOf(answer.data) }
 }
 
 /** What tier 2's patch read: the issues still open with their details and pull requests, and those closed or gone. */
@@ -336,20 +349,33 @@ export async function fetchTop($: EngineInterface, info: RepoInfo, first: number
   return { rows, total: countOf(issues['totalCount']) ?? rows.length, cost: answer.cost, remaining: remainingOf(answer.data) }
 }
 
-/** E3 where V1's list ran: the listed issues' pull requests, at most PRS_MAX issues; an alias that misses has none. */
-export async function fetchPrLinks($: EngineInterface, info: RepoInfo, numbers: readonly number[]): Promise<{ links: Map<number, PrLinks>; cost: number | null; remaining: number | null } | { state: RepoState }> {
-  const asked = numbersOf(numbers).slice(0, PRS_MAX)
-  const answer = await graphql($, info, prsQuery(asked), { owner: info.owner, name: info.name })
-  if (!answer.ok) return { state: answer.state }
-  const repository = answer.data['repository']
-  if (!isRecord(repository)) return noData(info, 'repository')
+/**
+ * E3 where V1's list ran: the listed issues' pull requests, one request (~1 point at 30, 4 at 100) per PRS_MAX issues,
+ * so every listed row has its states whatever the issue cap (as fetchBoards reads, R2-RT-3); the first request that
+ * fails is the answer. An alias that misses has none. The answer names the signed-in account too (E5).
+ */
+export async function fetchPrLinks($: EngineInterface, info: RepoInfo, numbers: readonly number[]): Promise<{ links: Map<number, PrLinks>; viewer: string | null; cost: number | null; remaining: number | null } | { state: RepoState }> {
+  const all = numbersOf(numbers)
   const links = new Map<number, PrLinks>()
-  for (const number of asked) {
-    const node = repository[`i${number}`]
-    if (isRecord(node)) links.set(number, parsePrConnection(node['closedByPullRequestsReferences']))
+  let viewer: string | null = null
+  let cost: number | null = null
+  let remaining: number | null = null
+  for (let start = 0; start < all.length; start += PRS_MAX) {
+    const asked = all.slice(start, start + PRS_MAX)
+    const answer = await graphql($, info, prsQuery(asked), { owner: info.owner, name: info.name })
+    if (!answer.ok) return { state: answer.state }
+    const repository = answer.data['repository']
+    if (!isRecord(repository)) return noData(info, 'repository')
+    for (const number of asked) {
+      const node = repository[`i${number}`]
+      if (isRecord(node)) links.set(number, parsePrConnection(node['closedByPullRequestsReferences']))
+    }
+    viewer = viewer ?? viewerOf(answer.data)
+    if (answer.cost !== null) cost = (cost ?? 0) + answer.cost
+    remaining = remainingOf(answer.data) ?? remaining
   }
 
-  return { links, cost: answer.cost, remaining: remainingOf(answer.data) }
+  return { links, viewer, cost, remaining }
 }
 
 /**

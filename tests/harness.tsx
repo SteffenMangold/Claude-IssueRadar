@@ -161,7 +161,12 @@ export type Setup = {
    * slow store, so two readers both see what was there); undefined answers at once, as the default does for every key.
    */
   storeDelay?: (key: string) => Promise<unknown> | undefined
+  /** The text the model answers a `$.model.complete` with, per request; the default is V1's plain German recap. */
+  model?: (request: { prompt: string; system: string }) => string
 }
+
+/** The model's default answer: a plain sentence, as V1 asked it (no JSON, so no triage). */
+export const PLAIN_RECAP = 'Der Export bricht bei leeren Ordnern ab; erwartet wird stattdessen ein leeres Archiv.'
 
 export type Project = {
   store: Map<string, unknown>
@@ -189,6 +194,8 @@ export type Project = {
   logs: string[]
   /** The prompt of every `$.model.complete` (a recap's names the issue's title), in order. */
   prompts: string[]
+  /** The system prompt of every `$.model.complete`, in order (empty where none was given). */
+  systems: string[]
   /** Shows or hides a placed pane (another tab in front of it), as `$.ui.panes()` reports it. */
   setShown: (isShown: boolean) => void
 }
@@ -212,6 +219,7 @@ export function project(on: On, setup: Setup = {}): Project {
   const checks: Array<{ tool: string; input: unknown }> = []
   const logs: string[] = []
   const prompts: string[] = []
+  const systems: string[] = []
   /** The open panes by id: the title and whether the latest open placed them. */
   const panes = new Map<string, { title: string; isPlaced: boolean }>()
   let isShown = setup.isShown ?? true
@@ -291,8 +299,10 @@ export function project(on: On, setup: Setup = {}): Project {
   })
   on('model.complete', (_, e) => {
     prompts.push(e.prompt)
+    systems.push(e.system ?? '')
+    const text = setup.model === undefined ? PLAIN_RECAP : setup.model({ prompt: e.prompt, system: e.system ?? '' })
 
-    return { value: { isAnswered: true, text: 'Der Export bricht bei leeren Ordnern ab; erwartet wird stattdessen ein leeres Archiv.', usage: USAGE } }
+    return { value: { isAnswered: true, text, usage: USAGE } }
   })
   on('mcp.call', async (_, e) => {
     const call: McpCall = { server: e.server, tool: e.tool, args: (e.args ?? {}) as Record<string, unknown> }
@@ -331,6 +341,7 @@ export function project(on: On, setup: Setup = {}): Project {
     closed,
     logs,
     prompts,
+    systems,
     setShown: value => {
       isShown = value
     },
