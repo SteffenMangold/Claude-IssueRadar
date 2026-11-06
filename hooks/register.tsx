@@ -1,6 +1,7 @@
 // Issue Radar: the open GitHub issues of the session's repository in a pane,
 // and one click that starts a dedicated session per issue. The hooks module:
-// the pane, the commands, the refresh pipeline, the hand-off.
+// the pane, the commands, the refresh pipeline, the hand-off. `$.ui.status`
+// has one owner, the issue session's status line (E12); nothing else sets it.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
 
@@ -9,7 +10,9 @@ import { MARKER, branchName, renderBackground, renderBrief, sessionName, session
 import { isRepoSpec, listIssues, repoKey, repoLabel, resolveCheckout, resolveNamed, stateOf, viewIssue } from './github'
 import { asLanguage, strings } from './i18n'
 import { recapIssue } from './recap'
-import { detachSession, focusSession, lookUpSession, routeInUse, startDesktopSession } from './session'
+import { commandConsent, detachSession, focusSession, lookUpSession, parseObject, pressConsent, quietDesktop, routeInUse, startDesktopSession } from './session'
+import { clean } from './text'
+import { takeToast } from './toasts'
 import { renderPane, rowKeyOf } from './view'
 
 const PLUGIN = 'issue-radar'
@@ -44,8 +47,11 @@ const route = atom({ plugin: 'issue-radar', key: 'route' } as const, 'none')
 let timer: Timer | undefined
 let timerMinutes = 0
 let isRunning = false
-let isQueued = false
+/** The reason of the refresh asked for while one ran (the strongest, when several were); it runs once that one ends. */
+let queuedReason: Reason | null = null
 let delayed: Timer | undefined
+/** The reason the pending `delayed` refresh will run with; a later `schedule` keeps the stronger of both. */
+let delayedReason: Reason | null = null
 /** Whether the first refresh has decided about opening the pane. */
 let paneDecided = false
 /** Whether the pane is up on the mod's or the owner's initiative, so an attach places it again. */
@@ -61,7 +67,18 @@ const inFlight = new Set<string>()
 const ownBriefs = new Set<string>()
 
 type Resolved = { spec: string; info: RepoInfo | null; state: RepoState; isCheckout: boolean }
-type Reason = 'start' | 'timer' | 'manual' | 'tool'
+/**
+ * Why a refresh runs: the session's start, the timer, the owner's ↻ (`press`, nothing else), a re-run the mod asks
+ * for itself (`manual`: a consent, a watch change, a reset, a command, a state block's retry), or a tool or an attach.
+ */
+type Reason = 'start' | 'timer' | 'press' | 'manual' | 'tool'
+
+/** How much a reason asks for: a queued or merged refresh runs with the strongest reason it stands for. */
+const REASON_RANK: Record<Reason, number> = { timer: 0, tool: 1, start: 2, manual: 3, press: 4 }
+
+function strongerReason(a: Reason | null, b: Reason): Reason {
+  return a !== null && REASON_RANK[a] >= REASON_RANK[b] ? a : b
+}
 
 function readOptions(given: PluginOptions): Options {
   const num = (key: string, fallback: number) => {
@@ -119,17 +136,50 @@ async function loadVersion($: EngineInterface): Promise<void> {
   if (stated !== undefined) await update($, version, () => stated)
 }
 
+/** A stored mapping as the mod can use it; anything without a session id is no mapping. */
+function asMapping(value: unknown): Mapping | undefined {
+  return typeof value === 'object' && value !== null && typeof (value as { sessionId?: unknown }).sessionId === 'string' ? (value as Mapping) : undefined
+}
+
+/**
+ * Every issue → session mapping in the store, mirrored into the state. Run at the session's start and on every
+ * refresh: another pane (or this project's issue session) may have written or released one since (A 6c).
+ */
 async function loadMappings($: EngineInterface): Promise<Record<string, Mapping>> {
   const keys = await $.store.keys().catch(() => [] as string[])
   const found: Record<string, Mapping> = {}
   for (const key of keys) {
     if (!key.startsWith('session:')) continue
-    const value = await readStore<Mapping>($, key)
-    if (value !== undefined && typeof value.sessionId === 'string') found[key.slice('session:'.length)] = value
+    const value = asMapping(await readStore<unknown>($, key))
+    if (value !== undefined) found[key.slice('session:'.length)] = value
   }
-  await update($, mappings, () => found)
+  await update($, mappings, current => {
+    const next = { ...found }
+    // A press in flight owns its row: it writes the store and then the state, and a read between the two must not undo it.
+    for (const rowKey of inFlight) {
+      const mine = current[rowKey]
+      if (mine === undefined) delete next[rowKey]
+      else next[rowKey] = mine
+    }
+
+    return next
+  })
 
   return found
+}
+
+/** One row's mapping, read from the store for a click and mirrored into the state, so a press never acts on a stale copy. */
+async function reloadMapping($: EngineInterface, rowKey: string): Promise<Mapping | undefined> {
+  const stored = asMapping(await readStore<unknown>($, storeKeyOf('session:', rowKey)))
+  await update($, mappings, current => {
+    const next = { ...current }
+    if (stored === undefined) delete next[rowKey]
+    else next[rowKey] = stored
+
+    return next
+  })
+
+  return stored
 }
 
 async function saveMapping($: EngineInterface, rowKey: string, mapping: Mapping | null): Promise<void> {
@@ -156,9 +206,17 @@ async function saveSettings($: EngineInterface, change: (current: RepoSettings) 
   return next
 }
 
+/**
+ * The pane's title, the one composer of it: every open goes through here (`openPane`, the command, the attach), since
+ * an open of the same id retitles, and a re-open with a bare title would drop what a later count adds to it (E5).
+ */
+async function paneTitle($: EngineInterface, options: Options): Promise<string> {
+  return strings(options.language).title
+}
+
 async function openPane($: EngineInterface, options: Options, isLoud: boolean): Promise<void> {
   const S = strings(options.language)
-  const placed = await $.ui.open({ id: PANE, title: S.title, columns: PANE_COLUMNS }).catch(() => null)
+  const placed = await $.ui.open({ id: PANE, title: await paneTitle($, options), columns: PANE_COLUMNS }).catch(() => null)
   if (placed === null) return
   wantsPane = true
   if (!placed.isPlaced) $.ui.log(`${PLUGIN}: ${S.paneWaits(placed.reason)}`, isLoud ? undefined : { to: 'debug' })
@@ -168,6 +226,24 @@ async function isPaneShown($: EngineInterface): Promise<boolean> {
   const panes = await $.ui.panes().catch(() => [])
 
   return panes.some(pane => pane.id === PANE && pane.isShown)
+}
+
+/**
+ * Whether work the mod starts on its own (the timer, a background fetch, tracking) may run now: only while the
+ * pane is SHOWN, not merely open (undrawn before the desktop attaches, on a narrow terminal, on vscode or mobile, or
+ * behind another tab), and never inside an issue session (D X-1).
+ */
+async function mayRunInBackground($: EngineInterface): Promise<boolean> {
+  return !(await read($, isIssueSession)) && (await isPaneShown($))
+}
+
+/**
+ * Whether the owner is typing in the pane: an inline editor or a form with an Input is open. Timed refreshes wait
+ * while it holds, so a redraw never races the typing (F X-1). The pane has no such editor yet (the watch field of
+ * the settings panel draws no value and keeps its text across redraws); the editors that come add their atoms here.
+ */
+async function isEditing($: EngineInterface): Promise<boolean> {
+  return false
 }
 
 async function isPaneOpen($: EngineInterface): Promise<boolean> {
@@ -191,7 +267,7 @@ function armTimer($: EngineInterface, options: Options): void {
   if (options.refreshMinutes <= 0) return
   timer = $.clock.every(Math.max(MIN_PERIOD_MS, Math.round(options.refreshMinutes * 60_000)), () => {
     void (async () => {
-      if (!(await read($, isIssueSession)) && (await isPaneShown($))) await refresh($, options, 'timer')
+      if ((await mayRunInBackground($)) && !(await isEditing($))) await refresh($, options, 'timer')
     })()
   })
 }
@@ -202,16 +278,28 @@ function standDown(): void {
   paneDecided = true
   delayed?.cancel()
   delayed = undefined
+  delayedReason = null
   timer?.cancel()
   timer = undefined
   timerMinutes = 0
 }
 
+/** Runs a refresh after `delayMs`; a refresh already pending is replaced, and the new one keeps the stronger reason of both. */
 function schedule($: EngineInterface, options: Options, delayMs: number, reason: Reason = 'manual'): void {
   delayed?.cancel()
+  const merged = strongerReason(delayedReason, reason)
+  delayedReason = merged
   delayed = $.clock.after(delayMs, () => {
-    void refresh($, options, reason)
+    delayedReason = null
+    void refresh($, options, merged)
   })
+}
+
+/** Shows the refresh's one toast: the best offer its steps made (failure before a proposal before arrivals). */
+function flushToasts($: EngineInterface): void {
+  const offer = takeToast()
+  if (offer === null) return
+  $.ui.toast(clean(offer.text), offer.timeoutMs === undefined ? undefined : { timeoutMs: offer.timeoutMs })
 }
 
 async function resolveTargets($: EngineInterface, root: string, watch: readonly string[], reason: Reason): Promise<Resolved[]> {
@@ -254,7 +342,8 @@ function isCurrent(have: { updatedAt: string } | undefined, row: IssueRow): bool
 
 async function refresh($: EngineInterface, options: Options, reason: Reason): Promise<void> {
   if (isRunning) {
-    isQueued = true
+    // The ask is kept with its reason (E7-2, E11-2): a ↻ pressed meanwhile still runs as the owner's press.
+    queuedReason = strongerReason(queuedReason, reason)
 
     return
   }
@@ -263,6 +352,8 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     await update($, isRefreshing, () => true)
     const now = await $.clock.now()
     const root = await $.session.root()
+    // Another pane, or an issue session of this project, may have started or released a session since the last refresh.
+    await loadMappings($)
     if (checkout !== null && checkout.root !== root) {
       checkout = null
       named.clear()
@@ -400,9 +491,11 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
   } finally {
     isRunning = false
     await update($, isRefreshing, () => false).catch(() => undefined)
-    if (isQueued) {
-      isQueued = false
-      schedule($, options, 500)
+    flushToasts($)
+    if (queuedReason !== null) {
+      const again = queuedReason
+      queuedReason = null
+      schedule($, options, 500, again)
     }
   }
 }
@@ -539,7 +632,7 @@ async function freshDetails($: EngineInterface, options: Options, section: Secti
   if (section.info === null) return null
   const viewed = await viewIssue($, section.info, row, now)
   if ('state' in viewed) {
-    $.ui.toast(S.error(viewed.state.detail ?? viewed.state.kind))
+    $.ui.toast(clean(S.error(viewed.state.detail ?? viewed.state.kind)))
 
     return null
   }
@@ -556,16 +649,20 @@ async function freshDetails($: EngineInterface, options: Options, section: Secti
   return viewed.details
 }
 
-async function workOn($: EngineInterface, options: Options, sectionKey: string, number: number): Promise<void> {
+/** "Work on it" (or "Open session", as `label` says): opens the issue's session, or starts one. */
+async function workOn($: EngineInterface, options: Options, sectionKey: string, number: number, label: string): Promise<void> {
   const S = strings(options.language)
   const rowKey = rowKeyOf(sectionKey, number)
   if (inFlight.has(rowKey)) return
   inFlight.add(rowKey)
   await setStarting($, rowKey, true)
   try {
-    const mapping = (await read($, mappings))[rowKey]
+    // What the owner pressed, in the words they saw, for a desktop call that has to take the typed route.
+    const consent = pressConsent(label, `issue ${rowKey}`)
+    // The store, not this pane's copy, says whether the issue has a session: another pane may have started one.
+    const mapping = await reloadMapping($, rowKey)
     if (mapping !== undefined) {
-      await openExisting($, options, rowKey, mapping, number)
+      await openExisting($, options, rowKey, mapping, number, consent)
 
       return
     }
@@ -578,18 +675,22 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
     const prompt = renderBrief(input)
     const background = renderBackground(input, checkout?.root ?? (await $.session.root()))
     const title = sessionTitle(found.row)
-    const outcome = await startDesktopSession($, {
-      title,
-      name: sessionName(found.row, found.section.info.name),
-      prompt,
-      background,
-      branch_name: branchName(found.row),
-      use_worktree: true,
-    })
+    const outcome = await startDesktopSession(
+      $,
+      {
+        title,
+        name: sessionName(found.row, found.section.info.name),
+        prompt,
+        background,
+        branch_name: branchName(found.row),
+        use_worktree: true,
+      },
+      consent,
+    )
     await update($, route, () => outcome.route)
     if (outcome.route === 'none') {
       await fillPrompt($, options, prompt)
-      $.ui.toast(S.sessionNotStarted(outcome.reason ?? '?'), { timeoutMs: 8_000 })
+      $.ui.toast(clean(S.sessionNotStarted(outcome.reason ?? '?')), { timeoutMs: 8_000 })
 
       return
     }
@@ -600,8 +701,8 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
     }
     const started: Mapping = { sessionId: outcome.sessionId, title, startedAt: now, startedFrom: myId, detached: false }
     await saveMapping($, rowKey, started)
-    $.ui.toast(S.sessionStarted(title))
-    const detached = await detachSession($, outcome.sessionId)
+    $.ui.toast(clean(S.sessionStarted(title)))
+    const detached = await detachSession($, outcome.sessionId, consent)
     if (detached.ok) await saveMapping($, rowKey, { ...started, detached: true })
     else $.ui.toast(S.stayLinked, { timeoutMs: 6_000 })
   } finally {
@@ -610,13 +711,13 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
   }
 }
 
-async function openExisting($: EngineInterface, options: Options, rowKey: string, mapping: Mapping, number: number): Promise<void> {
+async function openExisting($: EngineInterface, options: Options, rowKey: string, mapping: Mapping, number: number, consent: string): Promise<void> {
   const S = strings(options.language)
-  const focused = await focusSession($, mapping.sessionId)
+  const focused = await focusSession($, mapping.sessionId, consent)
   if (focused.ok) return
-  const look = await lookUpSession($, mapping.sessionId)
+  const look = await lookUpSession($, mapping.sessionId, consent)
   if (look.exists && !look.isArchived) {
-    $.ui.toast(S.openElsewhere(look.title || mapping.title), { timeoutMs: 6_000 })
+    $.ui.toast(clean(S.openElsewhere(look.title || mapping.title)), { timeoutMs: 6_000 })
 
     return
   }
@@ -722,25 +823,38 @@ async function resetStore($: EngineInterface): Promise<void> {
   await update($, tokens, () => 0)
 }
 
-/** The spike: one throw-away session, started the way the button starts one, to learn which route works and what the app answers. */
-async function runSpike($: EngineInterface): Promise<string> {
+/**
+ * The spike: one throw-away session, started the way the button starts one, to learn which route works and what the
+ * app answers; then one quiet read of this session's own metadata, the way the mod's own calls go (never a card).
+ */
+async function runSpike($: EngineInterface, command: string): Promise<string> {
+  const consent = commandConsent(`/${command} spike`)
   const brief = spikeBrief()
-  const outcome = await startDesktopSession($, { ...brief, use_worktree: true, branch_name: 'issue-radar-spike' })
+  const outcome = await startDesktopSession($, { ...brief, use_worktree: true, branch_name: 'issue-radar-spike' }, consent)
   await update($, route, () => outcome.route)
-  if (outcome.route === 'none') return `No route started a session (${outcome.reason ?? '?'}). The button would put the brief into the prompt box.`
-  const lines = [`start_session via ${outcome.route} (use_worktree: true); session id ${outcome.sessionId ?? 'not parsed'}.`, `Answer: ${outcome.raw || '(empty)'}`]
-  if (outcome.sessionId !== null) {
-    const detached = await detachSession($, outcome.sessionId)
-    lines.push(detached.ok ? 'detach_session: ok.' : `detach_session refused: ${detached.reason ?? '?'}`)
-    const look = await lookUpSession($, outcome.sessionId)
-    lines.push(look.exists ? `get_session: state ${look.state || '?'}, title "${look.title}", archived ${look.isArchived}` : 'get_session: not found')
+  const lines: string[] = []
+  if (outcome.route === 'none') lines.push(`No route started a session (${outcome.reason ?? '?'}). The button would put the brief into the prompt box.`)
+  else {
+    lines.push(`start_session via ${outcome.route} (use_worktree: true); session id ${outcome.sessionId ?? 'not parsed'}.`, `Answer: ${outcome.raw || '(empty)'}`)
+    if (outcome.sessionId !== null) {
+      const detached = await detachSession($, outcome.sessionId, consent)
+      lines.push(detached.ok ? 'detach_session: ok.' : `detach_session refused: ${detached.reason ?? '?'}`)
+      const look = await lookUpSession($, outcome.sessionId, consent)
+      lines.push(look.exists ? `get_session: state ${look.state || '?'}, title "${look.title}", archived ${look.isArchived}` : 'get_session: not found')
+    }
   }
+  // The route the mod's own reads take (S1 for quiet calls) and what the app tells a session about itself (S4).
+  const self = await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: 'self' })
+  if (self.ok) {
+    const keys = Object.keys(parseObject(self.structured, self.text))
+    lines.push(`get_session self (quiet, via ${self.via}): ${keys.length === 0 ? 'no JSON' : `keys ${keys.slice(0, 40).join(', ')}`}`)
+  } else lines.push(`get_session self (quiet): not read (${self.reason})`)
 
-  return lines.join('\n')
+  return clean(lines.join('\n'))
 }
 
 /** `/issue-radar` and `/issues`: opens the pane, or `reset` clears the store, or `spike` measures the session tools. Top-level, as the engine requires of a function `$` is passed to. */
-async function runCommand($: EngineInterface, options: Options, args: string): Promise<{ text: string }> {
+async function runCommand($: EngineInterface, options: Options, command: string, args: string): Promise<{ text: string }> {
   const S = strings(options.language)
   const word = args.trim().toLowerCase()
   if (word === 'reset') {
@@ -749,9 +863,9 @@ async function runCommand($: EngineInterface, options: Options, args: string): P
 
     return { text: S.storeCleared }
   }
-  if (word === 'spike') return { text: await runSpike($) }
+  if (word === 'spike') return { text: await runSpike($, command) }
   if (!(await surfacesAllowPane($))) return { text: S.unsupported }
-  const placed = await $.ui.open({ id: PANE, title: S.title, columns: PANE_COLUMNS })
+  const placed = await $.ui.open({ id: PANE, title: await paneTitle($, options), columns: PANE_COLUMNS })
   wantsPane = true
   armTimer($, options)
   schedule($, options, 0)
@@ -812,8 +926,8 @@ export const register: Register = (on, given) => {
     return next(e)
   })
 
-  on('command.run', { command: 'issue-radar' }, ($, e) => runCommand($, options, e.args))
-  on('command.run', { command: 'issues' }, ($, e) => runCommand($, options, e.args))
+  on('command.run', { command: 'issue-radar' }, ($, e) => runCommand($, options, 'issue-radar', e.args))
+  on('command.run', { command: 'issues' }, ($, e) => runCommand($, options, 'issues', e.args))
 
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
@@ -851,7 +965,8 @@ export const register: Register = (on, given) => {
         route: routeInUse(),
       },
       {
-        refresh: () => schedule($, options, 0),
+        refresh: () => schedule($, options, 0, 'press'),
+        retry: () => schedule($, options, 0),
         toggleSettings: () => void update($, isSettingsOpen, current => !current),
         close: () => {
           wantsPane = false
@@ -859,7 +974,7 @@ export const register: Register = (on, given) => {
         },
         toggleSection: key => void toggleSection($, key),
         toggleRow: key => void toggleRow($, options, key),
-        workOn: (sectionKey, number) => void workOn($, options, sectionKey, number),
+        workOn: (sectionKey, number, label) => void workOn($, options, sectionKey, number, label),
         takeHere: (sectionKey, number) => void takeHere($, options, sectionKey, number),
         consent: (key, value) => void consent($, options, key, value),
         addWatch: spec => void addWatch($, options, spec),

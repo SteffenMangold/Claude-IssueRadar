@@ -1,11 +1,14 @@
 // The pane's drawing: the title bar, one section per repository with its rows
 // or its state, the consent row, the settings panel and the footer. The
 // desktop gets tints, pills and an icon; the terminal the same layout in plain
-// text. Nothing here writes state: every press goes to an action.
+// text. Nothing here writes state: every press goes to an action. Every string
+// that came from GitHub, a model or the owner's settings goes through `clean`
+// before it is drawn: one control character would get the whole tree refused.
 import type { Elements, RenderElement, RenderSurface, Space } from 'claude-code'
 
-import type { IssueDetails, IssueRow, Mapping, Options, Recap, RepoSettings, Section, StartRoute } from '../types'
+import type { IssueDetails, IssueRow, LinkedPr, Mapping, Options, Recap, RepoSettings, Section, StartRoute } from '../types'
 import type { Strings } from './i18n'
+import { clean } from './text'
 
 type Table = Elements[keyof Elements]
 
@@ -33,12 +36,16 @@ export type ViewState = {
 
 /** What a press asks for; the hooks module carries it out. */
 export type ViewActions = {
+  /** The title bar's ↻: the owner's own refresh. */
   refresh: () => void
+  /** A state block's retry, after the owner fixed what it names (signed in, back online). */
+  retry: () => void
   toggleSettings: () => void
   close: () => void
   toggleSection: (key: string) => void
   toggleRow: (rowKey: string) => void
-  workOn: (sectionKey: string, number: number) => void
+  /** `label` is the button's label as drawn: the owner's own words for the press, which a typed desktop call carries. */
+  workOn: (sectionKey: string, number: number, label: string) => void
   takeHere: (sectionKey: string, number: number) => void
   consent: (repoKey: string, value: boolean) => void
   addWatch: (spec: string) => void
@@ -117,7 +124,17 @@ export function shortAgo(iso: string, now: number, words: Strings['ago']): strin
 }
 
 function labelOf(section: Section): string {
-  return section.info === null ? section.spec : `${section.info.owner}/${section.info.name}`
+  return clean(section.info === null ? section.spec : `${section.info.owner}/${section.info.name}`)
+}
+
+/**
+ * A linked pull request as the opened row names it: `#n`, with its state once one is known. gh's
+ * closedByPullRequestsReferences carries no state, so V1 printed `#n ()`; the state arrives with E3.
+ */
+export function prLabel(pr: LinkedPr): string {
+  const state = clean(pr.state).trim().toLowerCase()
+
+  return state === '' ? `#${pr.number}` : `#${pr.number} (${state})`
 }
 
 function logoSvg(): string {
@@ -200,7 +217,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         <Box key={`watch:${spec}`} flexDirection="row" alignItems="center" columnGap={step('sm', 1)}>
           <Box flexGrow={1} flexShrink={1} minWidth={0}>
             <Text size="footnote" wrap="truncate-end">
-              {spec}
+              {clean(spec)}
             </Text>
           </Box>
           <Button key={`unwatch:${spec}`} plain label={isRich ? '✕' : `✕ ${S.watchRemove}`} onPress={() => actions.removeWatch(spec)} />
@@ -241,13 +258,15 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const stateBlock = (section: Section) => {
     const { kind } = section.state
     const label = labelOf(section)
-    const host = section.state.host ?? section.info?.host ?? 'github.com'
+    const host = clean(section.state.host ?? section.info?.host ?? 'github.com')
+    // What gh said (a repository, a scope, the first line of an error) is gh's text, not ours.
+    const detail = section.state.detail === undefined ? undefined : clean(section.state.detail)
     const line = (text: string, ink: string = INK.secondary) => (
       <Text size="footnote" color={ink} wrap="wrap">
         {text}
       </Text>
     )
-    const retry = <Button key={`retry:${section.key}`} label={S.retry} onPress={actions.refresh} />
+    const retry = <Button key={`retry:${section.key}`} label={S.retry} onPress={actions.retry} />
     const body = (() => {
       switch (kind) {
         case 'loading':
@@ -264,8 +283,13 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           return [line(S.ghMissing, INK.warning), <Link href={S.ghInstall} label={S.ghInstall} />, retry]
         case 'token-invalid':
           return [line(S.tokenInvalid, INK.warning), <Code source={S.signInHint(host)} language="bash" />, retry]
+        case 'missing-scope': {
+          const scope = detail ?? 'read:project'
+
+          return [line(S.scopeMissing(scope), INK.warning), <Code source={S.scopeHint(host, scope)} language="bash" />, line(S.scopeEnv(scope), INK.muted), retry]
+        }
         case 'no-access':
-          return [line(S.noAccess(section.state.detail ?? label), INK.warning), retry]
+          return [line(S.noAccess(detail ?? label), INK.warning), retry]
         case 'issues-disabled':
           return [line(S.issuesDisabled(label))]
         case 'archived':
@@ -275,10 +299,10 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         case 'rate-limited':
           return [line(S.rateLimited, INK.warning)]
         case 'error':
-          return [line(S.error(section.state.detail ?? '?'), INK.error), retry]
+          return [line(S.error(detail ?? '?'), INK.error), retry]
         case 'ok':
           return section.rows.length === 0
-            ? [line(S.empty(label)), section.info === null ? null : <Link href={`${section.info.url}/issues`} label={S.allIssues} />]
+            ? [line(S.empty(label)), section.info === null ? null : <Link href={clean(`${section.info.url}/issues`)} label={S.allIssues} />]
             : []
       }
     })()
@@ -326,7 +350,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   // One issue ------------------------------------------------------------
   const chips = (row: IssueRow, details: IssueDetails | undefined) => {
     const parts: RenderElement[] = []
-    row.labels.slice(0, LABELS_SHOWN).forEach(label => parts.push(labelChip(label.name, label.color)))
+    row.labels.slice(0, LABELS_SHOWN).forEach(label => parts.push(labelChip(clean(label.name), label.color)))
     if (row.labels.length > LABELS_SHOWN) {
       parts.push(
         <Text size="caption" color={INK.muted}>
@@ -339,7 +363,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     const facts: string[] = [created]
     if (updated !== created) facts.push(`↑ ${updated}`)
     if (details !== undefined) facts.push(S.comment(details.commentCount))
-    if (row.assignees.length > 0) facts.push(row.assignees.map(name => `@${name}`).join(' '))
+    if (row.assignees.length > 0) facts.push(row.assignees.map(name => `@${clean(name)}`).join(' '))
     if (row.isPinned) facts.push(`📌 ${S.pinned}`)
     parts.push(
       <Text size="caption" color={INK.muted} wrap="truncate-end">
@@ -360,14 +384,14 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       if (recap !== undefined && recap.error === undefined && recap.updatedAt >= row.updatedAt) {
         return (
           <Text size="caption" color={INK.secondary} wrap="wrap">
-            {recap.text}
+            {clean(recap.text)}
           </Text>
         )
       }
       if (recap !== undefined && recap.error !== undefined && recap.updatedAt >= row.updatedAt) {
         return (
           <Text size="caption" color={INK.muted} wrap="wrap">
-            {details?.excerpt ?? ''} <Text color={INK.warning}>({S.recapFailed})</Text>
+            {clean(details?.excerpt ?? '')} <Text color={INK.warning}>({S.recapFailed})</Text>
           </Text>
         )
       }
@@ -388,7 +412,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
 
     return (
       <Text size="caption" color={INK.secondary} wrap="wrap">
-        {details.excerpt === '' ? S.noBody : details.excerpt} <Text color={INK.muted}>({S.noRecap})</Text>
+        {details.excerpt === '' ? S.noBody : clean(details.excerpt)} <Text color={INK.muted}>({S.noRecap})</Text>
       </Text>
     )
   }
@@ -402,13 +426,14 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         </Text>
       )
     }
-    const body = details.body.trim() === '' ? (details.excerpt === '' ? S.noBody : details.excerpt) : details.body.replace(/\s+/g, ' ').slice(0, 600)
+    const text = clean(details.body).replace(/\s+/g, ' ').trim()
+    const body = text === '' ? (details.excerpt === '' ? S.noBody : clean(details.excerpt)) : text.slice(0, 600)
 
     return (
       <Box flexDirection="column" rowGap={step('xs', 0)} paddingX={step('sm', 1)} paddingY={step('xs', 0)} borderStyle="round" backgroundColor={wash(HUE.gray, 0.05)}>
         <Text size="caption" wrap="wrap">
           {body}
-          {details.body.length > 600 ? ' …' : ''}
+          {text.length > 600 ? ' …' : ''}
         </Text>
         <Text size="caption" weight="semibold" color={INK.secondary}>
           {S.lastComments}
@@ -418,22 +443,26 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             {S.noComments}
           </Text>
         )}
-        {details.comments.map(comment => (
-          <Text size="caption" color={INK.secondary} wrap="wrap">
-            <Text weight="medium" color={INK.text}>
-              {comment.author}
-            </Text>{' '}
-            · {shortAgo(comment.createdAt, state.now, S.ago)} · {comment.body.slice(0, 240)}
-            {comment.body.length > 240 ? ' …' : ''}
-          </Text>
-        ))}
+        {details.comments.map(comment => {
+          const said = clean(comment.body)
+
+          return (
+            <Text size="caption" color={INK.secondary} wrap="wrap">
+              <Text weight="medium" color={INK.text}>
+                {clean(comment.author)}
+              </Text>{' '}
+              · {shortAgo(comment.createdAt, state.now, S.ago)} · {said.slice(0, 240)}
+              {said.length > 240 ? ' …' : ''}
+            </Text>
+          )
+        })}
         {details.linkedPrs.length > 0 && (
           <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)}>
             <Text size="caption" weight="semibold" color={INK.secondary}>
               {S.linkedPrs}
             </Text>
             {details.linkedPrs.map(pr => (
-              <Link href={pr.url} label={`#${pr.number} (${pr.state.toLowerCase()})`} />
+              <Link href={clean(pr.url)} label={prLabel(pr)} />
             ))}
           </Box>
         )}
@@ -464,19 +493,19 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       >
         <Button key={`row-title:${key}`} plain onPress={() => actions.toggleRow(key)}>
           <Text color={INK.muted}>#{item.number} </Text>
-          <Text weight="semibold">{item.title}</Text>
+          <Text weight="semibold">{clean(item.title)}</Text>
         </Button>
         {chips(item, details)}
         {isOpen ? openedBlock(details) : recapLine(section, item, details, recap)}
         {mapping !== undefined && (
           <Text size="caption" color={INK.muted} wrap="truncate-end">
-            {S.sessionLine(mapping.title, fmtTime(mapping.startedAt))}
+            {S.sessionLine(clean(mapping.title), fmtTime(mapping.startedAt))}
             {mapping.detached ? '' : ` · ${S.sessionLinked}`}
           </Text>
         )}
         <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
           <Box flexGrow={1} flexShrink={1} minWidth={0}>
-            <Link href={item.url} label={S.github} />
+            <Link href={clean(item.url)} label={S.github} />
           </Box>
           <Button
             key={`work:${key}`}
@@ -484,7 +513,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             variant={mapping === undefined && !isStarting ? 'primary' : undefined}
             dimColor={isStarting}
             onPress={() => {
-              if (!isStarting) actions.workOn(section.key, item.number)
+              if (!isStarting) actions.workOn(section.key, item.number, workLabel)
             }}
           />
           <Button key={`here:${key}`} plain label={S.takeHere} onPress={() => actions.takeHere(section.key, item.number)} />
@@ -546,7 +575,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const footerParts: string[] = []
   if (fetchedAt !== null) footerParts.push(S.fetched(fmtTime(fetchedAt)))
   footerParts.push(S.openCount(openCount))
-  if (options.recaps) footerParts.push(options.recapModel)
+  if (options.recaps) footerParts.push(clean(options.recapModel))
   if (state.tokens > 0) footerParts.push(S.tokens(fmtK(state.tokens)))
   const footer = (
     <Box flexDirection="row" alignItems="center" columnGap={step('sm', 1)} paddingX={step('xs', 0)} paddingY={step('xs', 0)} marginTop={isRich ? 0 : 1}>
@@ -557,7 +586,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         </Text>
       </Box>
       <Text size="caption" color={INK.muted}>
-        issue-radar{state.version === '' ? '' : ` v${state.version}`}
+        issue-radar{state.version === '' ? '' : ` v${clean(state.version)}`}
       </Text>
     </Box>
   )

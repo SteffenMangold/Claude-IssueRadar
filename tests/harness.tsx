@@ -1,0 +1,293 @@
+// The shared test harness: a desktop session in a checkout of acme/widgets
+// with two open issues. The test's hooks stand for the engine beneath the
+// plugin (the first registration of an event answers it); `project` records
+// what the plugin asked of them, so tests assert on keys and argv, not on
+// incidental text.
+import type { RenderSurface, UiOpenResult } from 'claude-code'
+import { mock } from 'claude-code/testing'
+import type { MockClock, TestBody } from 'claude-code/testing'
+
+export const PANE = {
+  plugin: 'issue-radar',
+  component: 'Pane',
+  requestId: 'issue-radar',
+  props: {
+    title: 'Issues',
+    isFocused: false,
+    bodyColumns: 60,
+    placement: 'dock',
+    scroll: { offset: 0, bodyRows: 40 },
+    view: {},
+  },
+} as const
+
+export const SECTION = 'github.com/acme/widgets'
+export const ROW_42 = `${SECTION}#42`
+export const ROW_7 = `${SECTION}#7`
+/** Where the mocked clock starts. */
+export const NOW = Date.parse('2026-11-06T12:00:00.000Z')
+/** One timer period at the default interval (refreshMinutes 3). */
+export const TICK_MS = 180_000
+
+export const REPO = JSON.stringify({
+  nameWithOwner: 'acme/widgets',
+  isPrivate: false,
+  hasIssuesEnabled: true,
+  isArchived: false,
+  isFork: false,
+  url: 'https://github.com/acme/widgets',
+  defaultBranchRef: { name: 'main' },
+})
+
+export const ISSUES = JSON.stringify([
+  {
+    number: 42,
+    title: 'Export fails for empty folders',
+    url: 'https://github.com/acme/widgets/issues/42',
+    createdAt: '2026-11-03T10:00:00Z',
+    updatedAt: '2026-11-05T09:00:00Z',
+    author: { login: 'reporter' },
+    labels: [{ name: 'bug', color: 'd73a4a' }],
+    assignees: [],
+    milestone: null,
+    isPinned: false,
+  },
+  {
+    number: 7,
+    title: 'Dark mode for the settings page',
+    url: 'https://github.com/acme/widgets/issues/7',
+    createdAt: '2026-10-01T10:00:00Z',
+    updatedAt: '2026-11-01T09:00:00Z',
+    author: { login: 'designer' },
+    labels: [],
+    assignees: [{ login: 'steffen' }],
+    milestone: { title: 'v2' },
+    isPinned: true,
+  },
+])
+
+/** `gh issue view <n> --json …` for one of the two issues; `extra` overrides fields (`closedByPullRequestsReferences`, `body` …). */
+export function issueView(number: number, state = 'OPEN', extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    number,
+    state,
+    body: 'The export throws on a folder without files.\n\nExpected: an empty archive instead.',
+    comments: [{ author: { login: 'maintainer' }, createdAt: '2026-11-04T08:00:00Z', body: 'Can reproduce on main.' }],
+    updatedAt: number === 42 ? '2026-11-05T09:00:00Z' : '2026-11-01T09:00:00Z',
+    closedByPullRequestsReferences: [],
+    url: `https://github.com/acme/widgets/issues/${number}`,
+    ...extra,
+  })
+}
+
+export type Ran = { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }
+
+export function ran(stdout: string, exitCode = 0, stderr = ''): Ran {
+  return { value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } }
+}
+
+/** What `gh api graphql` answers: the body on stdout, exit 1 and gh's message on stderr when there are errors. */
+export function graphAnswer(data: unknown, errors?: ReadonlyArray<Record<string, unknown>>): Ran {
+  const first = errors?.[0]
+
+  return errors === undefined ? ran(JSON.stringify({ data })) : ran(JSON.stringify({ data, errors }), 1, `gh: ${String(first?.['message'] ?? 'error')}`)
+}
+
+/** The GraphQL operation a recorded argv names (`IssueRadarProbe`), or null for any other command. */
+export function op(argv: readonly string[]): string | null {
+  const query = argv.find(arg => arg.startsWith('query='))
+
+  return query === undefined ? null : (/^query=\s*(?:query|mutation)\s+(\w+)/.exec(query)?.[1] ?? null)
+}
+
+/** How many recorded gh calls start with these words (`count(argv, 'issue', 'list')`). */
+export function count(argv: readonly (readonly string[])[], ...words: string[]): number {
+  return argv.filter(call => call[0] === 'gh' && words.every((word, index) => call[index + 1] === word)).length
+}
+
+export const USAGE = { input_tokens: 300, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+
+export type On = Parameters<TestBody>[1]
+export type Engine = Parameters<TestBody>[0]
+export type McpCall = { server: string; tool: string; args: Record<string, unknown> }
+export type McpAnswer = { value: { content: Array<{ type: 'text'; text: string }>; isError: boolean; structuredContent?: unknown } }
+export type CheckDecision = 'allow' | 'ask' | 'deny'
+
+/** An answer of the desktop app to `$.mcp.call`: text, optionally an error. */
+export function mcpText(text: string, isError = false): McpAnswer {
+  return { value: { content: [{ type: 'text', text }], isError } }
+}
+
+export type Setup = {
+  /** What gh answers to `gh repo view`; the default is a healthy repository. */
+  repo?: () => Ran
+  /** Answers a gh call by its argv (without the leading `gh`) before the defaults; undefined leaves it to them. */
+  gh?: (args: readonly string[]) => Ran | undefined | Promise<Ran | undefined>
+  /** Values the store holds before the session starts. */
+  stored?: Record<string, unknown>
+  /** What `session.surfaces` answers; the default is a desktop. */
+  surfaces?: RenderSurface[]
+  /** What `ui.open` answers; the default places the pane. */
+  open?: () => { value: UiOpenResult }
+  /** What the desktop answers to `$.mcp.call`; the default starts and reports sessions. A throw stands for a server the engine cannot reach. */
+  mcp?: (call: McpCall) => McpAnswer | Promise<McpAnswer>
+  /** What a typed `$.tool.call` gets beneath the plugin; the default refuses it as an unknown tool. */
+  toolCall?: (input: Record<string, unknown>) => Record<string, unknown>
+  /** What a `$.tool.check` query (no tool_use_id) is answered; the default is 'ask'. */
+  check?: (tool: string, input: unknown) => CheckDecision
+  /** What `$.session.id()` answers; the default is 'local_pane'. */
+  sessionId?: string
+  /** Whether the pane is shown at the start; the default is true. */
+  isShown?: boolean
+}
+
+export type Project = {
+  store: Map<string, unknown>
+  mcp: McpCall[]
+  /** The ids of every `ui.open`, in order. */
+  opened: string[]
+  /** The titles of every `ui.open`, in order. */
+  titles: string[]
+  /** The texts put into the prompt box, in order; the composer keeps them as its draft. */
+  filled: string[]
+  /** Every `$.process.run` argv, in order. */
+  argv: string[][]
+  /** Every toast's text, in order. */
+  toasts: string[]
+  /** Every typed `$.tool.call` input that reached beneath the plugin. */
+  toolCalls: Record<string, unknown>[]
+  /** Every `$.tool.check` query (not a typed call's own check). */
+  checks: Array<{ tool: string; input: unknown }>
+  /** Shows or hides the pane, as `$.ui.panes()` reports it. */
+  setShown: (isShown: boolean) => void
+}
+
+/** A desktop session in a checkout of acme/widgets with two open issues. The test's hooks stand for the engine: the first registration of an event answers it. */
+export function project(on: On, setup: Setup = {}): Project {
+  const store = new Map<string, unknown>(Object.entries(setup.stored ?? {}))
+  const mcp: McpCall[] = []
+  const opened: string[] = []
+  const titles: string[] = []
+  const filled: string[] = []
+  const argv: string[][] = []
+  const toasts: string[] = []
+  const toolCalls: Record<string, unknown>[] = []
+  const checks: Array<{ tool: string; input: unknown }> = []
+  let isShown = setup.isShown ?? true
+  let draft = ''
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => {
+    store.set(e.key, e.value)
+
+    return { value: undefined }
+  })
+  on('store.delete', (_, e) => {
+    store.delete(e.key)
+
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }))
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('ui.open', (_, e) => {
+    opened.push(e.id)
+    titles.push(e.title ?? '')
+
+    return setup.open === undefined ? { value: { isPlaced: true } } : setup.open()
+  })
+  on('ui.close', () => ({ value: undefined }))
+  on('ui.panes', () => ({ value: [{ id: 'issue-radar', title: 'Issues', isShown, isFocused: false, isPlaced: true }] }))
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.attach', (_, e) => ({ clientId: e.clientId }))
+  on('session.root', () => ({ value: 'D:\\proj' }))
+  on('session.id', () => ({ value: setup.sessionId ?? 'local_pane' }))
+  on('session.repo', () => ({ value: { root: 'D:\\proj', remote: 'https://github.com/acme/widgets', internal: false, name: null } }))
+  on('session.surfaces', () => ({ value: setup.surfaces ?? ['desktop'] }))
+  on('fs.read', () => ({ value: '{ "name": "issue-radar", "version": "9.9.9" }' }))
+  on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('prompt.fill', (_, e) => {
+    draft = e.mode === 'append' ? draft + e.text : e.text
+    filled.push(e.text)
+
+    return { isFilled: true, text: draft, cursor: draft.length }
+  })
+  on('process.run', async (_, e) => {
+    const call = [...e.argv]
+    argv.push(call)
+    if (call[0] !== 'gh') return ran('')
+    const own = setup.gh === undefined ? undefined : await setup.gh(call.slice(1))
+    if (own !== undefined) return own
+    if (call[1] === 'repo') return setup.repo === undefined ? ran(REPO) : setup.repo()
+    if (call[1] === 'issue' && call[2] === 'list') return ran(ISSUES)
+    if (call[1] === 'issue' && call[2] === 'view') return ran(issueView(Number(call[3])))
+
+    return ran('')
+  })
+  on('model.complete', () => ({
+    value: { isAnswered: true, text: 'Der Export bricht bei leeren Ordnern ab; erwartet wird stattdessen ein leeres Archiv.', usage: USAGE },
+  }))
+  on('mcp.call', async (_, e) => {
+    const call: McpCall = { server: e.server, tool: e.tool, args: (e.args ?? {}) as Record<string, unknown> }
+    mcp.push(call)
+    if (setup.mcp !== undefined) return setup.mcp(call)
+    if (e.tool === 'start_session') return mcpText('Started session local_abc123 ("#42 Export fails for empty folders").')
+    if (e.tool === 'get_session') return mcpText('{"sessionId":"local_abc123","title":"#42 Export fails for empty folders","state":"idle"}')
+
+    return mcpText('ok')
+  })
+  // A typed call the plugin makes raises its own check (it carries a tool_use_id): let it through, as a session
+  // without a check hook would, so the call reaches the tool.call hook below. Only a query is answered by `check`.
+  on('tool.check', (_, e) => {
+    if (e.tool_use_id !== undefined) return { decision: 'allow' }
+    checks.push({ tool: e.tool, input: e.input })
+
+    return { decision: setup.check === undefined ? 'ask' : setup.check(e.tool, e.input) }
+  })
+  on('tool.call', (_, e) => {
+    const input = { ...(e as unknown as Record<string, unknown>) }
+    toolCalls.push(input)
+
+    return (setup.toolCall === undefined ? { deny: 'no such tool' } : setup.toolCall(input)) as never
+  })
+
+  return {
+    store,
+    mcp,
+    opened,
+    titles,
+    filled,
+    argv,
+    toasts,
+    toolCalls,
+    checks,
+    setShown: value => {
+      isShown = value
+    },
+  }
+}
+
+/** Starts the session on a mocked clock and lets the start refresh run; returns the clock. */
+export async function started($: Engine, on: On, surface: RenderSurface = 'desktop'): Promise<MockClock> {
+  const clock = mock.clock(on, { now: NOW })
+  await $.session.start({ cwd: 'D:\\proj', surface, isInteractive: true })
+  await clock.advance(1_000)
+
+  return clock
+}
+
+/** Moves the clock on by whole timer periods, letting each tick's refresh run. */
+export async function tick(clock: MockClock, periods = 1): Promise<void> {
+  for (let done = 0; done < periods; done++) await clock.advance(TICK_MS)
+}
+
+/** Runs one of the mod's commands as the owner would type it. */
+export async function command($: Engine, name: string, args = ''): Promise<string> {
+  const result = await $.command.run({ command: name, args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
+
+  return result.text ?? ''
+}

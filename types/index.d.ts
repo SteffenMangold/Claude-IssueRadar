@@ -44,13 +44,15 @@ export type RepoStateKind =
   | 'archived'
   | 'offline'
   | 'rate-limited'
+  /** The token lacks a scope a field needs (GraphQL's INSUFFICIENT_SCOPES); `detail` names the scope. */
+  | 'missing-scope'
   | 'error'
 
 export type RepoState = {
   kind: RepoStateKind
   /** The host a sign-in concerns. */
   host?: string
-  /** The first line of what `gh` said, for `error`, or the repository asked for. */
+  /** The first line of what `gh` said, for `error`; the repository asked for; or the missing scope, for `missing-scope`. */
   detail?: string
 }
 

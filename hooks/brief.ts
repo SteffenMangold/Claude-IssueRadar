@@ -60,6 +60,8 @@ function names(list: readonly string[]): string {
 export function renderBrief(input: BriefInput): string {
   const { row, details, issueRepo, codeRepo } = input
   const issue = repoSpec(issueRepo)
+  // GitHub reads a closing keyword as `owner/name#n`; a host in front (`ghe.example.com/owner/name#n`) is not parsed.
+  const closes = `${repoLabel(issueRepo)}#${row.number}`
   const code = codeRepo === null ? issue : repoSpec(codeRepo)
   const defaultBranch = (codeRepo ?? issueRepo).defaultBranch
   const comments =
@@ -98,7 +100,7 @@ export function renderBrief(input: BriefInput): string {
     '',
     'Phase 4 - Proposal. Deliver: Approach (and the alternatives you rejected, with the reason); Files to change or add; Ordered steps; Tests to write; Risks and mitigations; Definition of done (the acceptance criteria from phases 2 and 3); Size (S/M/L, one sentence why); whether the project\'s decision log needs a new entry. End with the single question: "Go?"',
     '',
-    `Phase 5 - Stop. Do not edit files, create branches, commit, or write to GitHub (no comments, labels, assignments, closures) before I answer "go". After "go": implement the proposal in this session on its own branch (the app created one with this worktree; if this session shares the checkout, first create \`${branchName(row)}\` from \`${defaultBranch}\`), reference #${row.number} in every commit message, and open a pull request in \`${code}\` whose description carries the phase 2 summary and the line \`Closes ${issue}#${row.number}\`.`,
+    `Phase 5 - Stop. Do not edit files, create branches, commit, or write to GitHub (no comments, labels, assignments, closures) before I answer "go". After "go": implement the proposal in this session on its own branch (the app created one with this worktree; if this session shares the checkout, first create \`${branchName(row)}\` from \`${defaultBranch}\`), reference #${row.number} in every commit message, and open a pull request in \`${code}\` whose description carries the phase 2 summary and the line \`Closes ${closes}\`.`,
     '',
     'Answer me in the language I write in; keep code, commits, the pull request and documentation in English. The project\'s own agent rules (`AGENTS.md`, `CLAUDE.md`) are loaded in this session: follow them, and where they conflict with this brief they win.',
   ].join('\n')

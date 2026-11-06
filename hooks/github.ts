@@ -13,7 +13,20 @@ export const EXCERPT_CHARS = 160
 export const COMMENT_CHARS = 600
 export const COMMENTS_KEPT = 3
 
-export type GhResult = { ok: true; stdout: string } | { ok: false; state: RepoState }
+/**
+ * What a gh call came to. A failure keeps what the process wrote to stdout and its exit code when it ran at all:
+ * `gh api graphql` exits 1 with partial data on stdout, which a caller may still use.
+ */
+export type GhResult = { ok: true; stdout: string } | { ok: false; state: RepoState; stdout?: string; exitCode?: number }
+
+export type GhOptions = {
+  cwd?: string
+  /** Variables set over the host's own environment (`GH_HOST` for a search on another host); never a token. */
+  env?: Record<string, string>
+  host?: string
+  repo?: string
+  timeoutMs?: number
+}
 
 /** `owner/name` or `host/owner/name`; a leading dash would reach gh as a flag, not a repository. */
 export function isRepoSpec(spec: string): boolean {
@@ -46,6 +59,14 @@ function firstLine(text: string): string {
   return text.split(/\r?\n/).map(line => line.trim()).find(line => line !== '') ?? ''
 }
 
+/**
+ * The scope a scope wall names: `['read:project']` in GitHub's GraphQL message, `[read:project]` in `gh project`'s;
+ * null when the text names none.
+ */
+export function scopeIn(text: string): string | null {
+  return /(?:following scopes|required scopes):?\s*\[\s*'?([\w:-]+)'?/i.exec(text)?.[1] ?? null
+}
+
 /** Names the failure: the exit code first (4 is signed out), then what gh said. */
 export function classify(exitCode: number, stderr: string, host: string, repo: string): RepoState {
   const said = stderr.toLowerCase()
@@ -54,6 +75,10 @@ export function classify(exitCode: number, stderr: string, host: string, repo: s
   if (said.includes('no git remotes found')) return { kind: 'no-remote' }
   if (said.includes('known github host')) return { kind: 'not-github' }
   if (said.includes('bad credentials') || said.includes('http 401')) return { kind: 'token-invalid', host }
+  // A token without a scope a field needs: GraphQL's INSUFFICIENT_SCOPES text, or gh's own for `gh project`.
+  if (said.includes('has not been granted the required scopes') || said.includes('missing required scopes')) {
+    return { kind: 'missing-scope', host, detail: scopeIn(stderr) ?? 'read:project' }
+  }
   if (said.includes('rate limit')) return { kind: 'rate-limited', host }
   if (
     said.includes('dial tcp') ||
@@ -85,19 +110,20 @@ function classifyThrow(error: unknown): RepoState {
 }
 
 /** Runs gh with the given arguments; `host` and `repo` only name the state a failure gets. */
-export async function gh($: EngineInterface, args: readonly string[], options: { cwd?: string; host?: string; repo?: string; timeoutMs?: number } = {}): Promise<GhResult> {
+export async function gh($: EngineInterface, args: readonly string[], options: GhOptions = {}): Promise<GhResult> {
   try {
-    // No env of our own: gh prompts nothing without a TTY, and the host's PATH must stay as it is (Doc Radar's precedent).
-    const ran = await $.process.run(['gh', ...args], { cwd: options.cwd, timeoutMs: options.timeoutMs ?? 30_000 })
+    // Only variables a caller names go on top of the host's environment: gh prompts nothing without a TTY,
+    // and the host's PATH must stay as it is (Doc Radar's precedent).
+    const ran = await $.process.run(['gh', ...args], { cwd: options.cwd, timeoutMs: options.timeoutMs ?? 30_000, ...(options.env === undefined ? {} : { env: options.env }) })
     if (ran.exitCode === 0) return { ok: true, stdout: ran.stdout }
 
-    return { ok: false, state: classify(ran.exitCode, ran.stderr, options.host ?? 'github.com', options.repo ?? '') }
+    return { ok: false, state: classify(ran.exitCode, ran.stderr, options.host ?? 'github.com', options.repo ?? ''), stdout: ran.stdout, exitCode: ran.exitCode }
   } catch (error) {
     return { ok: false, state: classifyThrow(error) }
   }
 }
 
-function parseJson(text: string): unknown {
+export function parseJson(text: string): unknown {
   try {
     return JSON.parse(text) as unknown
   } catch {
