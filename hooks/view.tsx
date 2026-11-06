@@ -7,8 +7,12 @@
 // mark would get the whole tree refused.
 import type { Elements, RenderElement, RenderSurface, Space } from 'claude-code'
 
-import type { IssueDetails, IssueRef, IssueRow, Mapping, Options, PrRecord, Recap, RepoSettings, Section, SessionPr, StartRoute } from '../types'
+import type { Boards, ClosedCache, ClosedRow, Facets, Filter, FilterGroup, FilterSort, Inbox, InboxRow, IssueDetails, IssueRef, IssueRow, Mapping, Options, PrRecord, Recap, RepoSettings, RepoState, Section, SessionPr, StartRoute } from '../types'
+import { BOARD_STATUS_CHARS, boardItemFor, boardOptions, matchesBoard } from './boards'
+import { CLOSED_LOADING_MS, CLOSED_SHOWN, closedCountLabel, sinceDate } from './closed'
+import { ANY, GROUPS, SORTS, VIEWS, cutText, groupRows, isBuiltInView, isDefaultFilter, matchesUrl, sanitizeQuery } from './filter'
 import type { Strings } from './i18n'
+import { INBOX_CAP } from './inbox'
 import { linksOf, prChip, prLine, prRefOf } from './prs'
 import type { PrTone, ShownPr } from './prs'
 import { clean, cleanLine } from './text'
@@ -26,6 +30,22 @@ export type ViewState = {
   /** The pull request the app binds to each mapped issue session, by row key (E3). */
   sessionPrs: Record<string, SessionPr>
   settings: RepoSettings
+  /** E14: the pane's filter, and the key of the list it asks (undefined for the default list). */
+  filter: Filter
+  filterKey: string | undefined
+  isFilterOpen: boolean
+  /** What the label and milestone pickers offer (E14). */
+  facets: Facets
+  /** Part of the search field's key: bumped when the filter clears the search, so the field is drawn afresh (E14-4). */
+  searchGen: number
+  /** E18's board status per row. */
+  boards: Boards
+  /** E11's section. */
+  inbox: Inbox
+  /** E22's recently closed issues, loading flags and failures, per repository key. */
+  closed: Record<string, ClosedCache>
+  closedLoading: Record<string, number>
+  closedErrors: Record<string, RepoState>
   options: Options
   strings: Strings
   opened: string
@@ -57,6 +77,23 @@ export type ViewActions = {
   consent: (repoKey: string, value: boolean) => void
   addWatch: (spec: string) => void
   removeWatch: (spec: string) => void
+  /** E14: the ⌕ tool, a picker's choice, the search (Enter), ✕, saving and removing a view. */
+  toggleFilter: () => void
+  setFilter: (patch: Partial<Filter>) => void
+  setSearch: (text: string) => void
+  clearFilter: () => void
+  saveView: (name: string) => void
+  removeView: (id: string) => void
+  /** E17-4: an epic's open sub-issues in the list, through the search. */
+  listSubIssues: (rowKey: string) => void
+  /** E18: the ⚙ panel's switch, and Erneut prüfen after a missing scope. */
+  toggleBoards: () => void
+  retryBoards: (host: string) => void
+  /** E11: the section's header, and ↓ Zeigen. */
+  toggleInbox: () => void
+  showInSection: (rowKey: string) => void
+  /** E22: a repository's "recently closed" header. */
+  toggleClosed: (sectionKey: string) => void
 }
 
 /** Text colors: the theme's own keys, so the pane follows the app's light or dark mode. */
@@ -184,10 +221,50 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const isRich = state.surface !== 'terminal'
   const Svg = isRich && 'Svg' in ui ? ui.Svg : undefined
   const Input = state.surface !== 'mobile' && 'Input' in ui ? ui.Input : undefined
+  // E14: a surface without Select (mobile) draws a picker as a row of chips instead.
+  const Select = state.surface !== 'mobile' && 'Select' in ui ? ui.Select : undefined
   const S = state.strings
   const { options, settings } = state
   const step = (rich: Space, plain: number): Space => (isRich ? rich : plain)
   const wash = (hue: string, alpha: number) => (isRich ? tint(hue, alpha) : undefined)
+  const savedViews = settings.views ?? []
+  /** E18's facet while the feature is on; empty keeps every row. */
+  const boardFacet = settings.boards === true ? state.filter.board : ''
+  /** E14-5: a section listed for another filter than the current one is drawn as loading until its own list comes. */
+  const isStale = (section: Section) => section.info !== null && section.state.kind === 'ok' && section.filterKey !== state.filterKey
+  const listedOf = (section: Section): IssueRow[] => (isStale(section) ? [] : section.rows)
+  /** The rows a section draws: its listed rows, those the board facet picks (E18). */
+  const shownOf = (section: Section): IssueRow[] =>
+    boardFacet === '' ? listedOf(section) : listedOf(section).filter(item => matchesBoard(state.boards.items[rowKeyOf(section.key, item.number)], boardFacet))
+  const isFiltered = (section: Section) => section.query !== undefined
+  /** One line of words for a failed state, as the state blocks word it. */
+  const stateText = (failed: RepoState): string => {
+    const host = clean(failed.host ?? 'github.com')
+    const detail = failed.detail === undefined ? undefined : clean(failed.detail)
+    switch (failed.kind) {
+      case 'offline':
+        return S.offline
+      case 'rate-limited':
+        return S.rateLimited
+      case 'signed-out':
+        return S.signedOut(host)
+      case 'token-invalid':
+        return S.tokenInvalid
+      case 'gh-missing':
+        return S.ghMissing
+      case 'no-access':
+        return S.noAccess(detail ?? '?')
+      case 'missing-scope':
+        return S.scopeMissing(detail ?? 'read:project')
+      default:
+        return S.error(detail ?? failed.kind)
+    }
+  }
+  const note = (text: string, ink: string = INK.secondary) => (
+    <Text size="footnote" color={ink} wrap="wrap">
+      {text}
+    </Text>
+  )
 
   /** A small label: a tinted, bordered Box on a graphical surface, a colored run on the terminal; `canShrink` lets it cut its text at the row's end. */
   const pill = (text: string, ink: string, hue: string, isRound = false, canShrink = false) =>
@@ -244,13 +321,126 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       </Box>
       <Box flexDirection="row" alignItems="center" columnGap={step('xs', 1)}>
         {tool('refresh', state.isRefreshing ? '…' : '↻', S.refresh, actions.refresh)}
+        {tool('filter', '⌕', S.filter, actions.toggleFilter)}
         {tool('settings', '⚙', S.settings, actions.toggleSettings)}
         {tool('close', '✕', S.close, actions.close)}
       </Box>
     </Box>
   )
 
+  // Filter (E14) -----------------------------------------------------------
+
+  /**
+   * A one-of-several picker: a Select where the surface draws one, else a row of plain chips, the current one in
+   * brackets. The current value is always among the options: a value outside them is not one a Select takes.
+   */
+  const picker = (key: string, label: string, choices: ReadonlyArray<{ value: string; label: string }>, value: string, onPick: (value: string) => void) => {
+    // Values unique (a Select refuses a repeated one), the current one among them.
+    const unique = choices.filter((choice, index) => choices.findIndex(found => found.value === choice.value) === index)
+    const listed = unique.some(choice => choice.value === value) ? unique : [...unique, { value, label: cutText(clean(value), 40) }]
+    if (Select !== undefined) return <Select key={key} label={label} options={listed.map(choice => ({ value: choice.value, label: choice.label }))} value={value} onSelect={picked => onPick(picked)} />
+
+    return (
+      <Box key={key} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} rowGap={step('xs', 0)}>
+        <Text size="caption" color={INK.secondary}>
+          {label}:
+        </Text>
+        {listed.map(choice => (
+          <Button key={`${key}:${choice.value}`} plain label={choice.value === value ? `[${choice.label}]` : choice.label} onPress={() => onPick(choice.value)} />
+        ))}
+      </Box>
+    )
+  }
+
+  /** The listed rows' board items (E18), for the facet's options. */
+  const listedItems = state.sections.flatMap(section => listedOf(section).map(item => state.boards.items[rowKeyOf(section.key, item.number)] ?? []))
+  const boardChoices = boardOptions(listedItems).map(option => ({ value: option.value, label: clean(S.boardOption(option.title, option.status ?? S.boardNoStatus)) }))
+  const listedCount = state.sections.reduce((sum, section) => sum + listedOf(section).length, 0)
+  const isScopeMissing = Object.values(state.boards.scope).some(scope => scope === 'missing')
+
+  /** The filter line (E14): what the filter is, cut at the end, and ✕ to restore the default. */
+  const filterLine = (() => {
+    const f = state.filter
+    // A board facet left from before E18 was switched off filters nothing, so it alone names no filter.
+    if (isDefaultFilter({ ...f, board: boardFacet })) return null
+    const parts: string[] = []
+    if (f.view !== 'open') parts.push(isBuiltInView(f.view) ? S.viewNames[f.view] : (savedViews.find(view => view.id === f.view)?.name ?? f.view))
+    const { query, dropped } = sanitizeQuery(f.search)
+    const epic = /^parent-issue:([\w.-]+\/[\w.-]+#\d+)$/.exec(query)?.[1]
+    if (epic !== undefined) parts.push(S.subIssuesOf(epic))
+    else if (query !== '') parts.push(`"${query}"`)
+    if (f.label !== '') parts.push(`label:${f.label}`)
+    if (f.milestone !== '') parts.push(`milestone:${f.milestone}`)
+    if (f.sort !== 'updated') parts.push(S.sortNames[f.sort])
+    if (f.group !== 'none') parts.push(S.groupNames[f.group])
+    if (boardFacet !== '') parts.push(`${S.boardFacet}: ${boardChoices.find(choice => choice.value === boardFacet)?.label ?? boardFacet} (${S.boardAmong(listedCount)})`)
+    if (dropped.length > 0) parts.push(S.filterIgnored(dropped.join(' ')))
+
+    return (
+      <Box key="filter-line" flexDirection="row" alignItems="center" columnGap={step('sm', 1)} paddingX={step('sm', 1)}>
+        <Box flexGrow={1} flexShrink={1} minWidth={0}>
+          <Text size="caption" color={INK.accent} wrap="truncate-end">
+            {clean(`⌕ ${parts.join(' · ')}`)}
+          </Text>
+        </Box>
+        <Button key="filter-clear" plain label="✕" onPress={actions.clearFilter} />
+      </Box>
+    )
+  })()
+
+  /** The filter panel (E14): one control per line; the search Input draws no value, by V1's rule (E14-4). */
+  const filterPanel = (() => {
+    if (!state.isFilterOpen) return null
+    const f = state.filter
+    const viewChoices = [...VIEWS.map(view => ({ value: view as string, label: S.viewNames[view] })), ...savedViews.map(view => ({ value: view.id, label: clean(view.name) }))]
+    const facetChoices = (names: readonly string[]) => [{ value: ANY, label: S.filterAny }, ...names.map(name => ({ value: clean(name), label: cutText(clean(name), 40) }))]
+    const pickSort = (value: string) => {
+      const sort = SORTS.find(found => found === value)
+      if (sort !== undefined) actions.setFilter({ sort: sort as FilterSort })
+    }
+    const pickGroup = (value: string) => {
+      const group = GROUPS.find(found => found === value)
+      if (group !== undefined) actions.setFilter({ group: group as FilterGroup })
+    }
+    const hasSearch = sanitizeQuery(f.search).query !== ''
+    const boardPart = (() => {
+      if (settings.boards !== true) return null
+      if (isScopeMissing) return note(S.boardScopeLine, INK.muted)
+      if (boardChoices.length === 0) return listedCount > 0 && Object.values(state.boards.scope).some(scope => scope === 'present') ? note(S.boardNone, INK.muted) : null
+
+      return picker('filter-board', S.boardFacet, [{ value: ANY, label: S.filterAny }, ...boardChoices], f.board === '' ? ANY : f.board, value => actions.setFilter({ board: value === ANY ? '' : value }))
+    })()
+
+    return (
+      <Box key="filter-panel" flexDirection="column" marginTop={step('sm', 0)} paddingX={step('md', 1)} paddingY={step('sm', 0)} rowGap={step('xs', 0)} borderStyle="round" backgroundColor={wash(HUE.blue, 0.04)}>
+        {picker('filter-view', S.filterView, viewChoices, f.view, value => actions.setFilter({ view: value }))}
+        {Input !== undefined && <Input key={`filter-search:${state.searchGen}`} placeholder={S.filterSearchHint} submitLabel={S.filterSearch} onSubmit={value => actions.setSearch(value)} />}
+        {(state.facets.labels.length > 0 || f.label !== '') && picker('filter-label', S.filterLabel, facetChoices(state.facets.labels), f.label === '' ? ANY : f.label, value => actions.setFilter({ label: value === ANY ? '' : value }))}
+        {(state.facets.milestones.length > 0 || f.milestone !== '') &&
+          picker('filter-milestone', S.filterMilestone, facetChoices(state.facets.milestones), f.milestone === '' ? ANY : f.milestone, value => actions.setFilter({ milestone: value === ANY ? '' : value }))}
+        {picker(
+          'filter-sort',
+          S.filterSort,
+          SORTS.map(sort => ({ value: sort as string, label: S.sortNames[sort] })),
+          f.sort,
+          pickSort,
+        )}
+        {picker(
+          'filter-group',
+          S.filterGroup,
+          GROUPS.map(group => ({ value: group as string, label: S.groupNames[group] })),
+          f.group,
+          pickGroup,
+        )}
+        {boardPart}
+        {Input !== undefined && hasSearch && <Input key={`filter-save:${state.searchGen}`} placeholder={S.filterSaveHint} submitLabel={S.filterSave} onSubmit={value => actions.saveView(value)} />}
+      </Box>
+    )
+  })()
+
   // Settings panel -------------------------------------------------------
+  const boardsOn = settings.boards === true
+  const boardHosts = Object.entries(state.boards.scope).filter(([, scope]) => scope === 'missing').map(([host]) => host)
   const settingsPanel = state.isSettingsOpen ? (
     <Box flexDirection="column" marginTop={step('sm', 0)} paddingX={step('md', 1)} paddingY={step('sm', 0)} rowGap={step('xs', 0)} borderStyle="round" backgroundColor={wash(HUE.gray, 0.05)}>
       <Text size="caption" weight="semibold" color={INK.secondary}>
@@ -299,6 +489,51 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
               </Box>
             )
           })}
+      <Text size="caption" weight="semibold" color={INK.secondary}>
+        {S.savedViewsTitle}
+      </Text>
+      {savedViews.length === 0 && (
+        <Text size="caption" color={INK.muted}>
+          {S.savedViewsNone}
+        </Text>
+      )}
+      {savedViews.map(view => (
+        <Box key={`view:${view.id}`} flexDirection="row" alignItems="center" columnGap={step('sm', 1)}>
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Text size="footnote" wrap="truncate-end">
+              {clean(view.name)} <Text color={INK.muted}>{clean(view.query)}</Text>
+            </Text>
+          </Box>
+          <Button key={`view-remove:${view.id}`} plain label={isRich ? '✕' : `✕ ${S.watchRemove}`} onPress={() => actions.removeView(view.id)} />
+        </Box>
+      ))}
+      <Text size="caption" weight="semibold" color={INK.secondary}>
+        {S.boardsTitle}
+      </Text>
+      <Box key="boards-row" flexDirection="row" alignItems="center" columnGap={step('sm', 1)}>
+        {isRich ? pill(boardsOn ? S.on : S.off, boardsOn ? INK.success : INK.muted, boardsOn ? HUE.green : HUE.gray) : null}
+        <Button key="boards-toggle" plain label={isRich ? S.boardsLabel : `[${boardsOn ? S.on : S.off}] ${S.boardsLabel}`} onPress={actions.toggleBoards} />
+      </Box>
+      {boardsOn &&
+        boardHosts.map(host => {
+          const scope = clean(state.boards.needs[host] ?? 'read:project')
+          const shownHost = clean(host)
+
+          return (
+            <Box key={`boards-scope:${host}`} flexDirection="column" rowGap={step('xs', 0)}>
+              {note(S.boardScopeMissing(scope), INK.warning)}
+              <Code source={S.scopeHint(shownHost, scope)} language="bash" />
+              {note(S.scopeEnv(shownHost, scope), INK.muted)}
+              <Button key={`boards-retry:${host}`} label={S.retry} onPress={() => actions.retryBoards(host)} />
+            </Box>
+          )
+        })}
+      {boardsOn &&
+        Object.entries(state.boards.detail).map(([host, detail]) => (
+          <Box key={`boards-failed:${host}`} flexDirection="column">
+            {note(S.boardUnavailable(clean(detail)), INK.warning)}
+          </Box>
+        ))}
     </Box>
   ) : null
 
@@ -348,10 +583,17 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           return [line(S.rateLimited, INK.warning)]
         case 'error':
           return [line(S.error(detail ?? '?'), INK.error), retry]
-        case 'ok':
-          return section.rows.length === 0
-            ? [line(S.empty(label)), section.info === null ? null : <Link href={clean(`${section.info.url}/issues`)} label={S.allIssues} />]
-            : []
+        case 'ok': {
+          if (section.rows.length > 0) return []
+          // E14: an empty filtered list says so, and links GitHub's search for the same query.
+          if (isFiltered(section)) {
+            const href = section.info === null ? null : matchesUrl(section.info.url, state.filter, savedViews, state.now)
+
+            return [line(S.emptyFiltered(label)), href === null ? null : <Link href={clean(href)} label={S.allMatches} />]
+          }
+
+          return [line(S.empty(label)), section.info === null ? null : <Link href={clean(`${section.info.url}/issues`)} label={S.allIssues} />]
+        }
       }
     })()
     const parts = body.filter(part => part !== null)
@@ -420,6 +662,9 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     if (open > 0 && firstBlocker !== undefined) {
       lead.push(keyedPill(`blocked:${key}`, S.blockedChip(refLabel(firstBlocker, sectionRepo), open - 1), INK.warning, HUE.amber))
     }
+    // E18: the board status, right after the blocked pill: in the project the facet picked, else the first open project.
+    const onBoard = settings.boards === true ? boardItemFor(state.boards.items[key], boardFacet) : null
+    if (onBoard !== null && onBoard.status !== null) lead.push(keyedPill(`board:${key}`, S.boardChip(cutText(onBoard.status, BOARD_STATUS_CHARS)), INK.accent, HUE.blue))
     const subIssues = relations?.subIssues ?? null
     if (subIssues !== null) {
       const isDone = subIssues.completed >= subIssues.total
@@ -609,6 +854,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             {S.subIssuesDone(subIssues.completed, subIssues.total)}
           </Text>
         )}
+        {subIssues !== null && subIssues.completed < subIssues.total && <Button key={`sub-issues:${key}`} plain label={S.listSubIssues} onPress={() => actions.listSubIssues(key)} />}
       </Box>
     )
   }
@@ -721,7 +967,17 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
    */
   const pointer = (section: Section) => {
     const count = section.rows.length
-    if (section.info === null || section.state.kind !== 'ok' || count === 0) return null
+    if (section.info === null || section.state.kind !== 'ok' || count === 0 || isStale(section)) return null
+    // E14: a filtered list at the cap points to every match on GitHub, within what a Link may hold (E14-2).
+    if (isFiltered(section)) {
+      const matches = count < options.maxIssues ? null : matchesUrl(section.info.url, state.filter, savedViews, state.now)
+
+      return matches === null ? null : (
+        <Box key={`more:${section.key}`} paddingX={step('sm', 1)}>
+          <Link href={clean(matches)} label={S.allMatches} />
+        </Box>
+      )
+    }
     const href = clean(`${section.info.url}/issues`)
     if (section.total !== undefined && section.total > count) {
       return (
@@ -742,11 +998,145 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     )
   }
 
+  // E22: the recently closed part --------------------------------------------
+
+  const closedRow = (section: Section, item: ClosedRow) => {
+    const reason = item.stateReason
+    const glyph = reason === 'COMPLETED' ? '✓' : reason === 'NOT_PLANNED' || reason === 'DUPLICATE' ? '⊘' : '•'
+    const word = reason === 'COMPLETED' ? S.closedCompleted : reason === 'NOT_PLANNED' ? S.closedNotPlanned : reason === 'DUPLICATE' ? S.closedDuplicate : S.closedPlain
+    const first = item.prs[0]
+
+    return (
+      <Box key={`closed-row:${section.key}#${item.number}`} flexDirection="column">
+        <Text size="caption" wrap="wrap">
+          <Text color={reason === 'COMPLETED' ? INK.success : INK.muted}>{glyph}</Text> <Text color={INK.muted}>#{item.number}</Text> {clean(item.title)}
+        </Text>
+        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)}>
+          <Text size="caption" color={INK.muted}>
+            {word} · {shortAgo(item.closedAt, state.now, S.ago)} ·
+          </Text>
+          {first !== undefined && <Link href={clean(first.url)} label={clean(S.prRef(prRefOf(first, repoOfSection(section), true)))} />}
+          {item.prs.length > 1 && (
+            <Text size="caption" color={INK.muted}>
+              +{item.prs.length - 1}
+            </Text>
+          )}
+          {first !== undefined && (
+            <Text size="caption" color={INK.muted}>
+              ·
+            </Text>
+          )}
+          <Link href={clean(item.url)} label={S.github} />
+        </Box>
+      </Box>
+    )
+  }
+
+  /**
+   * A repository's collapsed "recently closed" part (E22), at the end of its section: a header with the count of the
+   * current window; expanded, the loading line, the failure above the last good rows, at most ten rows, the empty
+   * line and the links. Its rows count against the drawing's row budget.
+   */
+  const closedBlock = (section: Section) => {
+    if (options.closedDays <= 0 || section.info === null || section.state.kind !== 'ok') return null
+    const key = section.key
+    const isOpen = settings.showClosed?.[key] === true
+    const cache = state.closed[key]
+    const since = sinceDate(state.now, options.closedDays)
+    const header = (
+      <Box key={`closed:${key}`} flexDirection="row" alignItems="center" columnGap={step('sm', 1)} paddingX={step('sm', 1)}>
+        <Box flexGrow={1} flexShrink={1} minWidth={0}>
+          <Button key={`closed-toggle:${key}`} plain onPress={() => actions.toggleClosed(key)}>
+            <Text size="caption" color={INK.muted}>
+              {isOpen ? '▼' : '▶'}
+            </Text>{' '}
+            <Text size="footnote" color={INK.secondary}>
+              {S.closedTitle(options.closedDays)}
+            </Text>
+          </Button>
+        </Box>
+        {cache !== undefined && cache.since === since && (
+          <Box key={`closed-count:${key}`} flexShrink={0}>
+            {pill(closedCountLabel(cache), INK.muted, HUE.gray)}
+          </Box>
+        )}
+      </Box>
+    )
+    if (!isOpen) return header
+    const loadingAt = state.closedLoading[key]
+    const isLoading = loadingAt !== undefined && state.now - loadingAt < CLOSED_LOADING_MS
+    const failed = state.closedErrors[key]
+    const drawn = (cache?.rows ?? []).slice(0, Math.min(CLOSED_SHOWN, Math.max(0, rowsLeft)))
+    rowsLeft -= drawn.length
+
+    return (
+      <Box key={`closed-part:${key}`} flexDirection="column" rowGap={step('xs', 0)}>
+        {header}
+        <Box flexDirection="column" rowGap={step('xs', 0)} paddingX={step('md', 2)}>
+          {isLoading && (
+            <Text size="caption" color={INK.muted}>
+              {S.closedLoading}
+            </Text>
+          )}
+          {failed !== undefined && note(stateText(failed), INK.warning)}
+          {drawn.map(item => closedRow(section, item))}
+          {cache !== undefined && cache.since === since && cache.rows.length === 0 && !isLoading && (
+            <Text size="caption" color={INK.muted}>
+              {S.closedEmpty(options.closedDays)}
+            </Text>
+          )}
+          {cache !== undefined && (
+            <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)}>
+              <Link href={clean(`${section.info.url}/issues?q=is%3Aissue+is%3Aclosed`)} label={S.closedAll} />
+              <Text size="caption" color={INK.muted}>
+                · {S.closedAsOf(fmtTime(cache.fetchedAt))}
+              </Text>
+            </Box>
+          )}
+        </Box>
+      </Box>
+    )
+  }
+
+  /** The rows of a section, in E14's groups when grouping: a caption per group (`bug · 3`), the empty group last. */
+  const groupedRows = (section: Section, shown: readonly IssueRow[]) => {
+    const group = state.filter.group
+    const parts: RenderElement[] = []
+    let drawnCount = 0
+    for (const found of groupRows(shown, group)) {
+      const drawn = found.rows.slice(0, Math.max(0, rowsLeft))
+      rowsLeft -= drawn.length
+      drawnCount += drawn.length
+      if (group === 'none') {
+        parts.push(...drawn.map(item => row(section, item)))
+        continue
+      }
+      if (drawn.length === 0) continue
+      const name = found.id === '' ? S.groupEmpty[group] : cutText(clean(found.id), 40)
+      parts.push(
+        <Box key={`group:${section.key}:${found.id === '' ? '-' : found.id}`} flexDirection="column" rowGap={step('xs', 0)}>
+          <Box paddingX={step('sm', 1)}>
+            <Text size="caption" weight="semibold" color={INK.secondary}>
+              {`${name} · ${found.rows.length}`}
+            </Text>
+          </Box>
+          {drawn.map(item => row(section, item))}
+        </Box>,
+      )
+    }
+
+    return { parts, rest: shown.length - drawnCount }
+  }
+
   const sectionBlock = (section: Section) => {
     const label = labelOf(section)
     const isCollapsed = settings.collapsed[section.key] === true
-    const count = section.rows.length
-    const counted = section.total !== undefined && section.total > count ? `${count}/${section.total}` : String(count)
+    const isLoading = isStale(section)
+    const listed = listedOf(section)
+    const shown = shownOf(section)
+    const count = shown.length
+    // A filtered list counts its matches, the board facet the rows it keeps (E18-3); the default list E7's count.
+    const counted = isLoading ? '…' : !isFiltered(section) && boardFacet === '' && section.total !== undefined && section.total > count ? `${count}/${section.total}` : String(count)
     const header = (
       <Box flexDirection="row" alignItems="center" columnGap={step('sm', 1)} paddingX={step('sm', 1)} paddingY={step('xs', 0)}>
         <Box flexGrow={1} flexShrink={1} minWidth={0}>
@@ -772,22 +1162,123 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         </Box>
       )
     }
-    const drawn = section.rows.slice(0, Math.max(0, rowsLeft))
-    rowsLeft -= drawn.length
-    const rest = section.rows.length - drawn.length
+    const { parts, rest } = groupedRows(section, shown)
 
     return (
       <Box key={`sec:${section.key}`} flexDirection="column" rowGap={step('xs', 0)}>
         {header}
-        {stateBlock(section)}
+        {isLoading ? <Box paddingX={step('sm', 1)}>{note(S.loading(label), INK.muted)}</Box> : stateBlock(section)}
         {consentBlock(section)}
-        {drawn.map(item => row(section, item))}
+        {listed.length > 0 && shown.length === 0 && <Box paddingX={step('sm', 1)}>{note(S.emptyFiltered(label), INK.muted)}</Box>}
+        {parts}
         {rest > 0 && (
           <Text size="caption" color={INK.muted}>
             … +{rest}
           </Text>
         )}
         {pointer(section)}
+        {closedBlock(section)}
+      </Box>
+    )
+  }
+
+  // E11: assigned to me -------------------------------------------------------
+
+  /** The rows listed in the pane's sections, collapsed or past the row budget too (E11-4): ↓ Zeigen opens them. */
+  const listedKeys = new Set(state.sections.flatMap(section => section.rows.map(item => rowKeyOf(section.key, item.number))))
+  const paneRepos = new Set(state.sections.map(section => section.key))
+
+  /**
+   * One assigned issue, two lines (E11-7): the title; the repository (cut in the middle) and number, the age and the
+   * comments, GitHub ↗, and ↓ Zeigen when a section lists the issue, else + Beobachten when the repository is neither
+   * the checkout nor watched. No Work on it: an issue session works in this checkout.
+   */
+  const inboxRow = (item: InboxRow) => {
+    const [owner = '', name = ''] = item.repo.split('/')
+    const repoKey = `${item.host}/${owner}/${name}`.toLowerCase()
+    const key = rowKeyOf(repoKey, item.number)
+    const spec = item.host === 'github.com' ? item.repo : `${item.host}/${item.repo}`
+    const isListed = listedKeys.has(key)
+    const isWatchable = !isListed && !paneRepos.has(repoKey) && !settings.watch.some(watched => watched.toLowerCase() === spec.toLowerCase())
+
+    return (
+      <Box key={`inbox-row:${key}`} flexDirection="column" paddingX={step('sm', 1)} paddingY={step('xs', 0)}>
+        <Text weight="semibold" wrap="truncate-end">
+          {clean(item.title)}
+        </Text>
+        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)}>
+          <Box flexShrink={1} minWidth={0}>
+            <Text size="caption" color={INK.muted} wrap="truncate-middle">
+              {clean(`${item.repo}#${item.number}`)}
+            </Text>
+          </Box>
+          <Text size="caption" color={INK.muted}>
+            · {shortAgo(item.updatedAt, state.now, S.ago)} · {S.comment(item.commentCount)}
+          </Text>
+          <Link href={clean(item.url)} label={S.github} />
+          {isListed && <Button key={`inbox-show:${key}`} plain label={S.inboxShow} onPress={() => actions.showInSection(key)} />}
+          {isWatchable && <Button key={`inbox-watch:${key}`} plain label={S.inboxWatch} onPress={() => actions.addWatch(spec)} />}
+        </Box>
+      </Box>
+    )
+  }
+
+  /** E11's section, last: collapsed by default, its header V1's shape (the count pill beside the Button, never in it). */
+  const inboxBlock = () => {
+    if (!options.assignedToMe) return null
+    const box = state.inbox
+    const isCollapsed = settings.collapsed['inbox'] !== false
+    const counted = box.fetchedAt === null && box.rows.length === 0 ? '…' : String(box.rows.length)
+    const host = clean(box.host === '' ? 'github.com' : box.host)
+    const header = (
+      <Box flexDirection="row" alignItems="center" columnGap={step('sm', 1)} paddingX={step('sm', 1)} paddingY={step('xs', 0)}>
+        <Box flexGrow={1} flexShrink={1} minWidth={0}>
+          <Button key="section:inbox" plain onPress={actions.toggleInbox}>
+            <Text size="caption" color={INK.muted}>
+              {isCollapsed ? '▶' : '▼'}
+            </Text>{' '}
+            <Text weight="semibold">{S.inboxTitle}</Text>
+          </Button>
+        </Box>
+        <Box key="count:inbox" flexShrink={0}>
+          {pill(counted, box.rows.length > 0 ? INK.text : INK.muted, HUE.gray)}
+        </Box>
+      </Box>
+    )
+    if (isCollapsed) {
+      return (
+        <Box key="sec:inbox" flexDirection="column">
+          {header}
+        </Box>
+      )
+    }
+    const failed = box.state.kind === 'ok' || box.state.kind === 'loading' ? null : box.state
+    const drawn = box.rows.slice(0, Math.max(0, rowsLeft))
+    rowsLeft -= drawn.length
+
+    return (
+      <Box key="sec:inbox" flexDirection="column" rowGap={step('xs', 0)}>
+        {header}
+        {failed !== null && (
+          <Box flexDirection="column" rowGap={step('xs', 0)} paddingX={step('sm', 1)}>
+            {note(stateText(failed), failed.kind === 'error' ? INK.error : INK.warning)}
+            {(failed.kind === 'signed-out' || failed.kind === 'token-invalid') && <Code source={S.signInHint(host)} language="bash" />}
+          </Box>
+        )}
+        {box.fetchedAt !== null && box.rows.length === 0 && failed === null && <Box paddingX={step('sm', 1)}>{note(S.inboxEmpty, INK.muted)}</Box>}
+        {drawn.map(inboxRow)}
+        {box.rows.length >= Math.min(INBOX_CAP, options.maxIssues) && (
+          <Box paddingX={step('sm', 1)}>
+            <Link href={`https://${host}/issues/assigned`} label={S.inboxAll} />
+          </Box>
+        )}
+        {box.fetchedAt !== null && (
+          <Box paddingX={step('sm', 1)}>
+            <Text size="caption" color={INK.muted}>
+              {S.inboxSearched(fmtTime(box.fetchedAt))}
+            </Text>
+          </Box>
+        )}
       </Box>
     )
   }
@@ -795,9 +1286,13 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   // Footer ---------------------------------------------------------------
   const fetchedAt = state.sections.reduce<number | null>((latest, section) => (section.fetchedAt !== null && (latest === null || section.fetchedAt > latest) ? section.fetchedAt : latest), null)
   const openCount = state.sections.reduce((sum, section) => sum + section.rows.length, 0)
+  const shownCount = state.sections.reduce((sum, section) => sum + shownOf(section).length, 0)
   const footerParts: string[] = []
   if (fetchedAt !== null) footerParts.push(S.fetched(fmtTime(fetchedAt)))
-  footerParts.push(S.openCount(openCount))
+  // E14: matches while a filter lists; E18-3: how many of the listed rows the board facet keeps.
+  if (boardFacet !== '') footerParts.push(S.shownOf(shownCount, listedCount))
+  else if (state.sections.some(isFiltered)) footerParts.push(S.matches(listedCount))
+  else footerParts.push(S.openCount(openCount))
   if (options.recaps) footerParts.push(clean(options.recapModel))
   if (state.tokens > 0) footerParts.push(S.tokens(fmtK(state.tokens)))
   const footer = (
@@ -818,6 +1313,8 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     <Box flexDirection="column" minHeight={isRich ? Math.max(1, state.rows - 0.1) : undefined}>
       {titleBar}
       {hairline()}
+      {filterLine}
+      {filterPanel}
       {settingsPanel}
       <Box flexDirection="column" flexGrow={1} paddingY={step('sm', 0)} rowGap={step('sm', 0)}>
         {state.sections.length === 0 ? (
@@ -827,6 +1324,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         ) : (
           state.sections.map(sectionBlock)
         )}
+        {inboxBlock()}
       </Box>
       {hairline()}
       {footer}

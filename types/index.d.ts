@@ -13,6 +13,10 @@ export type Options = {
   /** Model alias for the recaps (`haiku`, `sonnet`). */
   recapModel: string
   language: Language
+  /** How many days back each repository's collapsed "Recently closed" part reaches (E22); 0 hides it. Clamped to 0–90. */
+  closedDays: number
+  /** Whether the pane adds the collapsed "Assigned to me" section from GitHub search (E11). */
+  assignedToMe: boolean
 }
 
 /** A GitHub repository as `gh repo view` resolved it. */
@@ -192,6 +196,11 @@ export type IssueMeta = {
   commentCount: number
   excerpt: string
   linkedPrs: LinkedPr[]
+  /**
+   * When a list (the default one or a filtered one) last showed the issue (E14-1): beyond the listed rows the store
+   * keeps the most recently shown, up to a bound, so a filter applied again costs no second read or recap.
+   */
+  seenAt?: number
 }
 
 export type RecapUsage = {
@@ -229,8 +238,117 @@ export type RepoSettings = {
   watch: string[]
   /** Recap consent per repository key; absent means not asked yet. */
   consent: Record<string, boolean>
-  /** Sections the owner collapsed. */
+  /** Sections the owner collapsed; `inbox` is E11's section, collapsed unless it is false. */
   collapsed: Record<string, boolean>
+  /** The saved views (E14), at most 8. */
+  views?: SavedView[]
+  /** Whether rows show their GitHub Projects status (E18); off unless true. */
+  boards?: boolean
+  /** The repositories whose "Recently closed" part is expanded (E22), by section key. */
+  showClosed?: Record<string, boolean>
+}
+
+/** How a filtered list is sorted (E14); `updated` is V1's order. */
+export type FilterSort = 'updated' | 'created' | 'oldest' | 'comments' | 'reactions'
+
+/** How the rows of a section are grouped (E14), drawn without a fetch. */
+export type FilterGroup = 'none' | 'label' | 'milestone' | 'assignee'
+
+/** The pane's one filter over every section (E14), the session's state only; the default lists as V1 does. */
+export type Filter = {
+  /** A built-in view (`open`, `mine`, `unassigned`, `recent`, `blocked`, `epics`) or a saved one's id (`custom:…`). */
+  view: string
+  /** The search as the owner typed it; sanitized before it reaches gh. */
+  search: string
+  /** A label name; empty for any. */
+  label: string
+  /** A milestone title; empty for any. */
+  milestone: string
+  sort: FilterSort
+  group: FilterGroup
+  /** E18's board facet, `<owner>/<project number>:<status>`; empty for any. Drawn without a fetch. */
+  board: string
+}
+
+/** A named query the owner saved for the checkout's repository (E14). */
+export type SavedView = { id: string; name: string; query: string }
+
+/** What the label and milestone pickers offer (E14): seen in the default lists, the most frequent first. */
+export type Facets = { labels: string[]; milestones: string[] }
+
+/** One GitHub Projects (v2) item of an issue (E18): the project and the item's single-select Status. */
+export type BoardItem = { owner: string; project: number; title: string; status: string | null }
+
+/** Whether a host's token reads Projects (`present`), lacks the scope (`missing`), or has not said yet (`unknown`). */
+export type BoardScope = 'present' | 'missing' | 'unknown'
+
+/** E18's board status, the session's state only: moving a card does not change an issue's updatedAt. */
+export type Boards = {
+  scope: Record<string, BoardScope>
+  /** Per host: the scope a missing-scope answer named. */
+  needs: Record<string, string>
+  /** Per host: the first line of the last failure other than a missing scope; gone once a read answers. */
+  detail: Record<string, string>
+  /** Per row key: the issue's items in open projects. */
+  items: Record<string, BoardItem[]>
+  fetchedAt: number | null
+}
+
+/** One issue assigned to the signed-in account, from GitHub search (E11): metadata only. */
+export type InboxRow = {
+  host: string
+  /** `owner/name`. */
+  repo: string
+  number: number
+  title: string
+  url: string
+  createdAt: string
+  updatedAt: string
+  commentCount: number
+  labels: IssueLabel[]
+}
+
+/** E11's section as the pane draws it. */
+export type Inbox = { host: string; state: RepoState; rows: InboxRow[]; fetchedAt: number | null }
+
+/** The store's `inbox:<host>`, shared by every pane on the machine, so the search budget is spent once. */
+export type InboxCache = {
+  v: 1
+  /** When the last search answered; 0 when none did. */
+  fetchedAt: number
+  rows: InboxRow[]
+  /** When the last search ran, answered or not. */
+  triedAt?: number
+  /** No timed search before this (a failure's back-off). */
+  retryAt?: number
+  /** No search at all before this, ↻ included (a rate limit). */
+  holdUntil?: number
+}
+
+/** A pull request that closed an issue, as gh names it (E22). */
+export type ClosedPr = { number: number; url: string; repo: string }
+
+/** One recently closed issue (E22): metadata only. */
+export type ClosedRow = {
+  number: number
+  title: string
+  url: string
+  closedAt: string
+  /** `COMPLETED`, `NOT_PLANNED`, `DUPLICATE`; empty for issues closed before GitHub kept a reason. */
+  stateReason: string
+  prs: ClosedPr[]
+}
+
+/** The store's `closed:<repoKey>` (E22): the newest closed issues of one window, replaced whole by each fetch. */
+export type ClosedCache = {
+  v: 1
+  fetchedAt: number
+  /** The UTC date the window starts on (`closed:>=`). */
+  since: string
+  /** The newest ten, by closing time. */
+  rows: ClosedRow[]
+  /** How many the fetch returned (at most 30). */
+  count: number
 }
 
 /** One repository's section of the pane. */
@@ -246,6 +364,10 @@ export type Section = {
   isCheckout: boolean
   /** The repository's open issues on GitHub when known (the probe's count, or an uncapped list's length; E7). */
   total?: number
+  /** E14: the search a filtered list asked gh (`--search=<query>`); absent on the default list. */
+  query?: string
+  /** E14: which filter asked that list; the pane draws a section whose filter is not the current one as loading. */
+  filterKey?: string
 }
 
 /** The store's per-repository cache of the list. */
@@ -287,6 +409,23 @@ declare module 'claude-code' {
       prs: Shaped<Record<string, PrRecord>>
       /** The pull request the app binds to each mapped issue session, by row key (E3); the session's memory only. */
       sessionPrs: Shaped<Record<string, SessionPr>>
+      /** The pane's filter (E14): survives a hot reload, starts at the default in each new session. */
+      filter: Shaped<Filter>
+      isFilterOpen: boolean
+      /** What the label and milestone pickers offer (E14). */
+      facets: Shaped<Facets>
+      /** Bumped when the filter clears its search, so the search field is drawn afresh, empty (E14-4). */
+      searchGen: number
+      /** E18's board status per row and the hosts' scope verdicts; never in the store. */
+      boards: Shaped<Boards>
+      /** E11's section. */
+      inbox: Shaped<Inbox>
+      /** E22's recently closed issues per repository key, mirrored from the store's `closed:`. */
+      closed: Shaped<Record<string, ClosedCache>>
+      /** E22: when a repository's closed list started loading; a display flag only (a reload leaves it, so it ages out). */
+      closedLoading: Record<string, number>
+      /** E22: the last failure per repository key, drawn above the last good rows. */
+      closedErrors: Shaped<Record<string, RepoState>>
     }
   }
 }

@@ -99,7 +99,7 @@ function hostOfSpec(spec: string): string {
   return parts.length >= 3 && parts[0] !== undefined && parts[0].includes('.') ? parts[0] : 'github.com'
 }
 
-function firstLine(text: string): string {
+export function firstLine(text: string): string {
   return text.split(/\r?\n/).map(line => line.trim()).find(line => line !== '') ?? ''
 }
 
@@ -344,11 +344,16 @@ function rowOf(data: Json): IssueRow | null {
   return row
 }
 
-function parseRows(text: string): IssueRow[] | null {
+/** The rows of a list's answer; with `isOpenOnly` (a filtered list, which asks `state`) only those GitHub says are open. */
+function parseRows(text: string, isOpenOnly = false): IssueRow[] | null {
   const json = parseJson(text)
   if (!Array.isArray(json)) return null
 
-  return json.filter(isRecord).map(rowOf).filter((row): row is IssueRow => row !== null)
+  return json
+    .filter(isRecord)
+    .filter(data => !isOpenOnly || str(data['state']).toUpperCase() === 'OPEN')
+    .map(rowOf)
+    .filter((row): row is IssueRow => row !== null)
 }
 
 /** One issue of the GraphQL Row fragment (E7, with E17's relations when asked) as a row; null when it is none. */
@@ -361,11 +366,17 @@ export function parseGraphRow(node: unknown): IssueRow | null {
  * relation fields too (E17), unless this repository failed with them before: a list that fails with them for any
  * reason they could cause is asked once more without them (E17-1), and the repository lists without them for good if
  * gh's failure named a relation field, else for half an hour, whether that second list answers or fails as well.
+ *
+ * With a `query` (E14's filtered list) the search goes as ONE argument, `--search=<query>`, so a query that starts
+ * with `-` (`-label:bug`) is never read as a flag; the list asks `state` too and keeps the open rows only (a qualifier
+ * the sanitizer does not know could still bring others), in GitHub's order: a sorted view is not sorted again.
  */
-export async function listIssues($: EngineInterface, info: RepoInfo, limit: number): Promise<{ rows: IssueRow[] } | { state: RepoState }> {
+export async function listIssues($: EngineInterface, info: RepoInfo, limit: number, query?: string): Promise<{ rows: IssueRow[] } | { state: RepoState }> {
   const now = await $.clock.now()
   const withRelations = hasRelations(info, now)
-  const args = (fields: string) => ['issue', 'list', '-R', repoSpec(info), '--state', 'open', '--limit', String(Math.max(1, limit)), '--search', 'sort:updated-desc', '--json', fields]
+  const isFiltered = query !== undefined
+  const search = isFiltered ? [`--search=${query}`] : ['--search', 'sort:updated-desc']
+  const args = (fields: string) => ['issue', 'list', '-R', repoSpec(info), '--state', 'open', '--limit', String(Math.max(1, limit)), ...search, '--json', isFiltered ? `${fields},state` : fields]
   let ran = await gh($, args(withRelations ? `${LIST_FIELDS},${LIST_RELATIONS}` : LIST_FIELDS), { host: info.host, repo: repoLabel(info) })
   if (!ran.ok && withRelations && !NOT_THE_RELATIONS.has(ran.state.kind)) {
     const said = ran.stderr ?? ran.state.detail ?? ''
@@ -380,10 +391,10 @@ export async function listIssues($: EngineInterface, info: RepoInfo, limit: numb
     )
   }
   if (!ran.ok) return { state: ran.state }
-  const rows = parseRows(ran.stdout)
+  const rows = parseRows(ran.stdout, isFiltered)
   if (rows === null) return { state: { kind: 'error', detail: 'gh issue list answered no JSON' } }
 
-  return { rows: rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)) }
+  return { rows: isFiltered ? rows : rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)) }
 }
 
 export function collapse(text: string): string {

@@ -43,6 +43,18 @@
       "title": "Language",
       "description": "Language of the pane's labels and of the recaps: de or en.",
       "default": "de"
+    },
+    "closedDays": {
+      "type": "number",
+      "title": "Recently closed (days)",
+      "description": "How many days back the collapsed Recently closed part of each repository reaches (0 to 90); 0 hides it. Fetched only while expanded and the pane is shown.",
+      "default": 7
+    },
+    "assignedToMe": {
+      "type": "boolean",
+      "title": "Assigned to me (all repositories)",
+      "description": "Adds a collapsed section listing the open issues assigned to you in any repository, from GitHub search; fetched at most every 15 minutes while the pane is shown.",
+      "default": false
     }
   }
 }

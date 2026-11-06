@@ -6,7 +6,8 @@
 // repository, and a second only when E7's probe found issues to read again.
 import type { EngineInterface } from 'claude-code'
 
-import type { IssueDetails, IssueRow, RepoInfo, RepoState } from '../types'
+import type { BoardItem, IssueDetails, IssueRow, RepoInfo, RepoState } from '../types'
+import { parseBoardItems } from './boards'
 import { countOf, gh, isRecord, nodesOf, parseGraphDetails, parseGraphRow, parseJson, repoLabel, scopeIn } from './github'
 import type { GhResult } from './github'
 import { PR_LINKS_MAX, parsePrConnection } from './prs'
@@ -148,6 +149,8 @@ export const MAPPED_MAX = 10
 export const PROBE_PAUSE_MS = 30 * 60_000
 /** At most this many issues one pull-request request names (E3). */
 export const PRS_MAX = 100
+/** At most this many issues one board request names (E18): one request per section up to the largest cap. */
+export const BOARDS_MAX = 100
 
 /** A pull request as E3 reads it: state, draft, review decision and the head commit's check rollup. */
 const PR_FIELDS = 'number url state isDraft reviewDecision repository { nameWithOwner } commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
@@ -197,6 +200,23 @@ export function rowsQuery(numbers: readonly number[], withRelations: boolean): s
 /** Tier 2's full read (E7): the rows of the whole window; the details follow per changed issue, as V1 reads them. */
 export function topQuery(withRelations: boolean): string {
   return `query IssueRadarTop($owner: String!, $name: String!, $first: Int!) { repository(owner: $owner, name: $name) { ${WINDOW} { totalCount nodes { ...Row } } } ${LIMIT} } ${rowFragment(withRelations)}`
+}
+
+/**
+ * E18: an issue's Projects (v2) items, the five newest that are not archived: the project (number, title, closed,
+ * owner) and the item's single-select `Status`. Needs the token's `read:project` scope; without it GitHub answers
+ * INSUFFICIENT_SCOPES for the whole query, with no data (measured live: a schema-valid query reports only the scope).
+ */
+const BOARD =
+  'fragment Board on Issue { projectItems(first: 5, includeArchived: false) { nodes { project { number title closed owner { ... on Organization { login } ... on User { login } } } status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }'
+
+/** E18: the board items of exactly the listed issues, one alias each. */
+export function boardsQuery(numbers: readonly number[]): string {
+  const aliases = numbersOf(numbers)
+    .map(number => ` i${number}: issue(number: ${number}) { ...Board }`)
+    .join('')
+
+  return `query IssueRadarBoards($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {${aliases} } ${LIMIT} } ${BOARD}`
 }
 
 /** E3 where V1's list ran: the pull requests of exactly the listed issues, one alias each. */
@@ -330,4 +350,23 @@ export async function fetchPrLinks($: EngineInterface, info: RepoInfo, numbers: 
   }
 
   return { links, cost: answer.cost, remaining: remainingOf(answer.data) }
+}
+
+/**
+ * E18: the listed issues' board items, at most BOARDS_MAX issues in one request (~1 point). A missing `read:project`
+ * comes back as the state `missing-scope`; an alias that misses (a pull request's number, an issue gone) has none.
+ */
+export async function fetchBoards($: EngineInterface, info: RepoInfo, numbers: readonly number[]): Promise<{ items: Map<number, BoardItem[]>; cost: number | null } | { state: RepoState }> {
+  const asked = numbersOf(numbers).slice(0, BOARDS_MAX)
+  const answer = await graphql($, info, boardsQuery(asked), { owner: info.owner, name: info.name })
+  if (!answer.ok) return { state: answer.state }
+  const repository = answer.data['repository']
+  if (!isRecord(repository)) return noData(info, 'repository')
+  const items = new Map<number, BoardItem[]>()
+  for (const number of asked) {
+    const node = repository[`i${number}`]
+    items.set(number, isRecord(node) ? parseBoardItems(node['projectItems']) : [])
+  }
+
+  return { items, cost: answer.cost }
 }

@@ -177,6 +177,13 @@ export type Project = {
   checks: Array<{ tool: string; input: unknown }>
   /** The ids of every `ui.close`, in order. */
   closed: string[]
+  /**
+   * Every `$.ui.log` line, in order. The 2.1.317 kit has no implementation beneath a plugin's `$.ui.scroll` (the call
+   * rejects, no test hook is raised), so a scroll is seen only through the line the plugin logs when it is refused.
+   */
+  logs: string[]
+  /** The prompt of every `$.model.complete` (a recap's names the issue's title), in order. */
+  prompts: string[]
   /** Shows or hides a placed pane (another tab in front of it), as `$.ui.panes()` reports it. */
   setShown: (isShown: boolean) => void
 }
@@ -198,6 +205,8 @@ export function project(on: On, setup: Setup = {}): Project {
   const toasts: string[] = []
   const toolCalls: Record<string, unknown>[] = []
   const checks: Array<{ tool: string; input: unknown }> = []
+  const logs: string[] = []
+  const prompts: string[] = []
   /** The open panes by id: the title and whether the latest open placed them. */
   const panes = new Map<string, { title: string; isPlaced: boolean }>()
   let isShown = setup.isShown ?? true
@@ -238,6 +247,11 @@ export function project(on: On, setup: Setup = {}): Project {
 
     return { value: undefined }
   })
+  on('ui.log', (_, e) => {
+    logs.push(e.text)
+
+    return { value: undefined }
+  })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('session.root', () => ({ value: 'D:\\proj' }))
@@ -265,9 +279,11 @@ export function project(on: On, setup: Setup = {}): Project {
 
     return ran('')
   })
-  on('model.complete', () => ({
-    value: { isAnswered: true, text: 'Der Export bricht bei leeren Ordnern ab; erwartet wird stattdessen ein leeres Archiv.', usage: USAGE },
-  }))
+  on('model.complete', (_, e) => {
+    prompts.push(e.prompt)
+
+    return { value: { isAnswered: true, text: 'Der Export bricht bei leeren Ordnern ab; erwartet wird stattdessen ein leeres Archiv.', usage: USAGE } }
+  })
   on('mcp.call', async (_, e) => {
     const call: McpCall = { server: e.server, tool: e.tool, args: (e.args ?? {}) as Record<string, unknown> }
     mcp.push(call)
@@ -303,6 +319,8 @@ export function project(on: On, setup: Setup = {}): Project {
     toolCalls,
     checks,
     closed,
+    logs,
+    prompts,
     setShown: value => {
       isShown = value
     },

@@ -5,11 +5,15 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, PrRecord, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section } from '../types'
+import type { Boards, ClosedCache, Filter, Inbox, IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, PrRecord, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section } from '../types'
 import { MARKER, branchName, renderBackground, renderBrief, sessionName, sessionTitle, spikeBrief } from './brief'
-import { dropRelations, isRepoSpec, listIssues, metaOf, repoKey, repoLabel, resetRelations, resolveCheckout, resolveNamed, stateOf, viewIssue, viewParent } from './github'
-import { MAPPED_MAX, PROBE_MAX, PROBE_PAUSE_MS, fetchPrLinks } from './graph'
+import { asClosedCache, closedRecord, isClosedDue, listClosed, sinceDate } from './closed'
+import type { ClosedReason } from './closed'
+import { DEFAULT_FILTER, MAX_VIEWS, TYPED_CHARS, asSavedViews, cleanViewName, cutText, effectiveQuery, facetsOf, filterKey, metaBound, retainMeta, sameFacets, sanitizeQuery, viewIdOf } from './filter'
+import { dropRelations, firstLine, isRepoSpec, listIssues, metaOf, repoKey, repoLabel, resetRelations, resolveCheckout, resolveNamed, stateOf, viewIssue, viewParent } from './github'
+import { MAPPED_MAX, PROBE_MAX, PROBE_PAUSE_MS, fetchBoards, fetchPrLinks } from './graph'
 import { asLanguage, strings } from './i18n'
+import { INBOX_CAP, asInboxCache, failedInbox, inboxPeriod, isInboxDue, searchAssigned } from './inbox'
 import { asRecord, isPrsDue, mergeLinks, recordOf } from './prs'
 import { recapIssue } from './recap'
 import { commandConsent, detachSession, focusSession, lookUpSession, parseObject, pressConsent, quietDesktop, readPrStatus, routeInUse, startDesktopSession } from './session'
@@ -22,7 +26,11 @@ const PLUGIN = 'issue-radar'
 const PANE = 'issue-radar'
 const PANE_COLUMNS = 46
 const DETAILS_CONCURRENCY = 2
-const STORE_PREFIXES = ['cache:', 'recaps:', 'session:', 'settings:', 'debug:', 'prs:'] as const
+const STORE_PREFIXES = ['cache:', 'recaps:', 'session:', 'settings:', 'debug:', 'prs:', 'inbox:', 'closed:'] as const
+/** E18: the shortest gap between two board reads of the same rows that the timer, a tool or a re-run asks for. */
+const BOARDS_MIN_MS = 60_000
+/** E11: how long a scroll to a row the press just opened waits before its one retry (E11-5). */
+const SCROLL_RETRY_MS = 250
 /** How often a mapped issue session's pull request is read from the app while it answers (E3). */
 const SESSION_PR_EVERY_MS = 60_000
 /** How long one session's pull-request read waits after the app did not answer it, or answered with an error (E3-1). */
@@ -55,6 +63,17 @@ const isIssueSession = atom({ plugin: 'issue-radar', key: 'isIssueSession' } as 
 const route = atom({ plugin: 'issue-radar', key: 'route' } as const, 'none')
 const prs = atom({ plugin: 'issue-radar', key: 'prs' } as const, {}, { shape: 'prs-1' })
 const sessionPrs = atom({ plugin: 'issue-radar', key: 'sessionPrs' } as const, {}, { shape: 'sessionprs-1' })
+const NO_BOARDS: Boards = { scope: {}, needs: {}, detail: {}, items: {}, fetchedAt: null }
+const NO_INBOX: Inbox = { host: '', state: { kind: 'loading' }, rows: [], fetchedAt: null }
+const filter = atom({ plugin: 'issue-radar', key: 'filter' } as const, DEFAULT_FILTER, { shape: 'filter-1' })
+const isFilterOpen = atom({ plugin: 'issue-radar', key: 'isFilterOpen' } as const, false)
+const facets = atom({ plugin: 'issue-radar', key: 'facets' } as const, { labels: [], milestones: [] }, { shape: 'facets-1' })
+const searchGen = atom({ plugin: 'issue-radar', key: 'searchGen' } as const, 0)
+const boards = atom({ plugin: 'issue-radar', key: 'boards' } as const, NO_BOARDS, { shape: 'boards-1' })
+const inbox = atom({ plugin: 'issue-radar', key: 'inbox' } as const, NO_INBOX, { shape: 'inbox-1' })
+const closed = atom({ plugin: 'issue-radar', key: 'closed' } as const, {}, { shape: 'closed-1' })
+const closedLoading = atom({ plugin: 'issue-radar', key: 'closedLoading' } as const, {})
+const closedErrors = atom({ plugin: 'issue-radar', key: 'closedErrors' } as const, {}, { shape: 'closederrors-1' })
 
 // Module state: lost on a hot reload, which is fine, since the next refresh rebuilds it.
 let timer: Timer | undefined
@@ -96,6 +115,20 @@ const prFailuresLogged = new Set<string>()
 const sessionPrNext = new Map<string, number>()
 let isReadingSessionPrs = false
 let hasLoggedStatusRaw = false
+/**
+ * E3 for filtered sections (E14): their rows' pull-request states, read as the default list's are but kept in this
+ * module only, per section and query. `prs:<repoKey>` serves the default list and is never written from a filter.
+ */
+const filteredPrs = new Map<string, { query: string; record: PrRecord }>()
+const filteredPrTried = new Map<string, { query: string; at: number }>()
+/** E18: when each section's board items were last asked, and for which rows. */
+const boardsReadAt = new Map<string, { at: number; rows: string }>()
+/** E22: the closed lists in flight, claimed synchronously; a reload clears them, unlike a flag in `$.state` (E22-1). */
+const closedInFlight = new Set<string>()
+/** E22: until when a repository's closed list waits after a rate limit or no network. */
+const closedBackoff = new Map<string, number>()
+/** E22: repositories an issue just left (a complete list lost it, or Work on it found it closed): read again after 30 s. */
+const closedNudge = new Set<string>()
 
 type Resolved = { spec: string; info: RepoInfo | null; state: RepoState; isCheckout: boolean }
 /**
@@ -128,6 +161,8 @@ function readOptions(given: PluginOptions): Options {
     recaps: flag('recaps', true),
     recapModel: model,
     language: asLanguage(given['language']) as Language,
+    closedDays: Math.min(90, Math.round(num('closedDays', 7))),
+    assignedToMe: flag('assignedToMe', false),
   }
 }
 
@@ -154,7 +189,11 @@ async function writeStore($: EngineInterface, key: string, value: unknown): Prom
   }
 }
 
-/** The settings as stored, each one missing or of the wrong type at its default; a stored spec is checked again before it reaches gh. */
+/**
+ * The settings as stored, rebuilt field by field, each one missing or of the wrong type at its default; a stored spec
+ * is checked again before it reaches gh. The optional fields (E14's views, E18's boards, E22's expanded parts) are
+ * kept only when they say something, so a V1 record stays as it was.
+ */
 function readSettings(stored: unknown): RepoSettings {
   const value = typeof stored === 'object' && stored !== null ? (stored as Record<string, unknown>) : {}
   const watch = Array.isArray(value['watch']) ? (value['watch'] as unknown[]).filter((spec): spec is string => typeof spec === 'string' && isRepoSpec(spec)) : []
@@ -164,8 +203,14 @@ function readSettings(stored: unknown): RepoSettings {
 
     return Object.fromEntries(Object.entries(given as Record<string, unknown>).filter((entry): entry is [string, boolean] => typeof entry[1] === 'boolean'))
   }
+  const settled: RepoSettings = { watch, consent: record('consent'), collapsed: record('collapsed') }
+  const views = asSavedViews(value['views'])
+  if (views.length > 0) settled.views = views
+  if (value['boards'] === true) settled.boards = true
+  const showClosed = Object.fromEntries(Object.entries(record('showClosed')).filter(([, isShown]) => isShown))
+  if (Object.keys(showClosed).length > 0) settled.showClosed = showClosed
 
-  return { watch, consent: record('consent'), collapsed: record('collapsed') }
+  return settled
 }
 
 async function loadVersion($: EngineInterface): Promise<void> {
@@ -447,7 +492,10 @@ async function probeSection($: EngineInterface, options: Options, target: Resolv
 
     return { section, meta: cache.meta ?? {}, details: new Map(), record: undefined, log: { plan: 'failed', state: outcome.state.kind, links: withLinks } }
   }
-  const written: RepoCache = { fetchedAt: now, rows: outcome.rows, meta: outcome.meta, total: outcome.total }
+  // E14-1: beyond the window the store keeps the most recently shown issues' meta, which a filter may show again.
+  const isWhole = outcome.rows.length < options.maxIssues && outcome.total <= outcome.rows.length
+  const meta = retainMeta({ ...(cache.meta ?? {}), ...outcome.meta }, new Set(outcome.rows.map(row => String(row.number))), isWhole, metaBound(options.maxIssues), now)
+  const written: RepoCache = { fetchedAt: now, rows: outcome.rows, meta, total: outcome.total }
   await writeStore($, storeKeyOf('cache:', sectionKey), written)
   backoffUntil.delete(sectionKey)
   let record: PrRecord | undefined
@@ -463,18 +511,48 @@ async function probeSection($: EngineInterface, options: Options, target: Resolv
   if (record !== undefined) await writeStore($, storeKeyOf('prs:', sectionKey), record)
   const section: Section = { ...base, state: { kind: 'ok' }, rows: outcome.rows, fetchedAt: now, total: outcome.total }
 
-  return { section, meta: outcome.meta, details: outcome.details, record, log: { plan: outcome.plan, cost: outcome.cost, remaining: outcome.remaining, links: outcome.links !== null } }
+  return { section, meta, details: outcome.details, record, log: { plan: outcome.plan, cost: outcome.cost, remaining: outcome.remaining, links: outcome.links !== null } }
+}
+
+/** The pull-request record a filtered section read for its own query (E14); undefined before it read one. */
+function filteredRecordOf(section: Section): PrRecord | undefined {
+  const own = section.query === undefined ? undefined : filteredPrs.get(section.key)
+
+  return own !== undefined && own.query === section.query ? own.record : undefined
+}
+
+/**
+ * E14: one repository's filtered list, gh's search with the filter's query as one argument, in GitHub's order. It is
+ * never written to the store's list (`cache:` stays the default list's) and never prunes it. A timed refresh keeps
+ * the rows this pane listed for the same query less than 0.9 periods ago, or while a back-off holds; a failure keeps
+ * them under its state.
+ */
+async function listFiltered($: EngineInterface, options: Options, target: Resolved, info: RepoInfo, sectionKey: string, before: Section | undefined, query: string, listKey: string | undefined, reason: Reason, now: number, freshFor: number): Promise<Section> {
+  const same = before?.query === query ? before : undefined
+  const until = backoffUntil.get(sectionKey) ?? 0
+  if (reason === 'timer' && same !== undefined && (now < until || (same.fetchedAt !== null && now - same.fetchedAt < freshFor))) return same
+  const base = { key: sectionKey, spec: target.spec, info, isCheckout: target.isCheckout, query, ...(listKey === undefined ? {} : { filterKey: listKey }) }
+  const listed = await listIssues($, info, options.maxIssues, query)
+  if ('state' in listed) {
+    backoffFor(sectionKey, listed.state, now)
+
+    return { ...base, state: listed.state, rows: same?.rows ?? [], fetchedAt: same?.fetchedAt ?? null }
+  }
+  backoffUntil.delete(sectionKey)
+
+  return { ...base, state: { kind: 'ok' }, rows: listed.rows, fetchedAt: now }
 }
 
 /**
  * Mirrors each listed repository's stored pull-request record into the state (another pane may have read it since),
- * the ones this refresh read taking precedence, and drops the records of repositories no longer listed.
+ * the ones this refresh read taking precedence, and drops the records of repositories no longer listed. A filtered
+ * section draws the record its own query read, and the default list's stored one until it has read it.
  */
 async function loadPrCache($: EngineInterface, current: readonly Section[], fresh: ReadonlyMap<string, PrRecord>): Promise<void> {
   const found: Record<string, PrRecord> = {}
   for (const section of current) {
     if (section.info === null) continue
-    const record = fresh.get(section.key) ?? asRecord(await readStore<unknown>($, storeKeyOf('prs:', section.key)))
+    const record = filteredRecordOf(section) ?? fresh.get(section.key) ?? asRecord(await readStore<unknown>($, storeKeyOf('prs:', section.key)))
     if (record !== undefined) found[section.key] = record
   }
   await update($, prs, () => found)
@@ -499,15 +577,20 @@ function notePrFailure($: EngineInterface, section: Section, state: RepoState, n
 /**
  * E3 where V1's list ran: one GraphQL request per repository for the listed issues' pull requests, when they are due
  * (isPrsDue) and the pane is shown (D X-1). Repositories E7 probed this refresh are skipped: their states rode in the
- * probe, or wait for the next one.
+ * probe, or wait for the next one. A filtered section (E14) reads its own rows the same way, on a cadence of its own
+ * query, and keeps the record in this module: the store's record stays the default list's (E14-1).
  */
 async function refreshPrs($: EngineInterface, current: readonly Section[], reason: Reason, now: number, probed: ReadonlySet<string>, log: Record<string, string>): Promise<void> {
   for (const section of current) {
     if (section.state.kind !== 'ok' || section.info === null || section.rows.length === 0 || probed.has(section.key)) continue
     if (prsOffHosts.has(section.info.host)) continue
-    const stored = (await read($, prs))[section.key]
-    if (!isPrsDue(stored, section.rows, reason, now, prTriedAt.get(section.key), backoffUntil.get(section.key) ?? 0)) continue
-    prTriedAt.set(section.key, now)
+    const query = section.query
+    const tried = filteredPrTried.get(section.key)
+    const stored = query === undefined ? (await read($, prs))[section.key] : filteredRecordOf(section)
+    const triedAt = query === undefined ? prTriedAt.get(section.key) : tried?.query === query ? tried.at : undefined
+    if (!isPrsDue(stored, section.rows, reason, now, triedAt, backoffUntil.get(section.key) ?? 0)) continue
+    if (query === undefined) prTriedAt.set(section.key, now)
+    else filteredPrTried.set(section.key, { query, at: now })
     const fetched = await fetchPrLinks($, section.info, section.rows.map(row => row.number))
     if ('state' in fetched) {
       notePrFailure($, section, fetched.state, now)
@@ -515,9 +598,10 @@ async function refreshPrs($: EngineInterface, current: readonly Section[], reaso
       continue
     }
     const record = recordOf(fetched.links, newest(section.rows.map(row => row.updatedAt)), now)
-    await writeStore($, storeKeyOf('prs:', section.key), record)
+    if (query === undefined) await writeStore($, storeKeyOf('prs:', section.key), record)
+    else filteredPrs.set(section.key, { query, record })
     await update($, prs, current => ({ ...current, [section.key]: record }))
-    log[section.key] = `read (cost ${fetched.cost ?? '?'})`
+    log[section.key] = `read (cost ${fetched.cost ?? '?'})${query === undefined ? '' : ', filtered'}`
   }
 }
 
@@ -611,6 +695,8 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     const previous = await read($, sections)
     const nextSections: Section[] = []
     const cachedMeta = new Map<string, Record<string, IssueMeta>>()
+    /** Each repository's stored default list: the facets come from it while a filter shows other rows (E14). */
+    const cachedLists = new Map<string, IssueRow[]>()
     // Two specs can name one repository (`owner/name` and `github.com/owner/name`, a rename gh redirects): one section per key.
     const seenKeys = new Set<string>()
     // New background fetches run only while the pane is shown (D X-1): E3's pull-request states here.
@@ -621,12 +707,19 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     const prUpdates = new Map<string, PrRecord>()
     const probeLog: Record<string, Record<string, unknown>> = {}
     const prLog: Record<string, string> = {}
+    // E14: one filter for every section; null is V1's list, the same call and the same cache.
+    const views = chosen.views ?? []
+    const activeFilter = await read($, filter)
+    const query = effectiveQuery(activeFilter, views, now)
+    const listKey = filterKey(activeFilter, views)
 
     for (const target of targets) {
       const sectionKey = target.info === null ? `spec:${target.spec}`.toLowerCase() : repoKey(target.info)
       if (seenKeys.has(sectionKey)) continue
       seenKeys.add(sectionKey)
       const before = previous.find(section => section.key === sectionKey)
+      // The default list never builds on rows a filter listed (E14).
+      const prior = before?.query === undefined ? before : undefined
       if (target.info === null) {
         nextSections.push({ key: sectionKey, spec: target.spec, info: null, state: target.state, rows: [], fetchedAt: null, isCheckout: target.isCheckout })
         continue
@@ -640,21 +733,26 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
       const cachedRows = Array.isArray(cache?.rows) ? cache.rows : []
       const cachedAt = typeof cache?.fetchedAt === 'number' ? cache.fetchedAt : null
       cachedMeta.set(sectionKey, typeof cache?.meta === 'object' && cache?.meta !== null ? cache.meta : {})
+      cachedLists.set(sectionKey, cachedRows)
       const freshFor = Math.max(MIN_PERIOD_MS, options.refreshMinutes * 60_000 * 0.9)
       const isFresh = cachedAt !== null && now - cachedAt < freshFor
       const until = backoffUntil.get(sectionKey) ?? 0
+      if (query !== null) {
+        nextSections.push(await listFiltered($, options, target, target.info, sectionKey, before, query, listKey, reason, now, freshFor))
+        continue
+      }
       // A timed refresh trusts a list another pane of the project fetched a moment ago, and waits out a back-off;
       // it adopts that list when it is newer than this pane's, so rows and fetch time agree.
       if (reason === 'timer' && (isFresh || now < until)) {
-        const useCache = cachedAt !== null && cachedAt > (before?.fetchedAt ?? 0)
-        const total = useCache ? cache?.total : (before?.total ?? cache?.total)
+        const useCache = cachedAt !== null && cachedAt > (prior?.fetchedAt ?? 0)
+        const total = useCache ? cache?.total : (prior?.total ?? cache?.total)
         nextSections.push({
           key: sectionKey,
           spec: target.spec,
           info: target.info,
-          state: useCache ? { kind: 'ok' } : (before?.state ?? { kind: 'ok' }),
-          rows: useCache ? cachedRows : (before?.rows ?? cachedRows),
-          fetchedAt: useCache ? cachedAt : (before?.fetchedAt ?? cachedAt),
+          state: useCache ? { kind: 'ok' } : (prior?.state ?? { kind: 'ok' }),
+          rows: useCache ? cachedRows : (prior?.rows ?? cachedRows),
+          fetchedAt: useCache ? cachedAt : (prior?.fetchedAt ?? cachedAt),
           isCheckout: target.isCheckout,
           ...(total === undefined ? {} : { total }),
         })
@@ -664,7 +762,7 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
       if ((reason === 'timer' || reason === 'tool') && cache !== undefined && probeEngaged(cache, options.maxIssues, now, probeOffUntil.get(sectionKey) ?? 0)) {
         const stored = asRecord(await readStore<unknown>($, storeKeyOf('prs:', sectionKey)))
         const withLinks = isShown && !prsOffHosts.has(target.info.host) && isPrsDue(stored, cachedRows, reason, now, prTriedAt.get(sectionKey), until)
-        const done = await probeSection($, options, target, target.info, sectionKey, { ...cache, rows: cachedRows, meta: cachedMeta.get(sectionKey) ?? {} }, before, now, withLinks)
+        const done = await probeSection($, options, target, target.info, sectionKey, { ...cache, rows: cachedRows, meta: cachedMeta.get(sectionKey) ?? {} }, prior, now, withLinks)
         if (done !== null) {
           probed.add(sectionKey)
           probeLog[sectionKey] = done.log
@@ -680,14 +778,14 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
       if ('state' in listed) {
         backoffFor(sectionKey, listed.state, now)
         // The last good list stays visible under the error.
-        const total = before?.total ?? cache?.total
+        const total = prior?.total ?? cache?.total
         nextSections.push({
           key: sectionKey,
           spec: target.spec,
           info: target.info,
           state: listed.state,
-          rows: before?.rows ?? cachedRows,
-          fetchedAt: before?.fetchedAt ?? cachedAt,
+          rows: prior?.rows ?? cachedRows,
+          fetchedAt: prior?.fetchedAt ?? cachedAt,
           isCheckout: target.isCheckout,
           ...(total === undefined ? {} : { total }),
         })
@@ -695,10 +793,12 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
       }
       backoffUntil.delete(sectionKey)
       const open = new Set(listed.rows.map(row => String(row.number)))
-      const meta = Object.fromEntries(Object.entries(cachedMeta.get(sectionKey) ?? {}).filter(([number]) => open.has(number)))
-      cachedMeta.set(sectionKey, meta)
       // An uncapped list counts the open issues itself; a capped one keeps the probe's last count while it still fits (E7).
       const total = listed.rows.length < options.maxIssues ? listed.rows.length : cache?.total !== undefined && cache.total >= listed.rows.length ? cache.total : undefined
+      // V1 kept the listed issues' meta only; a capped list now keeps the most recently shown others too (E14-1).
+      const isWhole = listed.rows.length < options.maxIssues && (total ?? 0) <= listed.rows.length
+      const meta = retainMeta(cachedMeta.get(sectionKey) ?? {}, open, isWhole, metaBound(options.maxIssues), now)
+      cachedMeta.set(sectionKey, meta)
       const fresh: RepoCache = { fetchedAt: now, rows: listed.rows, meta, ...(total === undefined ? {} : { total }) }
       await writeStore($, storeKeyOf('cache:', sectionKey), fresh)
       nextSections.push({ key: sectionKey, spec: target.spec, info: target.info, state: { kind: 'ok' }, rows: listed.rows, fetchedAt: now, isCheckout: target.isCheckout, ...(total === undefined ? {} : { total }) })
@@ -741,23 +841,46 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     }
     await update($, recaps, current => Object.fromEntries(Object.entries(current).filter(([rowKey]) => live.has(rowKey))))
     await update($, opened, current => (current === '' || live.has(current) ? current : ''))
+    // E22: an issue that left a complete default list probably just closed; its repository's closed list is read again
+    // once it is 30 s old (E22-2: a capped list loses issues whenever another one is updated, so it says nothing).
+    for (const section of nextSections) {
+      const was = previous.find(found => found.key === section.key)
+      if (was === undefined || was.query !== undefined || section.query !== undefined || section.state.kind !== 'ok' || !isComplete(section, options)) continue
+      const open = new Set(section.rows.map(row => row.number))
+      if (was.rows.some(row => !open.has(row.number))) closedNudge.add(section.key)
+    }
     await update($, sections, () => nextSections)
+    // E14: the pickers offer what the default lists hold, the stored one while a filter shows other rows.
+    const nextFacets = facetsOf(nextSections.map(section => (section.query === undefined ? section.rows : (cachedLists.get(section.key) ?? []))))
+    if (!sameFacets(await read($, facets), nextFacets)) await update($, facets, () => nextFacets)
     // The stored pull-request states draw at once; then the due ones are read, before the details (E3-5).
     await loadPrCache($, nextSections, prUpdates)
     if (isShown) await refreshPrs($, nextSections, reason, now, probed, prLog)
+    // E11 and E18 run before the details, and only while the pane is shown (D X-1).
+    const inboxLog = isShown ? await refreshInbox($, options, reason, now) : 'not shown'
+    if (isShown) await refreshBoards($, nextSections, reason, now, false)
     // The last refresh's outcome, for the spike notes and a look at the store file.
     await writeStore($, 'debug:last', {
       at: now,
       reason,
       root,
       checkout: checkout.state,
-      sections: nextSections.map(section => ({ key: section.key, state: section.state, rows: section.rows.length, ...(section.total === undefined ? {} : { total: section.total }) })),
+      sections: nextSections.map(section => ({
+        key: section.key,
+        state: section.state,
+        rows: section.rows.length,
+        ...(section.total === undefined ? {} : { total: section.total }),
+        ...(section.query === undefined ? {} : { query: section.query }),
+      })),
       probe: probeLog,
       prs: prLog,
+      inbox: inboxLog,
     })
 
     await hydrate($, options, nextSections, now)
     await pruneMappings($, options, nextSections)
+    // E22 after the details: the expanded closed lists that are due, only while the pane is shown (D X-1).
+    if (isShown) await refreshClosed($, options, nextSections, reason, now)
     // The desktop's part comes last and is not awaited: no desktop call holds up the GitHub part (A-F4).
     void readSessionPrs($, nextSections)
   } catch (error) {
@@ -804,27 +927,38 @@ async function hydrate($: EngineInterface, options: Options, current: readonly S
     }
     await Promise.all(Array.from({ length: Math.min(DETAILS_CONCURRENCY, tasks.length) }, worker))
   }
-  // One store write per touched repository with the meta and the recaps as they stand now.
+  // One store write per touched repository: the meta and the recaps of its rows as they stand now, merged into what
+  // the store keeps of the other issues within E14-1's bound. A filtered section never writes the list itself.
   const allDetails = await read($, details)
   const allRecaps = await read($, recaps)
   for (const section of current) {
     if (!touchedRepos.has(section.key)) continue
+    const isFiltered = section.query !== undefined
     const cache = await readStore<RepoCache>($, storeKeyOf('cache:', section.key))
-    const meta: Record<string, IssueMeta> = {}
+    const merged: Record<string, IssueMeta> = { ...(typeof cache?.meta === 'object' && cache?.meta !== null ? cache.meta : {}) }
+    const listed = new Set<string>()
     const repoRecaps: Record<string, Recap> = {}
     for (const row of section.rows) {
       const rowKey = rowKeyOf(section.key, row.number)
+      listed.add(String(row.number))
       const have = allDetails[rowKey]
-      if (have !== undefined) meta[String(row.number)] = metaOf(have)
+      if (have !== undefined) merged[String(row.number)] = metaOf(have)
       const recap = allRecaps[rowKey]
       if (recap !== undefined && recap.error === undefined) repoRecaps[String(row.number)] = recap
     }
+    const meta = retainMeta(merged, listed, !isFiltered && isComplete(section, options), metaBound(options.maxIssues), now)
     const total = cache?.total ?? section.total
-    const merged: RepoCache = { fetchedAt: cache?.fetchedAt ?? section.fetchedAt ?? now, rows: cache?.rows ?? section.rows, meta, ...(total === undefined ? {} : { total }) }
-    await writeStore($, storeKeyOf('cache:', section.key), merged)
-    // Recaps stay on disk only while the owner wants them for this repository.
-    if (options.recaps && chosen.consent[section.key] === true) await writeStore($, storeKeyOf('recaps:', section.key), repoRecaps)
-    else await $.store.delete(storeKeyOf('recaps:', section.key)).catch(() => undefined)
+    const written: RepoCache = isFiltered
+      ? { ...(cache ?? { fetchedAt: 0, rows: [] }), meta }
+      : { fetchedAt: cache?.fetchedAt ?? section.fetchedAt ?? now, rows: cache?.rows ?? section.rows, meta, ...(total === undefined ? {} : { total }) }
+    await writeStore($, storeKeyOf('cache:', section.key), written)
+    // Recaps stay on disk only while the owner wants them for this repository: the listed rows' as they stand, the
+    // others' as long as the store keeps their meta.
+    if (options.recaps && chosen.consent[section.key] === true) {
+      const stored = await readStore<Record<string, Recap>>($, storeKeyOf('recaps:', section.key))
+      const others = Object.entries(typeof stored === 'object' && stored !== null ? stored : {}).filter(([number]) => !listed.has(number) && meta[number] !== undefined)
+      await writeStore($, storeKeyOf('recaps:', section.key), { ...Object.fromEntries(others), ...repoRecaps })
+    } else await $.store.delete(storeKeyOf('recaps:', section.key)).catch(() => undefined)
   }
 }
 
@@ -867,11 +1001,14 @@ function isComplete(section: Section, options: Options): boolean {
   return section.rows.length < options.maxIssues && (section.total ?? 0) <= section.rows.length
 }
 
-/** A mapping whose issue is no longer open is dropped; its session closed the issue, or someone did by hand. Only a complete list says an issue is gone. */
+/**
+ * A mapping whose issue is no longer open is dropped; its session closed the issue, or someone did by hand. Only a
+ * complete default list says an issue is gone: a filtered list (E14) is not the open set.
+ */
 async function pruneMappings($: EngineInterface, options: Options, current: readonly Section[]): Promise<void> {
   const all = await read($, mappings)
   for (const section of current) {
-    if (section.state.kind !== 'ok' || !isComplete(section, options)) continue
+    if (section.state.kind !== 'ok' || section.query !== undefined || !isComplete(section, options)) continue
     const open = new Set(section.rows.map(row => rowKeyOf(section.key, row.number)))
     for (const rowKey of Object.keys(all)) {
       if (rowKey.startsWith(`${section.key}#`) && !open.has(rowKey)) await saveMapping($, rowKey, null)
@@ -942,6 +1079,8 @@ async function freshDetails($: EngineInterface, options: Options, section: Secti
     $.ui.toast(S.closedMeanwhile(row.number))
     await update($, sections, current => current.map(found => (found.key === section.key ? { ...found, rows: found.rows.filter(item => item.number !== row.number) } : found)))
     await saveMapping($, rowKey, null)
+    // E22: the repository's closed list, when expanded, is read again on the next refresh (once it is 30 s old).
+    closedNudge.add(section.key)
 
     return null
   }
@@ -1106,6 +1245,304 @@ async function toggleRow($: EngineInterface, options: Options, rowKey: string): 
   await hydrateOne($, options, found.section, found.row, await $.clock.now())
 }
 
+// E14: the filter ------------------------------------------------------------
+
+/**
+ * Changes the pane's filter, and lists again only when the query gh would be asked changed: the grouping and the
+ * board facet are drawn from the rows already listed.
+ */
+async function setFilter($: EngineInterface, options: Options, patch: Partial<Filter>): Promise<void> {
+  const views = (await read($, settings)).views ?? []
+  const now = await $.clock.now()
+  const before = await read($, filter)
+  const next: Filter = { ...before, ...patch }
+  await update($, filter, () => next)
+  if (effectiveQuery(before, views, now) !== effectiveQuery(next, views, now)) schedule($, options, 0)
+}
+
+/** The search as typed (Enter applies, an empty Enter clears): one line, cleaned; the sanitizer runs on the query. */
+async function setSearch($: EngineInterface, options: Options, text: string): Promise<void> {
+  await setFilter($, options, { search: cutText(clean(text).replace(/\s+/g, ' ').trim(), TYPED_CHARS) })
+}
+
+/** Restores the default filter; the search field is drawn afresh, empty (E14-4). */
+async function clearFilter($: EngineInterface, options: Options): Promise<void> {
+  await update($, searchGen, current => current + 1)
+  await setFilter($, options, DEFAULT_FILTER)
+}
+
+/**
+ * Saves the current search as a view of the checkout's repository (at most 8; the same name replaces its view) and
+ * switches to it; the query is the sanitized search, so a saved view never leaves the repository.
+ */
+async function saveView($: EngineInterface, options: Options, name: string): Promise<void> {
+  const S = strings(options.language)
+  const shown = cleanViewName(name)
+  const query = sanitizeQuery((await read($, filter)).search).query
+  if (shown === null || query === '') return
+  const id = viewIdOf(shown)
+  let isFull = false
+  await saveSettings($, current => {
+    const views = current.views ?? []
+    const isKnown = views.some(view => view.id === id)
+    if (!isKnown && views.length >= MAX_VIEWS) {
+      isFull = true
+
+      return current
+    }
+
+    return { ...current, views: isKnown ? views.map(view => (view.id === id ? { id, name: shown, query } : view)) : [...views, { id, name: shown, query }] }
+  })
+  if (isFull) {
+    $.ui.toast(S.viewsFull)
+
+    return
+  }
+  await update($, searchGen, current => current + 1)
+  await setFilter($, options, { view: id, search: '' })
+}
+
+/** Removes a saved view; a pane showing it falls back to the open issues and lists again. */
+async function removeView($: EngineInterface, options: Options, id: string): Promise<void> {
+  await saveSettings($, current => {
+    const next = { ...current }
+    const views = (current.views ?? []).filter(view => view.id !== id)
+    if (views.length > 0) next.views = views
+    else delete next.views
+
+    return next
+  })
+  if ((await read($, filter)).view !== id) return
+  await update($, filter, current => ({ ...current, view: 'open' }))
+  schedule($, options, 0)
+}
+
+/** E17-4: an epic's open sub-issues in the list, through E14's search (`parent-issue:owner/name#n`, verified live). */
+async function listSubIssues($: EngineInterface, options: Options, rowKey: string): Promise<void> {
+  const hash = rowKey.lastIndexOf('#')
+  const found = findRow(await read($, sections), rowKey.slice(0, hash), Number(rowKey.slice(hash + 1)))
+  if (found === null || found.section.info === null) return
+  await update($, searchGen, current => current + 1)
+  await setFilter($, options, { view: 'open', search: `parent-issue:${repoLabel(found.section.info)}#${found.row.number}`, label: '', milestone: '' })
+}
+
+// E18: board status ------------------------------------------------------------
+
+/**
+ * Reads the listed rows' Projects status, one request per section, while the feature is on for the checkout's
+ * repository; collapsed sections wait (E18-2). The timer, a tool and the mod's own re-runs ask at most once a minute
+ * for the same rows, and never while the host's token lacks the scope; the session's start, ↻ and the owner's presses
+ * (`force`: the toggle, Erneut prüfen) always ask, since the owner may have granted the scope meanwhile. A rate limit,
+ * no network or a signed-out gh keep the last items; another failure is named in the ⚙ panel.
+ */
+async function refreshBoards($: EngineInterface, current: readonly Section[], reason: Reason, now: number, force: boolean, onlyHost?: string): Promise<void> {
+  const chosen = await read($, settings)
+  if (chosen.boards !== true) return
+  for (const section of current) {
+    const info = section.info
+    if (info === null || section.state.kind !== 'ok' || section.rows.length === 0 || chosen.collapsed[section.key] === true) continue
+    if (onlyHost !== undefined && info.host !== onlyHost) continue
+    const numbers = section.rows.map(row => row.number)
+    const asked = numbers.join(',')
+    const last = boardsReadAt.get(section.key)
+    if (!force && reason !== 'start' && reason !== 'press') {
+      if ((await read($, boards)).scope[info.host] === 'missing') continue
+      if (last !== undefined && last.rows === asked && now - last.at < BOARDS_MIN_MS) continue
+    }
+    boardsReadAt.set(section.key, { at: now, rows: asked })
+    const fetched = await fetchBoards($, info, numbers)
+    if ('state' in fetched) {
+      const failed = fetched.state
+      $.ui.log(`${PLUGIN}: board status of ${section.key} not read: ${failed.kind} ${failed.detail ?? ''}`, { to: 'debug' })
+      if (failed.kind === 'missing-scope') {
+        await update($, boards, (had): Boards => {
+          const items = { ...had.items }
+          for (const number of numbers) delete items[rowKeyOf(section.key, number)]
+
+          return { ...had, scope: { ...had.scope, [info.host]: 'missing' }, needs: { ...had.needs, [info.host]: failed.detail ?? 'read:project' }, items }
+        })
+      } else if (failed.kind !== 'rate-limited' && failed.kind !== 'offline' && failed.kind !== 'signed-out') {
+        await update($, boards, (had): Boards => ({ ...had, detail: { ...had.detail, [info.host]: firstLine(failed.detail ?? failed.kind) || failed.kind } }))
+      }
+      continue
+    }
+    await update($, boards, (had): Boards => {
+      const items = { ...had.items }
+      for (const number of numbers) delete items[rowKeyOf(section.key, number)]
+      for (const [number, list] of fetched.items) if (list.length > 0) items[rowKeyOf(section.key, number)] = list
+      const detail = { ...had.detail }
+      delete detail[info.host]
+
+      return { ...had, scope: { ...had.scope, [info.host]: 'present' }, detail, items, fetchedAt: now }
+    })
+  }
+}
+
+/** The ⚙ panel's switch: on reads the board status at once; off forgets the items and the board facet. */
+async function toggleBoards($: EngineInterface): Promise<void> {
+  const next = await saveSettings($, current => {
+    if (current.boards !== true) return { ...current, boards: true }
+    const rest = { ...current }
+    delete rest.boards
+
+    return rest
+  })
+  if (next.boards === true) {
+    await refreshBoards($, await read($, sections), 'press', await $.clock.now(), true)
+
+    return
+  }
+  await update($, boards, had => ({ ...had, items: {}, detail: {} }))
+  if ((await read($, filter)).board !== '') await update($, filter, current => ({ ...current, board: '' }))
+}
+
+/** Erneut prüfen after a missing scope: asks that host's sections at once, the rest of the refresh untouched (E18-2). */
+async function retryBoards($: EngineInterface, host: string): Promise<void> {
+  await update($, boards, (had): Boards => ({ ...had, scope: { ...had.scope, [host]: 'unknown' } }))
+  await refreshBoards($, await read($, sections), 'press', await $.clock.now(), true, host)
+}
+
+// E11: assigned to me ----------------------------------------------------------
+
+/**
+ * The search for the issues assigned to the signed-in account on the checkout's host, shared through the store by
+ * every pane on the machine. Due by age only (E11-1): the attach refresh that finds the pane placed searches; ↻ asks
+ * once the last try is a minute old (E11-2); a back-off kept in the store holds after a failure (E11-6), so a reload
+ * cannot fire a rate-limited search again. Not due, the pane adopts what another pane found. The caller runs it only
+ * while the pane is shown.
+ */
+async function refreshInbox($: EngineInterface, options: Options, reason: Reason, now: number): Promise<string> {
+  if (!options.assignedToMe) return 'off'
+  const host = checkout?.info?.host ?? 'github.com'
+  const key = storeKeyOf('inbox:', host)
+  const stored = asInboxCache(await readStore<unknown>($, key))
+  const period = inboxPeriod(options.refreshMinutes)
+  if (!isInboxDue(stored, reason, now, period)) {
+    const have = await read($, inbox)
+    if (stored !== undefined && stored.fetchedAt > 0 && (have.host !== host || have.fetchedAt === null || stored.fetchedAt > have.fetchedAt)) {
+      await update($, inbox, (): Inbox => ({ host, state: { kind: 'ok' }, rows: stored.rows, fetchedAt: stored.fetchedAt }))
+    }
+
+    return 'shared'
+  }
+  const found = await searchAssigned($, host, Math.min(INBOX_CAP, options.maxIssues))
+  if ('state' in found) {
+    const failed = found.state
+    await writeStore($, key, failedInbox(stored, failed, now, period))
+    const lastRows = stored?.rows ?? []
+    const lastAt = stored !== undefined && stored.fetchedAt > 0 ? stored.fetchedAt : null
+    await update($, inbox, (had): Inbox => (had.host === host && had.fetchedAt !== null ? { ...had, state: failed } : { host, state: failed, rows: lastRows, fetchedAt: lastAt }))
+
+    return `failed: ${failed.kind}`
+  }
+  await writeStore($, key, { v: 1, fetchedAt: now, triedAt: now, rows: found.rows })
+  await update($, inbox, (): Inbox => ({ host, state: { kind: 'ok' }, rows: found.rows, fetchedAt: now }))
+
+  return `searched: ${found.rows.length}`
+}
+
+/** The section is collapsed unless the owner expanded it: `collapsed.inbox` false. */
+async function toggleInbox($: EngineInterface): Promise<void> {
+  await saveSettings($, current => ({ ...current, collapsed: { ...current.collapsed, inbox: current.collapsed['inbox'] === false } }))
+}
+
+/** ↓ Zeigen: the issue's row in its section, expanded, opened and scrolled into view. */
+async function showInSection($: EngineInterface, options: Options, rowKey: string): Promise<void> {
+  const sectionKey = rowKey.slice(0, rowKey.lastIndexOf('#'))
+  if ((await read($, settings)).collapsed[sectionKey] === true) await toggleSection($, sectionKey)
+  if ((await read($, opened)) !== rowKey) await toggleRow($, options, rowKey)
+  await scrollToRow($, rowKey)
+}
+
+/**
+ * Scrolls the pane to a row's title. `$.ui.scroll` answers `{ deny }` for an element not drawn yet rather than
+ * waiting, so a denied scroll is tried once more a moment later (E11-5); then the owner scrolls.
+ */
+async function scrollToRow($: EngineInterface, rowKey: string): Promise<void> {
+  const first = await $.ui.scroll({ in: PANE, to: { key: `row-title:${rowKey}` }, block: 'start' }).catch(error => ({ deny: error instanceof Error ? error.message : String(error) }))
+  if (first.deny === undefined) return
+  await $.clock.sleep(SCROLL_RETRY_MS).catch(() => undefined)
+  const second = await $.ui.scroll({ in: PANE, to: { key: `row-title:${rowKey}` }, block: 'start' }).catch(error => ({ deny: error instanceof Error ? error.message : String(error) }))
+  if (second.deny !== undefined) $.ui.log(`${PLUGIN}: scroll to row-title:${rowKey} refused twice: ${second.deny}`, { to: 'debug' })
+}
+
+/** With the section switched off, no other project's issue titles stay on disk: every `inbox:` key goes at the start. */
+async function sweepInbox($: EngineInterface): Promise<void> {
+  const keys = await $.store.keys().catch(() => [] as string[])
+  for (const key of keys) if (key.startsWith('inbox:')) await $.store.delete(key).catch(() => undefined)
+}
+
+// E22: recently closed ---------------------------------------------------------
+
+/**
+ * Reads the expanded "recently closed" parts that are due (isClosedDue), one gh call each; a part that is
+ * collapsed, or whose section is, never fetches (E22-2). A fetch in flight is claimed in module memory (E22-1); the
+ * loading flag in the state only draws. A failure keeps the last list under its state and backs off: 10 minutes
+ * after a rate limit, 2 without a network. Another pane's newer list in the store is adopted.
+ */
+async function refreshClosed($: EngineInterface, options: Options, current: readonly Section[], reason: ClosedReason, now: number, only?: string): Promise<void> {
+  if (options.closedDays <= 0) return
+  const chosen = await read($, settings)
+  const since = sinceDate(now, options.closedDays)
+  for (const section of current) {
+    const info = section.info
+    if (only !== undefined && section.key !== only) continue
+    if (info === null || section.state.kind !== 'ok' || chosen.showClosed?.[section.key] !== true || chosen.collapsed[section.key] === true) continue
+    if (closedInFlight.has(section.key) || now < (closedBackoff.get(section.key) ?? 0)) continue
+    const have = (await read($, closed))[section.key]
+    const stored = asClosedCache(await readStore<unknown>($, storeKeyOf('closed:', section.key)))
+    const cache = stored !== undefined && (have === undefined || stored.fetchedAt > have.fetchedAt) ? stored : have
+    if (cache !== undefined && cache !== have) await update($, closed, all => ({ ...all, [section.key]: cache }))
+    if (!isClosedDue(cache, since, reason, now, closedNudge.has(section.key))) continue
+    closedInFlight.add(section.key)
+    closedNudge.delete(section.key)
+    await update($, closedLoading, all => ({ ...all, [section.key]: now }))
+    try {
+      const listed = await listClosed($, info, since)
+      if ('state' in listed) {
+        const failed = listed.state
+        if (failed.kind === 'rate-limited') closedBackoff.set(section.key, now + 10 * 60_000)
+        else if (failed.kind === 'offline') closedBackoff.set(section.key, now + 2 * 60_000)
+        await update($, closedErrors, all => ({ ...all, [section.key]: failed }))
+        continue
+      }
+      const record: ClosedCache = closedRecord(listed.rows, since, now)
+      await writeStore($, storeKeyOf('closed:', section.key), record)
+      await update($, closed, all => ({ ...all, [section.key]: record }))
+      await update($, closedErrors, all => {
+        if (all[section.key] === undefined) return all
+        const next = { ...all }
+        delete next[section.key]
+
+        return next
+      })
+    } finally {
+      closedInFlight.delete(section.key)
+      await update($, closedLoading, all => {
+        const next = { ...all }
+        delete next[section.key]
+
+        return next
+      })
+    }
+  }
+}
+
+/** Expands or collapses a repository's "recently closed" part; expanding reads it when due (the press shows the pane is drawn). */
+async function toggleClosed($: EngineInterface, options: Options, sectionKey: string): Promise<void> {
+  const next = await saveSettings($, current => {
+    const showClosed = { ...(current.showClosed ?? {}) }
+    if (showClosed[sectionKey] === true) delete showClosed[sectionKey]
+    else showClosed[sectionKey] = true
+    const rest = { ...current }
+    if (Object.keys(showClosed).length > 0) rest.showClosed = showClosed
+    else delete rest.showClosed
+
+    return rest
+  })
+  if (next.showClosed?.[sectionKey] === true) await refreshClosed($, options, await read($, sections), 'expand', await $.clock.now(), sectionKey)
+}
+
 async function resetStore($: EngineInterface): Promise<void> {
   const keys = await $.store.keys().catch(() => [] as string[])
   for (const key of keys) {
@@ -1118,6 +1555,11 @@ async function resetStore($: EngineInterface): Promise<void> {
   prTriedAt.clear()
   prsOffHosts.clear()
   sessionPrNext.clear()
+  filteredPrs.clear()
+  filteredPrTried.clear()
+  boardsReadAt.clear()
+  closedBackoff.clear()
+  closedNudge.clear()
   resetRelations()
   settingsKey = null
   await update($, sections, () => [])
@@ -1129,6 +1571,15 @@ async function resetStore($: EngineInterface): Promise<void> {
   await update($, tokens, () => 0)
   await update($, prs, () => ({}))
   await update($, sessionPrs, () => ({}))
+  // The saved views went with the settings: the filter starts over, and so do the lists' side data.
+  await update($, filter, () => DEFAULT_FILTER)
+  await update($, searchGen, current => current + 1)
+  await update($, facets, () => ({ labels: [], milestones: [] }))
+  await update($, boards, () => NO_BOARDS)
+  await update($, inbox, () => NO_INBOX)
+  await update($, closed, () => ({}))
+  await update($, closedLoading, () => ({}))
+  await update($, closedErrors, () => ({}))
 }
 
 /**
@@ -1209,6 +1660,10 @@ export const register: Register = (on, given) => {
     }
     myId = await $.session.id().catch(() => '')
     await loadVersion($)
+    // E11 switched off: no other project's issue titles stay on disk.
+    if (!options.assignedToMe) await sweepInbox($)
+    // E22-1: nothing of a fresh module is loading; a flag a reload left behind would read as a fetch that never ends.
+    await update($, closedLoading, () => ({}))
     const known = await loadMappings($)
     const isChild = myId !== '' && Object.values(known).some(mapping => mapping.sessionId === myId)
     if (isChild) {
@@ -1262,6 +1717,8 @@ export const register: Register = (on, given) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     if (!(await read($, isIssueSession))) armTimer($, options)
     const ui = $.ui.resolve(e)
+    const chosen = await read($, settings)
+    const activeFilter = await read($, filter)
 
     return renderPane(
       ui,
@@ -1272,7 +1729,17 @@ export const register: Register = (on, given) => {
         mappings: await read($, mappings),
         prs: await read($, prs),
         sessionPrs: await read($, sessionPrs),
-        settings: await read($, settings),
+        settings: chosen,
+        filter: activeFilter,
+        filterKey: filterKey(activeFilter, chosen.views ?? []),
+        isFilterOpen: await read($, isFilterOpen),
+        facets: await read($, facets),
+        searchGen: await read($, searchGen),
+        boards: await read($, boards),
+        inbox: await read($, inbox),
+        closed: await read($, closed),
+        closedLoading: await read($, closedLoading),
+        closedErrors: await read($, closedErrors),
         options,
         strings: S,
         opened: await read($, opened),
@@ -1302,6 +1769,18 @@ export const register: Register = (on, given) => {
         consent: (key, value) => void consent($, options, key, value),
         addWatch: spec => void addWatch($, options, spec),
         removeWatch: spec => void removeWatch($, options, spec),
+        toggleFilter: () => void update($, isFilterOpen, current => !current),
+        setFilter: patch => void setFilter($, options, patch),
+        setSearch: text => void setSearch($, options, text),
+        clearFilter: () => void clearFilter($, options),
+        saveView: name => void saveView($, options, name),
+        removeView: id => void removeView($, options, id),
+        listSubIssues: rowKey => void listSubIssues($, options, rowKey),
+        toggleBoards: () => void toggleBoards($),
+        retryBoards: host => void retryBoards($, host),
+        toggleInbox: () => void toggleInbox($),
+        showInSection: rowKey => void showInSection($, options, rowKey),
+        toggleClosed: key => void toggleClosed($, options, key),
       },
     )
   })
