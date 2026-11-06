@@ -105,6 +105,21 @@ export function count(argv: readonly (readonly string[])[], ...words: string[]):
   return argv.filter(call => call[0] === 'gh' && words.every((word, index) => call[index + 1] === word)).length
 }
 
+/** The recorded GraphQL calls of one operation (`ops(argv, 'IssueRadarProbe')`), in order. */
+export function ops(argv: readonly (readonly string[])[], name: string): string[][] {
+  return argv.filter(call => op(call) === name).map(call => [...call])
+}
+
+/** The query a recorded GraphQL argv sends (the text after `query=`); empty for any other command. */
+export function graphQuery(argv: readonly string[]): string {
+  return argv.find(arg => arg.startsWith('query='))?.slice('query='.length) ?? ''
+}
+
+/** The flag and value pairs of a recorded argv (`-f owner=acme`, `-F first=2`), for `toContain`. */
+export function pairs(argv: readonly string[]): string[] {
+  return argv.flatMap((arg, index) => (arg.startsWith('-') && index + 1 < argv.length ? [`${arg} ${argv[index + 1] ?? ''}`] : []))
+}
+
 export const USAGE = { input_tokens: 300, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
 export type On = Parameters<TestBody>[1]

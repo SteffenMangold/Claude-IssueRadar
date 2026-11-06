@@ -11,8 +11,8 @@ import { classifyGraph, graphErrors, graphqlArgs, operationOf, readGraph } from 
 import { strings } from '../hooks/i18n'
 import { isTransportText, quietDesktop, saysSessionGone } from '../hooks/session'
 import { clean, cleanLine } from '../hooks/text'
+import { prLine, prRefOf } from '../hooks/prs'
 import { offerToast, takeToast } from '../hooks/toasts'
-import { prLabel } from '../hooks/view'
 import type { McpAnswer } from './harness'
 import { ISSUES, NOW, PANE, REPO, ROW_42, SECTION, command, count, issueView, mcpText, project, ran, started, tick } from './harness'
 
@@ -656,9 +656,11 @@ test('a GitHub Enterprise brief closes the issue as owner/name#n, the marker kee
   expect(brief).toContain('gh issue view 12 -R ghe.example.com/acme/reports')
 })
 
-test('a linked pull request reads #n until its state is known', () => {
-  expect(prLabel({ number: 57, state: '', url: 'https://github.com/acme/widgets/pull/57' })).toBe('#57')
-  expect(prLabel({ number: 57, state: 'OPEN', url: '' })).toBe('#57 (open)')
+test('a linked pull request reads #n, and its state, once known, is words of its own, never in brackets', () => {
+  const open = { number: 57, url: 'https://github.com/acme/widgets/pull/57', repo: 'acme/widgets', state: 'OPEN', isDraft: false, review: null, checks: null, fromSession: false } as const
+  expect(prRefOf(open, 'acme/widgets', false)).toBe('#57')
+  expect(prLine({ ...open, state: null }, undefined, DE)).toBe('')
+  expect(prLine(open, undefined, DE)).toBe(DE.prOpen)
 })
 
 test('transport failures are told from answers of the app', () => {

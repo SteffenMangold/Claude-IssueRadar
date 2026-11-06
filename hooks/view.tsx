@@ -7,8 +7,10 @@
 // mark would get the whole tree refused.
 import type { Elements, RenderElement, RenderSurface, Space } from 'claude-code'
 
-import type { IssueDetails, IssueRow, LinkedPr, Mapping, Options, Recap, RepoSettings, Section, StartRoute } from '../types'
+import type { IssueDetails, IssueRef, IssueRow, Mapping, Options, PrRecord, Recap, RepoSettings, Section, SessionPr, StartRoute } from '../types'
 import type { Strings } from './i18n'
+import { linksOf, prChip, prLine, prRefOf } from './prs'
+import type { PrTone, ShownPr } from './prs'
 import { clean, cleanLine } from './text'
 
 type Table = Elements[keyof Elements]
@@ -19,6 +21,10 @@ export type ViewState = {
   details: Record<string, IssueDetails>
   recaps: Record<string, Recap>
   mappings: Record<string, Mapping>
+  /** Pull-request states per repository key (E3). */
+  prs: Record<string, PrRecord>
+  /** The pull request the app binds to each mapped issue session, by row key (E3). */
+  sessionPrs: Record<string, SessionPr>
   settings: RepoSettings
   options: Options
   strings: Strings
@@ -73,17 +79,58 @@ const HUE = {
   blue: '#4c8ed9',
   gray: '#8b8d98',
   red: '#e5484d',
+  purple: '#8e4ec6',
 } as const
+
+/** A pull request's tone as ink and hue; `neutral` while its state is unknown. */
+const PR_INK: Record<PrTone | 'neutral', string> = {
+  merged: 'merged',
+  muted: INK.muted,
+  error: INK.error,
+  warning: INK.warning,
+  success: INK.success,
+  accent: INK.accent,
+  neutral: INK.secondary,
+}
+const PR_HUE: Record<PrTone | 'neutral', string> = {
+  merged: HUE.purple,
+  muted: HUE.gray,
+  error: HUE.red,
+  warning: HUE.amber,
+  success: HUE.green,
+  accent: HUE.blue,
+  neutral: HUE.gray,
+}
 
 /** A color of no ink: a border that keeps its room without showing. */
 const CLEAR = '#00000000'
 /** The most rows one drawing holds; the engine refuses a tree of more than 20,000 elements. */
 const ROW_BUDGET = 200
-/** How many label chips a row shows before the rest is counted. */
+/** How many label chips a row shows before the rest is counted; one fewer once another pill shows (plan 4.6). */
 const LABELS_SHOWN = 4
+/** The longest text a chip-line pill draws (plan 4.6). */
+const PILL_CHARS = 24
+/** How many pull-request chips the status strip draws before it counts the rest. */
+const PR_CHIPS = 2
+/** How many pull requests the opened row lists. */
+const PR_LINES = 3
 
 export function rowKeyOf(sectionKey: string, number: number): string {
   return `${sectionKey}#${number}`
+}
+
+/** `text` cut to the pill's room, an ellipsis marking the cut. */
+export function pillText(text: string): string {
+  return text.length > PILL_CHARS ? `${text.slice(0, PILL_CHARS - 1)}…` : text
+}
+
+/** How a row names a related issue: `#12` in the section's repository, `owner/name#12` elsewhere. */
+export function refLabel(ref: Pick<IssueRef, 'number' | 'repo'>, sectionRepo: string): string {
+  return ref.repo === '' || ref.repo.toLowerCase() === sectionRepo.toLowerCase() ? `#${ref.number}` : `${ref.repo}#${ref.number}`
+}
+
+function repoOfSection(section: Section): string {
+  return section.info === null ? '' : `${section.info.owner}/${section.info.name}`
 }
 
 /** `hex` at `alpha` as CSS rgba: a tint the theme's ground shows through. */
@@ -128,16 +175,6 @@ function labelOf(section: Section): string {
   return clean(section.info === null ? section.spec : `${section.info.owner}/${section.info.name}`)
 }
 
-/**
- * A linked pull request as the opened row names it: `#n`, with its state once one is known. gh's
- * closedByPullRequestsReferences carries no state, so V1 printed `#n ()`; the state arrives with E3.
- */
-export function prLabel(pr: LinkedPr): string {
-  const state = clean(pr.state).trim().toLowerCase()
-
-  return state === '' ? `#${pr.number}` : `#${pr.number} (${state})`
-}
-
 function logoSvg(): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22"><rect x="0.5" y="0.5" width="21" height="21" rx="5" fill="${HUE.brand}" fill-opacity="0.12" stroke="${HUE.brand}" stroke-opacity="0.35"/><circle cx="11" cy="11" r="5.5" fill="none" stroke="${HUE.brand}" stroke-width="1.8"/><circle cx="11" cy="11" r="1.8" fill="${HUE.brand}"/></svg>`
 }
@@ -152,16 +189,26 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const step = (rich: Space, plain: number): Space => (isRich ? rich : plain)
   const wash = (hue: string, alpha: number) => (isRich ? tint(hue, alpha) : undefined)
 
-  /** A small label: a tinted, bordered Box on a graphical surface, a colored run on the terminal. */
-  const pill = (text: string, ink: string, hue: string, isRound = false) =>
+  /** A small label: a tinted, bordered Box on a graphical surface, a colored run on the terminal; `canShrink` lets it cut its text at the row's end. */
+  const pill = (text: string, ink: string, hue: string, isRound = false, canShrink = false) =>
     isRich ? (
-      <Box borderStyle={isRound ? 'round' : 'single'} borderColor={tint(hue, 0.35)} backgroundColor={tint(hue, 0.12)} paddingX="sm" paddingY={0} flexShrink={0}>
-        <Text size="caption" weight="medium" color={ink}>
+      <Box
+        borderStyle={isRound ? 'round' : 'single'}
+        borderColor={tint(hue, 0.35)}
+        backgroundColor={tint(hue, 0.12)}
+        paddingX="sm"
+        paddingY={0}
+        flexShrink={canShrink ? 1 : 0}
+        minWidth={canShrink ? 0 : undefined}
+      >
+        <Text size="caption" weight="medium" color={ink} wrap={canShrink ? 'truncate-end' : undefined}>
           {text}
         </Text>
       </Box>
     ) : (
-      <Text color={ink}>{text}</Text>
+      <Text color={ink} wrap={canShrink ? 'truncate-end' : undefined}>
+        {text}
+      </Text>
     )
 
   /** A GitHub label: its own color as a tint only, the text in the theme's ink. */
@@ -349,16 +396,48 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   }
 
   // One issue ------------------------------------------------------------
-  const chips = (row: IssueRow, details: IssueDetails | undefined) => {
-    const parts: RenderElement[] = []
-    row.labels.slice(0, LABELS_SHOWN).forEach(label => parts.push(labelChip(clean(label.name), label.color)))
-    if (row.labels.length > LABELS_SHOWN) {
+
+  /** A pill of the row's own, keyed so the drawing names what it shows (tests find it by key, plan 4.6). */
+  const keyedPill = (key: string, text: string, ink: string, hue: string) => (
+    <Box key={key} flexShrink={0}>
+      {pill(pillText(clean(text)), ink, hue)}
+    </Box>
+  )
+
+  /**
+   * The chip line (plan 4.6, line 2): E17's blocked pill, the labels (at most four, three once another pill shows,
+   * then `+n`), E17's progress and parent pills, the facts text last.
+   */
+  const chips = (section: Section, row: IssueRow, details: IssueDetails | undefined) => {
+    const key = rowKeyOf(section.key, row.number)
+    const sectionRepo = repoOfSection(section)
+    // Rows come from the store too: every part of the relations is read as possibly absent.
+    const relations = row.relations
+    const lead: RenderElement[] = []
+    const tail: RenderElement[] = []
+    const open = relations?.blockedBy?.open ?? 0
+    const firstBlocker = relations?.blockedBy?.refs?.[0]
+    if (open > 0 && firstBlocker !== undefined) {
+      lead.push(keyedPill(`blocked:${key}`, S.blockedChip(refLabel(firstBlocker, sectionRepo), open - 1), INK.warning, HUE.amber))
+    }
+    const subIssues = relations?.subIssues ?? null
+    if (subIssues !== null) {
+      const isDone = subIssues.completed >= subIssues.total
+      tail.push(keyedPill(`subs:${key}`, S.subProgress(subIssues.completed, subIssues.total), isDone ? INK.success : INK.accent, isDone ? HUE.green : HUE.blue))
+    }
+    const parent = relations?.parent ?? null
+    if (parent !== null) tail.push(keyedPill(`parent:${key}`, S.partOf(refLabel(parent, sectionRepo)), INK.muted, HUE.gray))
+    const labelsShown = lead.length + tail.length > 0 ? LABELS_SHOWN - 1 : LABELS_SHOWN
+    const parts: RenderElement[] = [...lead]
+    row.labels.slice(0, labelsShown).forEach(label => parts.push(labelChip(clean(label.name), label.color)))
+    if (row.labels.length > labelsShown) {
       parts.push(
         <Text size="caption" color={INK.muted}>
-          +{row.labels.length - LABELS_SHOWN}
+          +{row.labels.length - labelsShown}
         </Text>,
       )
     }
+    parts.push(...tail)
     const created = shortAgo(row.createdAt, state.now, S.ago)
     const updated = shortAgo(row.updatedAt, state.now, S.ago)
     const facts: string[] = [created]
@@ -418,7 +497,117 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     )
   }
 
-  const openedBlock = (details: IssueDetails | undefined) => {
+  /** The pull requests a row shows (E3): GraphQL's states, the details' links, the issue session's own. */
+  const prsOf = (section: Section, item: IssueRow, details: IssueDetails | undefined) => {
+    const key = rowKeyOf(section.key, item.number)
+    const session = state.sessionPrs[key]
+
+    return { key, session, sectionRepo: repoOfSection(section), ...linksOf(state.prs[section.key], item.number, details, session, repoOfSection(section), state.now) }
+  }
+
+  /**
+   * The status strip (plan 4.6, line 5): a chip per linked pull request, the most relevant first, at most two and then
+   * `+n`; closed, unmerged ones stay out (E3-8). Drawn only when the issue has one.
+   */
+  const statusStrip = (section: Section, item: IssueRow, details: IssueDetails | undefined) => {
+    const { key, session, sectionRepo, links, total } = prsOf(section, item, details)
+    const live = links.filter(pr => pr.state !== 'CLOSED')
+    if (live.length === 0) return null
+    const drawn = live.slice(0, PR_CHIPS)
+    const more = Math.max(0, total - drawn.length)
+
+    return (
+      <Box key={`prs:${key}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} rowGap={step('xs', 0)}>
+        {drawn.map(pr => {
+          const chip = prChip(pr, session, sectionRepo, S)
+          const tone = chip.tone ?? 'neutral'
+
+          // A chip may cut its text at the strip's end: a long repository name never pushes it past the pane (E3-8).
+          return (
+            <Box key={`pr:${key}:${pr.repo}#${pr.number}`} flexShrink={1} minWidth={0}>
+              {pill(clean(chip.text), PR_INK[tone], PR_HUE[tone], false, true)}
+            </Box>
+          )
+        })}
+        {more > 0 && (
+          <Text size="caption" color={INK.muted}>
+            +{more}
+          </Text>
+        )}
+      </Box>
+    )
+  }
+
+  /** The opened row's pull requests (E3): one line each, the link and its state in words, never `#n ()`. */
+  const prLinesOf = (section: Section, item: IssueRow, details: IssueDetails) => {
+    const { key, session, sectionRepo, links } = prsOf(section, item, details)
+    if (links.length === 0) return null
+
+    return (
+      <Box key={`prlines:${key}`} flexDirection="column">
+        <Text size="caption" weight="semibold" color={INK.secondary}>
+          {S.linkedPrs}
+        </Text>
+        {links.slice(0, PR_LINES).map((pr: ShownPr) => {
+          const words = prLine(pr, session, S)
+
+          return (
+            <Box key={`prline:${key}:${pr.repo}#${pr.number}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)}>
+              <Link href={clean(pr.url)} label={clean(prRefOf(pr, sectionRepo, false))} />
+              {words !== '' && (
+                <Text size="caption" color={pr.state === 'CLOSED' ? INK.muted : INK.secondary} wrap="wrap">
+                  · {clean(words)}
+                </Text>
+              )}
+            </Box>
+          )
+        })}
+      </Box>
+    )
+  }
+
+  /** The opened row's relations (E17), from the row alone: the parent, the open blockers, the sub-issue progress. */
+  const relationsOf = (section: Section, item: IssueRow) => {
+    const relations = item.relations
+    if (relations === undefined) return null
+    const key = rowKeyOf(section.key, item.number)
+    const sectionRepo = repoOfSection(section)
+    const parent = relations.parent ?? null
+    const subIssues = relations.subIssues ?? null
+    const blockedBy = { open: relations.blockedBy?.open ?? 0, refs: relations.blockedBy?.refs ?? [] }
+    const more = blockedBy.open - blockedBy.refs.length
+
+    return (
+      <Box key={`relations:${key}`} flexDirection="column">
+        <Text size="caption" weight="semibold" color={INK.secondary}>
+          {S.relationsTitle}
+        </Text>
+        {parent !== null && <Link href={clean(parent.url)} label={clean(parent.title === '' ? S.partOf(refLabel(parent, sectionRepo)) : S.partOfTitled(refLabel(parent, sectionRepo), parent.title))} />}
+        {blockedBy.open > 0 && (
+          <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)}>
+            <Text size="caption" color={INK.warning}>
+              {S.blockedByTitle}:
+            </Text>
+            {blockedBy.refs.map(ref => (
+              <Link href={clean(ref.url)} label={clean(refLabel(ref, sectionRepo))} />
+            ))}
+            {more > 0 && (
+              <Text size="caption" color={INK.muted}>
+                +{more}
+              </Text>
+            )}
+          </Box>
+        )}
+        {subIssues !== null && (
+          <Text size="caption" color={INK.secondary}>
+            {S.subIssuesDone(subIssues.completed, subIssues.total)}
+          </Text>
+        )}
+      </Box>
+    )
+  }
+
+  const openedBlock = (section: Section, item: IssueRow, details: IssueDetails | undefined) => {
     // A seeded entry has no body or comments yet: the opened row reads as loading until the details land.
     if (details === undefined || details.fetchedAt === 0) {
       return (
@@ -458,16 +647,8 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             </Text>
           )
         })}
-        {details.linkedPrs.length > 0 && (
-          <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)}>
-            <Text size="caption" weight="semibold" color={INK.secondary}>
-              {S.linkedPrs}
-            </Text>
-            {details.linkedPrs.map(pr => (
-              <Link href={clean(pr.url)} label={prLabel(pr)} />
-            ))}
-          </Box>
-        )}
+        {prLinesOf(section, item, details)}
+        {relationsOf(section, item)}
       </Box>
     )
   }
@@ -497,14 +678,15 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           <Text color={INK.muted}>#{item.number} </Text>
           <Text weight="semibold">{clean(item.title)}</Text>
         </Button>
-        {chips(item, details)}
-        {isOpen ? openedBlock(details) : recapLine(section, item, details, recap)}
+        {chips(section, item, details)}
+        {isOpen ? openedBlock(section, item, details) : recapLine(section, item, details, recap)}
         {mapping !== undefined && (
           <Text size="caption" color={INK.muted} wrap="truncate-end">
             {S.sessionLine(clean(mapping.title), fmtTime(mapping.startedAt))}
             {mapping.detached ? '' : ` · ${S.sessionLinked}`}
           </Text>
         )}
+        {statusStrip(section, item, details)}
         <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
           <Box flexGrow={1} flexShrink={1} minWidth={0}>
             <Link href={clean(item.url)} label={S.github} />
@@ -527,10 +709,38 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   // Sections -------------------------------------------------------------
   let rowsLeft = ROW_BUDGET
 
+  /**
+   * The pointer to the rest on GitHub (E7): `… +382 weitere auf GitHub ↗` once the open count is known and exceeds the
+   * rows; while it is unknown, a capped list says it shows only the most recently updated, beside a link to all.
+   */
+  const pointer = (section: Section) => {
+    const count = section.rows.length
+    if (section.info === null || section.state.kind !== 'ok' || count === 0) return null
+    const href = clean(`${section.info.url}/issues`)
+    if (section.total !== undefined && section.total > count) {
+      return (
+        <Box key={`more:${section.key}`} paddingX={step('sm', 1)}>
+          <Link href={href} label={S.moreOnGitHub(section.total - count)} />
+        </Box>
+      )
+    }
+    if (section.total !== undefined || count < options.maxIssues) return null
+
+    return (
+      <Box key={`more:${section.key}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} paddingX={step('sm', 1)}>
+        <Text size="caption" color={INK.muted}>
+          … {S.capped(count)} ·
+        </Text>
+        <Link href={href} label={S.allIssues} />
+      </Box>
+    )
+  }
+
   const sectionBlock = (section: Section) => {
     const label = labelOf(section)
     const isCollapsed = settings.collapsed[section.key] === true
     const count = section.rows.length
+    const counted = section.total !== undefined && section.total > count ? `${count}/${section.total}` : String(count)
     const header = (
       <Box flexDirection="row" alignItems="center" columnGap={step('sm', 1)} paddingX={step('sm', 1)} paddingY={step('xs', 0)}>
         <Box flexGrow={1} flexShrink={1} minWidth={0}>
@@ -542,7 +752,11 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             {section.info?.isFork === true ? <Text color={INK.muted}> (fork)</Text> : null}
           </Button>
         </Box>
-        {section.state.kind === 'ok' && pill(String(count), count > 0 ? INK.text : INK.muted, HUE.gray)}
+        {section.state.kind === 'ok' && (
+          <Box key={`count:${section.key}`} flexShrink={0}>
+            {pill(counted, count > 0 ? INK.text : INK.muted, HUE.gray)}
+          </Box>
+        )}
       </Box>
     )
     if (isCollapsed) {
@@ -567,6 +781,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             … +{rest}
           </Text>
         )}
+        {pointer(section)}
       </Box>
     )
   }

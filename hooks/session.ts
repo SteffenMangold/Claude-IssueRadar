@@ -9,7 +9,8 @@
 // - `quietDesktop`, for everything the mod does on its own: never a card.
 import type { EngineInterface } from 'claude-code'
 
-import type { StartRoute } from '../types'
+import type { SessionPr, StartRoute } from '../types'
+import { asReview, repoOfPr } from './prs'
 
 export type StartArgs = {
   title: string
@@ -182,6 +183,8 @@ export type QuietOptions = {
   timeoutMs?: number
   /** Tries the mcp route even while an earlier transport failure holds it back: the spike measures the route itself. */
   isMeasurement?: boolean
+  /** Never asks the typed route, not even its permission check: a measurement of the mcp route alone. */
+  isMcpOnly?: boolean
 }
 
 /**
@@ -209,6 +212,7 @@ export async function quietDesktop($: EngineInterface, server: string, tool: str
     mcpBroken.set(key, { until: now + MCP_RETRY_MS, reason: answer.reason })
     mcpSaid = `mcp: ${answer.reason}`
   } else mcpSaid = `mcp skipped until ${clockTime(broken.until)} after a transport failure (${broken.reason})`
+  if (options.isMcpOnly === true) return { ok: false, reason: mcpSaid, text: '', via: 'none', isTransport: true }
   const verdict = await $.tool.check({ tool: `mcp__${server}__${tool}`, input: args }).catch(() => null)
   const decision = verdict?.decision ?? 'none'
   if (decision !== 'allow') {
@@ -345,4 +349,95 @@ export async function focusSession($: EngineInterface, sessionId: string, consen
   const answer = await callDesktop($, 'ccd_window', 'open_session_in', { session_id: sessionId, target: 'focus' }, consent)
 
   return answer.ok ? { ok: true } : { ok: false, reason: answer.reason }
+}
+
+// The pull request the app binds to an issue session (E3) -------------------
+
+type Fields = Record<string, unknown>
+
+function recordIn(data: Fields, keys: readonly string[]): Fields | undefined {
+  for (const key of keys) {
+    const value = data[key]
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) return value as Fields
+  }
+
+  return undefined
+}
+
+function firstOf(data: Fields | undefined, keys: readonly string[]): unknown {
+  if (data === undefined) return undefined
+  for (const key of keys) if (data[key] !== undefined && data[key] !== null) return data[key]
+
+  return undefined
+}
+
+/** A count the answer gives as a number, or as a list of what it counts; null when it gives neither. */
+function tally(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.floor(value)
+
+  return Array.isArray(value) ? value.length : null
+}
+
+/** The failing checks' names: strings, or records with a `name`; at most 5, each cut to 40 characters. */
+function namesOf(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+
+  return value
+    .map(item => (typeof item === 'string' ? item : typeof item === 'object' && item !== null && typeof (item as Fields)['name'] === 'string' ? ((item as Fields)['name'] as string) : ''))
+    .map(name => name.replace(/\s+/g, ' ').trim())
+    .filter(name => name !== '')
+    .slice(0, 5)
+    .map(name => (name.length > 40 ? `${name.slice(0, 39)}…` : name))
+}
+
+/**
+ * The bound pull request in what `ccd_pr` `get_status` answered, or null when it names none. The field names are
+ * provisional until the spike records a real answer (S14): the number from `number`, `pr_number` or the URL; the
+ * state upper-cased, a draft as `DRAFT`; the check counts from `checks`, `ci` or `check_counts` (numbers, or lists);
+ * the failing checks' names; the review decision; the mergeability.
+ */
+export function parsePrStatus(structured: unknown, text: string, now: number): SessionPr | null {
+  const data = parseObject(structured, text)
+  const pr = recordIn(data, ['pr', 'pull_request', 'pullRequest', 'bound_pr', 'boundPr']) ?? data
+  const url = String(firstOf(pr, ['url', 'html_url', 'htmlUrl']) ?? '')
+  const given = Number(firstOf(pr, ['number', 'pr_number', 'prNumber']))
+  const number = Number.isInteger(given) && given > 0 ? given : Number(/\/pull\/(\d+)/.exec(url)?.[1] ?? Number.NaN)
+  if (!Number.isInteger(number) || number <= 0) return null
+  const draft = firstOf(pr, ['draft', 'isDraft', 'is_draft']) === true
+  const stated = String(firstOf(pr, ['state', 'status']) ?? '').toUpperCase()
+  const state: SessionPr['state'] = draft ? 'DRAFT' : stated === 'OPEN' || stated === 'MERGED' || stated === 'CLOSED' || stated === 'DRAFT' ? stated : ''
+  const checks = recordIn(data, ['checks', 'ci', 'check_counts', 'checkCounts', 'ci_checks']) ?? recordIn(pr, ['checks', 'ci', 'check_counts', 'checkCounts']) ?? {}
+  const failingList = firstOf(checks, ['failing', 'failing_checks', 'failingChecks', 'failed_checks']) ?? firstOf(data, ['failing_checks', 'failingChecks'])
+  const failed = tally(firstOf(checks, ['failed', 'failure', 'failures'])) ?? tally(failingList) ?? 0
+  const merge = firstOf(data, ['mergeable', 'mergeability', 'mergeable_state', 'merge_state_status', 'mergeStateStatus']) ?? firstOf(pr, ['mergeable', 'mergeability', 'mergeable_state'])
+
+  return {
+    number,
+    url,
+    repo: repoOfPr(url),
+    state,
+    review: asReview(firstOf(data, ['review_decision', 'reviewDecision']) ?? firstOf(pr, ['review_decision', 'reviewDecision'])),
+    passed: tally(firstOf(checks, ['passed', 'passing', 'success', 'successful', 'succeeded'])) ?? 0,
+    failed,
+    pending: tally(firstOf(checks, ['pending', 'in_progress', 'inProgress', 'queued', 'running'])) ?? 0,
+    failing: namesOf(failingList),
+    mergeable: typeof merge === 'boolean' ? (merge ? 'MERGEABLE' : 'CONFLICTING') : String(merge ?? '').toUpperCase(),
+    at: now,
+  }
+}
+
+export type PrStatusLook = { kind: 'pr'; pr: SessionPr; raw: string } | { kind: 'none'; raw: string } | { kind: 'failed'; reason: string; isTransport: boolean }
+
+/**
+ * What the app binds to a session as its pull request, read quietly (never a card): the app's cache, no GitHub
+ * budget. `none` when the app answered and names no pull request; `failed` when it did not answer, or answered with an
+ * error (E3-1: the caller backs off that one session, never the whole layer).
+ */
+export async function readPrStatus($: EngineInterface, sessionId: string, now: number, options: QuietOptions = {}): Promise<PrStatusLook> {
+  const answer = await quietDesktop($, 'ccd_pr', 'get_status', { session_id: sessionId }, options)
+  if (!answer.ok) return { kind: 'failed', reason: answer.reason, isTransport: answer.isTransport }
+  const raw = answer.text.slice(0, 400)
+  const pr = parsePrStatus(answer.structured, answer.text, now)
+
+  return pr === null ? { kind: 'none', raw } : { kind: 'pr', pr, raw }
 }

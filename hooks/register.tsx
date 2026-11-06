@@ -5,13 +5,16 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section } from '../types'
+import type { IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, PrRecord, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section } from '../types'
 import { MARKER, branchName, renderBackground, renderBrief, sessionName, sessionTitle, spikeBrief } from './brief'
-import { isRepoSpec, listIssues, repoKey, repoLabel, resolveCheckout, resolveNamed, stateOf, viewIssue } from './github'
+import { dropRelations, isRepoSpec, listIssues, metaOf, repoKey, repoLabel, resetRelations, resolveCheckout, resolveNamed, stateOf, viewIssue, viewParent } from './github'
+import { MAPPED_MAX, PROBE_MAX, PROBE_PAUSE_MS, fetchPrLinks } from './graph'
 import { asLanguage, strings } from './i18n'
+import { asRecord, isPrsDue, mergeLinks, recordOf } from './prs'
 import { recapIssue } from './recap'
-import { commandConsent, detachSession, focusSession, lookUpSession, parseObject, pressConsent, quietDesktop, routeInUse, startDesktopSession } from './session'
+import { commandConsent, detachSession, focusSession, lookUpSession, parseObject, pressConsent, quietDesktop, readPrStatus, routeInUse, startDesktopSession } from './session'
 import { clean } from './text'
+import { probeEngaged, runTiers } from './tiers'
 import { takeToast } from './toasts'
 import { renderPane, rowKeyOf } from './view'
 
@@ -19,7 +22,13 @@ const PLUGIN = 'issue-radar'
 const PANE = 'issue-radar'
 const PANE_COLUMNS = 46
 const DETAILS_CONCURRENCY = 2
-const STORE_PREFIXES = ['cache:', 'recaps:', 'session:', 'settings:', 'debug:'] as const
+const STORE_PREFIXES = ['cache:', 'recaps:', 'session:', 'settings:', 'debug:', 'prs:'] as const
+/** How often a mapped issue session's pull request is read from the app while it answers (E3). */
+const SESSION_PR_EVERY_MS = 60_000
+/** How long one session's pull-request read waits after the app did not answer it, or answered with an error (E3-1). */
+const SESSION_PR_BACKOFF_MS = 10 * 60_000
+/** The texts of a schema that lacks what the pull-request request asks (an older GitHub Enterprise): no more tries there. */
+const SCHEMA_REFUSAL = /doesn't accept argument|doesn't exist on type|undefined ?field|unknown argument|cannot query field/i
 const DEFAULT_SETTINGS: RepoSettings = { watch: [], consent: {}, collapsed: {} }
 /** The first characters of a brief: what tells this session's own fills from a hand-off. */
 const BRIEF_HEAD = 80
@@ -42,6 +51,8 @@ const version = atom({ plugin: 'issue-radar', key: 'version' } as const, '')
 const checkoutKey = atom({ plugin: 'issue-radar', key: 'checkoutKey' } as const, '')
 const isIssueSession = atom({ plugin: 'issue-radar', key: 'isIssueSession' } as const, false)
 const route = atom({ plugin: 'issue-radar', key: 'route' } as const, 'none')
+const prs = atom({ plugin: 'issue-radar', key: 'prs' } as const, {}, { shape: 'prs-1' })
+const sessionPrs = atom({ plugin: 'issue-radar', key: 'sessionPrs' } as const, {}, { shape: 'sessionprs-1' })
 
 // Module state: lost on a hot reload, which is fine, since the next refresh rebuilds it.
 let timer: Timer | undefined
@@ -71,6 +82,18 @@ const inFlight = new Set<string>()
 const unsaved = new Map<string, Mapping>()
 /** The heads of the briefs this session put into its own prompt box: sending one does not make this an issue session. */
 const ownBriefs = new Set<string>()
+/** E7: until when an unclassified failure pauses a repository's probe (the V1 list runs meanwhile). */
+const probeOffUntil = new Map<string, number>()
+/** E3: when each repository's pull-request states were last asked for, answered or not (a failure waits a full interval, E3-2). */
+const prTriedAt = new Map<string, number>()
+/** E3: hosts whose schema refused the pull-request fields; their rows keep gh's stateless links. */
+const prsOffHosts = new Set<string>()
+/** E3: the failure kinds already logged, once each per module lifetime. */
+const prFailuresLogged = new Set<string>()
+/** E3: when each mapped session's pull request may be read from the app again (per session, never the whole layer, E3-1). */
+const sessionPrNext = new Map<string, number>()
+let isReadingSessionPrs = false
+let hasLoggedStatusRaw = false
 
 type Resolved = { spec: string; info: RepoInfo | null; state: RepoState; isCheckout: boolean }
 /**
@@ -358,13 +381,168 @@ function seededDetails(meta: IssueMeta | undefined): IssueDetails | undefined {
   return { updatedAt: meta.updatedAt, state: 'OPEN', commentCount: meta.commentCount, comments: [], excerpt: meta.excerpt, body: '', linkedPrs: meta.linkedPrs, fetchedAt: 0 }
 }
 
-function metaOf(details: IssueDetails): IssueMeta {
-  return { updatedAt: details.updatedAt, commentCount: details.commentCount, excerpt: details.excerpt, linkedPrs: details.linkedPrs }
-}
-
 /** Details or a recap are current while they are at least as new as the row (ISO times compare as text). */
 function isCurrent(have: { updatedAt: string } | undefined, row: IssueRow): boolean {
   return have !== undefined && have.updatedAt >= row.updatedAt
+}
+
+/** V1's back-off after a failed list, shared by E7's tiers and E3's request: ten minutes after a rate limit, two offline. */
+function backoffFor(key: string, state: RepoState, now: number): void {
+  if (state.kind === 'rate-limited') backoffUntil.set(key, now + 10 * 60_000)
+  else if (state.kind === 'offline') backoffUntil.set(key, now + 2 * 60_000)
+}
+
+function newest(times: readonly string[]): string {
+  return times.reduce((latest, time) => (time > latest ? time : latest), '')
+}
+
+/** What E7's tiers made of a repository's timed refresh: the section, its meta, tier 2's details and the PR record. */
+type Probed = { section: Section; meta: Record<string, IssueMeta>; details: Map<number, IssueDetails>; record: PrRecord | undefined; log: Record<string, unknown> }
+
+/**
+ * E7 for one repository: the probe, and tier 2 when it found changes, in place of V1's list. Null when an unclassified
+ * failure paused the probe: the refresh then lists as V1 does, so the pane never shows less than V1. A classified
+ * failure keeps the last rows under its state and backs off as a failed list does. A mapped issue the probe found
+ * closed or gone is released, which V1's pruning cannot do for a capped list.
+ */
+async function probeSection($: EngineInterface, options: Options, target: Resolved, info: RepoInfo, sectionKey: string, cache: RepoCache, before: Section | undefined, now: number, withLinks: boolean): Promise<Probed | null> {
+  const all = await read($, mappings)
+  const mapped = Object.entries(all)
+    .filter(([rowKey]) => rowKey.startsWith(`${sectionKey}#`))
+    .sort(([, a], [, b]) => a.startedAt - b.startedAt)
+    .map(([rowKey]) => Number(rowKey.slice(sectionKey.length + 1)))
+    .filter(number => Number.isInteger(number) && number > 0)
+    .slice(0, MAPPED_MAX)
+  const outcome = await runTiers($, { info, first: Math.min(PROBE_MAX, options.maxIssues), cache, mapped, withLinks, now })
+  for (const number of outcome.released) await saveMapping($, rowKeyOf(sectionKey, number), null)
+  // A probe that asked the pull requests and did not bring them counts as a failed try of them (E3-2).
+  if (withLinks && outcome.kind !== 'done') prTriedAt.set(sectionKey, now)
+  if (outcome.kind === 'paused') {
+    probeOffUntil.set(sectionKey, now + PROBE_PAUSE_MS)
+    if (outcome.isRelations) dropRelations(info)
+    $.ui.log(`${PLUGIN}: the probe of ${sectionKey} pauses for 30 minutes: ${outcome.state.detail ?? outcome.state.kind}`, { to: 'debug' })
+
+    return null
+  }
+  const base = { key: sectionKey, spec: target.spec, info, isCheckout: target.isCheckout }
+  if (outcome.kind === 'failed') {
+    backoffFor(sectionKey, outcome.state, now)
+    const total = before?.total ?? cache.total
+    const section: Section = { ...base, state: outcome.state, rows: before?.rows ?? cache.rows, fetchedAt: before?.fetchedAt ?? cache.fetchedAt, ...(total === undefined ? {} : { total }) }
+
+    return { section, meta: cache.meta ?? {}, details: new Map(), record: undefined, log: { plan: 'failed', state: outcome.state.kind, links: withLinks } }
+  }
+  const written: RepoCache = { fetchedAt: now, rows: outcome.rows, meta: outcome.meta, total: outcome.total }
+  await writeStore($, storeKeyOf('cache:', sectionKey), written)
+  backoffUntil.delete(sectionKey)
+  let record: PrRecord | undefined
+  if (outcome.links !== null) {
+    prTriedAt.set(sectionKey, now)
+    record = recordOf(outcome.links, outcome.asOf, now)
+  }
+  if (outcome.patchedLinks.size > 0) {
+    const stored = record ?? asRecord(await readStore<unknown>($, storeKeyOf('prs:', sectionKey)))
+    // Tier 2's pull requests refresh a record a sweep made; alone they would make a partial one look fresh.
+    if (stored !== undefined) record = mergeLinks(stored, outcome.patchedLinks, outcome.patchedAsOf)
+  }
+  if (record !== undefined) await writeStore($, storeKeyOf('prs:', sectionKey), record)
+  const section: Section = { ...base, state: { kind: 'ok' }, rows: outcome.rows, fetchedAt: now, total: outcome.total }
+
+  return { section, meta: outcome.meta, details: outcome.details, record, log: { plan: outcome.plan, cost: outcome.cost, remaining: outcome.remaining, links: outcome.links !== null } }
+}
+
+/**
+ * Mirrors each listed repository's stored pull-request record into the state (another pane may have read it since),
+ * the ones this refresh read taking precedence, and drops the records of repositories no longer listed.
+ */
+async function loadPrCache($: EngineInterface, current: readonly Section[], fresh: ReadonlyMap<string, PrRecord>): Promise<void> {
+  const found: Record<string, PrRecord> = {}
+  for (const section of current) {
+    if (section.info === null) continue
+    const record = fresh.get(section.key) ?? asRecord(await readStore<unknown>($, storeKeyOf('prs:', section.key)))
+    if (record !== undefined) found[section.key] = record
+  }
+  await update($, prs, () => found)
+}
+
+/** A failed pull-request request: V1's back-off for a rate limit or no network, a host whose schema refused the fields given up, each kind logged once. */
+function notePrFailure($: EngineInterface, section: Section, state: RepoState, now: number): void {
+  backoffFor(section.key, state, now)
+  if (state.kind === 'error' && section.info !== null && SCHEMA_REFUSAL.test(state.detail ?? '')) prsOffHosts.add(section.info.host)
+  if (prFailuresLogged.has(state.kind)) return
+  prFailuresLogged.add(state.kind)
+  $.ui.log(`${PLUGIN}: pull-request states of ${section.key} failed: ${state.kind} ${state.detail ?? ''}`, { to: 'debug' })
+}
+
+/**
+ * E3 where V1's list ran: one GraphQL request per repository for the listed issues' pull requests, when they are due
+ * (isPrsDue) and the pane is shown (D X-1). Repositories E7 probed this refresh are skipped: their states rode in the
+ * probe, or wait for the next one.
+ */
+async function refreshPrs($: EngineInterface, current: readonly Section[], reason: Reason, now: number, probed: ReadonlySet<string>, log: Record<string, string>): Promise<void> {
+  for (const section of current) {
+    if (section.state.kind !== 'ok' || section.info === null || section.rows.length === 0 || probed.has(section.key)) continue
+    if (prsOffHosts.has(section.info.host)) continue
+    const stored = (await read($, prs))[section.key]
+    if (!isPrsDue(stored, section.rows, reason, now, prTriedAt.get(section.key), backoffUntil.get(section.key) ?? 0)) continue
+    prTriedAt.set(section.key, now)
+    const fetched = await fetchPrLinks($, section.info, section.rows.map(row => row.number))
+    if ('state' in fetched) {
+      notePrFailure($, section, fetched.state, now)
+      log[section.key] = `failed: ${fetched.state.kind}`
+      continue
+    }
+    const record = recordOf(fetched.links, newest(section.rows.map(row => row.updatedAt)), now)
+    await writeStore($, storeKeyOf('prs:', section.key), record)
+    await update($, prs, current => ({ ...current, [section.key]: record }))
+    log[section.key] = `read (cost ${fetched.cost ?? '?'})`
+  }
+}
+
+/**
+ * E3's optional layer: the pull request the app binds to each mapped issue session (`ccd_pr` `get_status`), read
+ * quietly (never a card), at most once a minute per session, each session backing off on its own for ten minutes
+ * after a failure (E3-1). Runs after the refresh as its own task, never awaited by it (A-F4), and only while the pane
+ * is shown (D X-1). The app's cache costs no GitHub budget.
+ */
+async function readSessionPrs($: EngineInterface, current: readonly Section[]): Promise<void> {
+  if (isReadingSessionPrs) return
+  isReadingSessionPrs = true
+  try {
+    if (!(await mayRunInBackground($))) return
+    const live = new Set(current.flatMap(section => section.rows.map(row => rowKeyOf(section.key, row.number))))
+    const all = await read($, mappings)
+    for (const [rowKey, mapping] of Object.entries(all)) {
+      if (!live.has(rowKey)) continue
+      const now = await $.clock.now()
+      if (now < (sessionPrNext.get(mapping.sessionId) ?? 0)) continue
+      const look = await readPrStatus($, mapping.sessionId, now)
+      if (look.kind === 'failed') {
+        sessionPrNext.set(mapping.sessionId, now + SESSION_PR_BACKOFF_MS)
+        $.ui.log(`${PLUGIN}: get_status ${mapping.sessionId} not read: ${look.reason}`, { to: 'debug' })
+        // No answer leaves what the app said last to age out; the app's own error means no pull request for that session.
+        if (look.isTransport) continue
+      } else {
+        if (!hasLoggedStatusRaw) {
+          hasLoggedStatusRaw = true
+          $.ui.log(`${PLUGIN}: get_status raw: ${look.raw}`, { to: 'debug' })
+        }
+        sessionPrNext.set(mapping.sessionId, now + SESSION_PR_EVERY_MS)
+      }
+      await update($, sessionPrs, found => {
+        const next = { ...found }
+        if (look.kind === 'pr') next[rowKey] = look.pr
+        else delete next[rowKey]
+
+        return next
+      })
+    }
+    await update($, sessionPrs, found => Object.fromEntries(Object.entries(found).filter(([rowKey]) => live.has(rowKey) && all[rowKey] !== undefined)))
+  } catch (error) {
+    $.ui.log(`${PLUGIN}: reading the sessions' pull requests failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
+  } finally {
+    isReadingSessionPrs = false
+  }
 }
 
 async function refresh($: EngineInterface, options: Options, reason: Reason): Promise<void> {
@@ -412,6 +590,14 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     const cachedMeta = new Map<string, Record<string, IssueMeta>>()
     // Two specs can name one repository (`owner/name` and `github.com/owner/name`, a rename gh redirects): one section per key.
     const seenKeys = new Set<string>()
+    // New background fetches run only while the pane is shown (D X-1): E3's pull-request states here.
+    const isShown = await isPaneShown($)
+    /** Repositories E7's tiers served this refresh, the details tier 2 read, the pull-request records they brought. */
+    const probed = new Set<string>()
+    const tierDetails = new Map<string, IssueDetails>()
+    const prUpdates = new Map<string, PrRecord>()
+    const probeLog: Record<string, Record<string, unknown>> = {}
+    const prLog: Record<string, string> = {}
 
     for (const target of targets) {
       const sectionKey = target.info === null ? `spec:${target.spec}`.toLowerCase() : repoKey(target.info)
@@ -438,6 +624,7 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
       // it adopts that list when it is newer than this pane's, so rows and fetch time agree.
       if (reason === 'timer' && (isFresh || now < until)) {
         const useCache = cachedAt !== null && cachedAt > (before?.fetchedAt ?? 0)
+        const total = useCache ? cache?.total : (before?.total ?? cache?.total)
         nextSections.push({
           key: sectionKey,
           spec: target.spec,
@@ -446,24 +633,52 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
           rows: useCache ? cachedRows : (before?.rows ?? cachedRows),
           fetchedAt: useCache ? cachedAt : (before?.fetchedAt ?? cachedAt),
           isCheckout: target.isCheckout,
+          ...(total === undefined ? {} : { total }),
         })
         continue
       }
+      // E7: a large repository's timed or tool refresh asks the probe, and tier 2 only for what changed.
+      if ((reason === 'timer' || reason === 'tool') && cache !== undefined && probeEngaged(cache, options.maxIssues, now, probeOffUntil.get(sectionKey) ?? 0)) {
+        const stored = asRecord(await readStore<unknown>($, storeKeyOf('prs:', sectionKey)))
+        const withLinks = isShown && !prsOffHosts.has(target.info.host) && isPrsDue(stored, cachedRows, reason, now, prTriedAt.get(sectionKey), until)
+        const done = await probeSection($, options, target, target.info, sectionKey, { ...cache, rows: cachedRows, meta: cachedMeta.get(sectionKey) ?? {} }, before, now, withLinks)
+        if (done !== null) {
+          probed.add(sectionKey)
+          probeLog[sectionKey] = done.log
+          cachedMeta.set(sectionKey, done.meta)
+          for (const [number, found] of done.details) tierDetails.set(rowKeyOf(sectionKey, number), found)
+          if (done.record !== undefined) prUpdates.set(sectionKey, done.record)
+          nextSections.push(done.section)
+          continue
+        }
+        probeLog[sectionKey] = { plan: 'paused' }
+      }
       const listed = await listIssues($, target.info, options.maxIssues)
       if ('state' in listed) {
-        if (listed.state.kind === 'rate-limited') backoffUntil.set(sectionKey, now + 10 * 60_000)
-        else if (listed.state.kind === 'offline') backoffUntil.set(sectionKey, now + 2 * 60_000)
+        backoffFor(sectionKey, listed.state, now)
         // The last good list stays visible under the error.
-        nextSections.push({ key: sectionKey, spec: target.spec, info: target.info, state: listed.state, rows: before?.rows ?? cachedRows, fetchedAt: before?.fetchedAt ?? cachedAt, isCheckout: target.isCheckout })
+        const total = before?.total ?? cache?.total
+        nextSections.push({
+          key: sectionKey,
+          spec: target.spec,
+          info: target.info,
+          state: listed.state,
+          rows: before?.rows ?? cachedRows,
+          fetchedAt: before?.fetchedAt ?? cachedAt,
+          isCheckout: target.isCheckout,
+          ...(total === undefined ? {} : { total }),
+        })
         continue
       }
       backoffUntil.delete(sectionKey)
       const open = new Set(listed.rows.map(row => String(row.number)))
       const meta = Object.fromEntries(Object.entries(cachedMeta.get(sectionKey) ?? {}).filter(([number]) => open.has(number)))
       cachedMeta.set(sectionKey, meta)
-      const fresh: RepoCache = { fetchedAt: now, rows: listed.rows, meta }
+      // An uncapped list counts the open issues itself; a capped one keeps the probe's last count while it still fits (E7).
+      const total = listed.rows.length < options.maxIssues ? listed.rows.length : cache?.total !== undefined && cache.total >= listed.rows.length ? cache.total : undefined
+      const fresh: RepoCache = { fetchedAt: now, rows: listed.rows, meta, ...(total === undefined ? {} : { total }) }
       await writeStore($, storeKeyOf('cache:', sectionKey), fresh)
-      nextSections.push({ key: sectionKey, spec: target.spec, info: target.info, state: { kind: 'ok' }, rows: listed.rows, fetchedAt: now, isCheckout: target.isCheckout })
+      nextSections.push({ key: sectionKey, spec: target.spec, info: target.info, state: { kind: 'ok' }, rows: listed.rows, fetchedAt: now, isCheckout: target.isCheckout, ...(total === undefined ? {} : { total }) })
     }
 
     // Seed details from the cache for issues this session has not fetched yet, and drop what no live row needs.
@@ -471,6 +686,8 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     await update($, details, current => {
       const next: Record<string, IssueDetails> = {}
       for (const [rowKey, have] of Object.entries(current)) if (live.has(rowKey)) next[rowKey] = have
+      // What E7's tier 2 read is current: hydrate finds it so, and runs no `gh issue view` for those issues.
+      for (const [rowKey, found] of tierDetails) if (live.has(rowKey)) next[rowKey] = found
       for (const section of nextSections) {
         const meta = cachedMeta.get(section.key) ?? {}
         for (const row of section.rows) {
@@ -502,17 +719,24 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     await update($, recaps, current => Object.fromEntries(Object.entries(current).filter(([rowKey]) => live.has(rowKey))))
     await update($, opened, current => (current === '' || live.has(current) ? current : ''))
     await update($, sections, () => nextSections)
+    // The stored pull-request states draw at once; then the due ones are read, before the details (E3-5).
+    await loadPrCache($, nextSections, prUpdates)
+    if (isShown) await refreshPrs($, nextSections, reason, now, probed, prLog)
     // The last refresh's outcome, for the spike notes and a look at the store file.
     await writeStore($, 'debug:last', {
       at: now,
       reason,
       root,
       checkout: checkout.state,
-      sections: nextSections.map(section => ({ key: section.key, state: section.state, rows: section.rows.length })),
+      sections: nextSections.map(section => ({ key: section.key, state: section.state, rows: section.rows.length, ...(section.total === undefined ? {} : { total: section.total }) })),
+      probe: probeLog,
+      prs: prLog,
     })
 
     await hydrate($, options, nextSections, now)
     await pruneMappings($, options, nextSections)
+    // The desktop's part comes last and is not awaited: no desktop call holds up the GitHub part (A-F4).
+    void readSessionPrs($, nextSections)
   } catch (error) {
     $.ui.log(`${PLUGIN}: refresh failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
   } finally {
@@ -572,7 +796,8 @@ async function hydrate($: EngineInterface, options: Options, current: readonly S
       const recap = allRecaps[rowKey]
       if (recap !== undefined && recap.error === undefined) repoRecaps[String(row.number)] = recap
     }
-    const merged: RepoCache = { fetchedAt: cache?.fetchedAt ?? section.fetchedAt ?? now, rows: cache?.rows ?? section.rows, meta }
+    const total = cache?.total ?? section.total
+    const merged: RepoCache = { fetchedAt: cache?.fetchedAt ?? section.fetchedAt ?? now, rows: cache?.rows ?? section.rows, meta, ...(total === undefined ? {} : { total }) }
     await writeStore($, storeKeyOf('cache:', section.key), merged)
     // Recaps stay on disk only while the owner wants them for this repository.
     if (options.recaps && chosen.consent[section.key] === true) await writeStore($, storeKeyOf('recaps:', section.key), repoRecaps)
@@ -653,19 +878,34 @@ async function setStarting($: EngineInterface, rowKey: string, value: boolean): 
   })
 }
 
-/** The fresh details the brief needs; `null` when the issue is closed or gh failed (the owner is told). */
+/**
+ * The fresh details the brief needs, with the issue's tree (E17): its relations, and when it has a parent, the
+ * parent's other sub-issues from one more read (a failure there leaves the brief without siblings). `null` when the
+ * issue is closed or gh failed (the owner is told). The tree lives in the session's state only.
+ */
 async function freshDetails($: EngineInterface, options: Options, section: Section, row: IssueRow, now: number): Promise<IssueDetails | null> {
   const S = strings(options.language)
   if (section.info === null) return null
-  const viewed = await viewIssue($, section.info, row, now)
+  const viewed = await viewIssue($, section.info, row, now, { tree: true })
   if ('state' in viewed) {
     $.ui.toast(clean(S.error(viewed.state.detail ?? viewed.state.kind)))
 
     return null
   }
   const rowKey = rowKeyOf(section.key, row.number)
-  await update($, details, current => ({ ...current, [rowKey]: viewed.details }))
-  if (viewed.details.state.toUpperCase() !== 'OPEN') {
+  let fetched = viewed.details
+  const tree = fetched.tree
+  if (tree !== undefined && tree.parent !== null && fetched.state.toUpperCase() === 'OPEN') {
+    const here = repoLabel(section.info).toLowerCase()
+    const parent = await viewParent($, tree.parent, section.info.host)
+    if (parent !== null && !('state' in parent)) {
+      const siblings = parent.subIssues.filter(ref => !(ref.number === row.number && (ref.repo === '' || ref.repo.toLowerCase() === here))).slice(0, 10)
+      fetched = { ...fetched, tree: { ...tree, siblings, parentProgress: parent.progress } }
+    } else $.ui.log(`${PLUGIN}: the parent of #${row.number} was not read: ${parent === null ? 'no repository in its URL' : `${parent.state.kind} ${parent.state.detail ?? ''}`}`, { to: 'debug' })
+  }
+  const settled = fetched
+  await update($, details, current => ({ ...current, [rowKey]: settled }))
+  if (settled.state.toUpperCase() !== 'OPEN') {
     $.ui.toast(S.closedMeanwhile(row.number))
     await update($, sections, current => current.map(found => (found.key === section.key ? { ...found, rows: found.rows.filter(item => item.number !== row.number) } : found)))
     await saveMapping($, rowKey, null)
@@ -673,7 +913,7 @@ async function freshDetails($: EngineInterface, options: Options, section: Secti
     return null
   }
 
-  return viewed.details
+  return settled
 }
 
 /** "Work on it" (or "Open session", as `label` says): opens the issue's session, or starts one. */
@@ -841,6 +1081,11 @@ async function resetStore($: EngineInterface): Promise<void> {
   named.clear()
   backoffUntil.clear()
   unsaved.clear()
+  probeOffUntil.clear()
+  prTriedAt.clear()
+  prsOffHosts.clear()
+  sessionPrNext.clear()
+  resetRelations()
   settingsKey = null
   await update($, sections, () => [])
   await update($, details, () => ({}))
@@ -849,6 +1094,8 @@ async function resetStore($: EngineInterface): Promise<void> {
   await update($, settings, () => DEFAULT_SETTINGS)
   await update($, opened, () => '')
   await update($, tokens, () => 0)
+  await update($, prs, () => ({}))
+  await update($, sessionPrs, () => ({}))
 }
 
 /**
@@ -878,6 +1125,18 @@ async function runSpike($: EngineInterface, command: string): Promise<string> {
     const keys = Object.keys(parseObject(self.structured, self.text))
     lines.push(`get_session self (quiet, via ${self.via}): ${keys.length === 0 ? 'no JSON' : `keys ${keys.slice(0, 40).join(', ')}`}`)
   } else lines.push(`get_session self (quiet): not read (${self.reason})`)
+  // S14: whether a mod's own $.mcp.call reaches ccd_pr get_status, for this session and for the mapped issue sessions
+  // (S4: are the mapped ids the app's?), and what the answer's fields are called. The mcp route alone: a measurement.
+  const now = await $.clock.now()
+  const asked = ['self', ...Object.values(await read($, mappings)).map(mapping => mapping.sessionId)].slice(0, 4)
+  for (const sessionId of asked) {
+    const look = await readPrStatus($, sessionId, now, { isMeasurement: true, isMcpOnly: true })
+    lines.push(
+      look.kind === 'failed'
+        ? `get_status ${sessionId} (quiet, mcp only): not read (${look.reason})`
+        : `get_status ${sessionId} (quiet, via mcp): ${look.kind === 'pr' ? `PR #${look.pr.number} ${look.pr.state || '?'}; ` : 'no pull request; '}${look.raw.slice(0, 200) || '(empty)'}`,
+    )
+  }
 
   return clean(lines.join('\n'))
 }
@@ -978,6 +1237,8 @@ export const register: Register = (on, given) => {
         details: await read($, details),
         recaps: await read($, recaps),
         mappings: await read($, mappings),
+        prs: await read($, prs),
+        sessionPrs: await read($, sessionPrs),
         settings: await read($, settings),
         options,
         strings: S,

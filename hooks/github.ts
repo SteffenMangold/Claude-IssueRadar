@@ -3,21 +3,65 @@
 // token; every failure becomes a named state.
 import type { EngineInterface } from 'claude-code'
 
-import type { IssueComment, IssueDetails, IssueRow, LinkedPr, RepoInfo, RepoState } from '../types'
+import type { IssueComment, IssueDetails, IssueMeta, IssueProgress, IssueRef, IssueRelations, IssueRow, IssueTree, LinkedPr, RepoInfo, RepoState, RepoStateKind } from '../types'
 
-const LIST_FIELDS = 'number,title,url,createdAt,updatedAt,author,labels,assignees,milestone,isPinned'
-const VIEW_FIELDS = 'number,state,body,comments,updatedAt,closedByPullRequestsReferences,url'
+export const LIST_FIELDS = 'number,title,url,createdAt,updatedAt,author,labels,assignees,milestone,isPinned'
+/** What a row shows of an issue's relations (E17); gh pages blockers by 50, as the GraphQL row does. */
+export const LIST_RELATIONS = 'parent,subIssuesSummary,blockedBy'
+export const VIEW_FIELDS = 'number,state,body,comments,updatedAt,closedByPullRequestsReferences,url'
+/** The issue's tree for a brief (E17): its parent, its sub-issues and both directions of blocking. */
+export const TREE_FIELDS = 'parent,subIssues,subIssuesSummary,blockedBy,blocking'
+/** What the parent read asks: its sub-issues are the siblings. */
+export const PARENT_FIELDS = 'number,title,state,subIssues,subIssuesSummary'
 const REPO_FIELDS = 'nameWithOwner,isPrivate,hasIssuesEnabled,isArchived,isFork,url,defaultBranchRef'
 export const BODY_CHARS = 6_000
 export const EXCERPT_CHARS = 160
 export const COMMENT_CHARS = 600
 export const COMMENTS_KEPT = 3
+/** A related issue's title as a row keeps it (the store holds it). */
+export const REF_TITLE_CHARS = 60
+/** A related issue's title as a brief's tree quotes it. */
+export const TREE_TITLE_CHARS = 80
+/** The relation field names gh or GraphQL name when a host lacks them (an older GitHub Enterprise). */
+export const RELATION_FIELD = /\b(?:parent|subIssues|subIssuesSummary|blockedBy|blocking)\b/
+
+/**
+ * Failures the relation fields cannot cause: asking again without them would only double the call. Everything else
+ * (a refused node in another organization, a field the host lacks, an answer gh calls an error) is asked once more
+ * without them (E17-1). A missing scope is in this set too: the relation fields need none beyond the issues' own.
+ */
+const NOT_THE_RELATIONS: ReadonlySet<RepoStateKind> = new Set<RepoStateKind>(['signed-out', 'token-invalid', 'rate-limited', 'offline', 'gh-missing', 'missing-scope'])
+
+/** How long a repository goes without relations after a failure that did not name them: most likely a blip (E17-1). */
+export const RELATIONS_PAUSE_MS = 30 * 60_000
+
+/**
+ * The repositories (by key) whose list failed with the relation fields and listed without them, and until when they
+ * go without: for the rest of the module's life when gh's failure named a relation field (a host without them, a
+ * related issue the token may not read), else for half an hour. A reload, or `/issue-radar reset`, tries them again.
+ */
+const relationsOff = new Map<string, number>()
+
+export function hasRelations(info: Pick<RepoInfo, 'host' | 'owner' | 'name'>, now: number): boolean {
+  const until = relationsOff.get(repoKey(info))
+
+  return until === undefined || now >= until
+}
+
+/** Lists and fetches this repository without relation fields until `until` (for good when not given). */
+export function dropRelations(info: Pick<RepoInfo, 'host' | 'owner' | 'name'>, until = Number.POSITIVE_INFINITY): void {
+  relationsOff.set(repoKey(info), until)
+}
+
+export function resetRelations(): void {
+  relationsOff.clear()
+}
 
 /**
  * What a gh call came to. A failure keeps what the process wrote to stdout and its exit code when it ran at all:
  * `gh api graphql` exits 1 with partial data on stdout, which a caller may still use.
  */
-export type GhResult = { ok: true; stdout: string } | { ok: false; state: RepoState; stdout?: string; exitCode?: number }
+export type GhResult = { ok: true; stdout: string } | { ok: false; state: RepoState; stdout?: string; stderr?: string; exitCode?: number }
 
 export type GhOptions = {
   cwd?: string
@@ -117,7 +161,7 @@ export async function gh($: EngineInterface, args: readonly string[], options: G
     const ran = await $.process.run(['gh', ...args], { cwd: options.cwd, timeoutMs: options.timeoutMs ?? 30_000, ...(options.env === undefined ? {} : { env: options.env }) })
     if (ran.exitCode === 0) return { ok: true, stdout: ran.stdout }
 
-    return { ok: false, state: classify(ran.exitCode, ran.stderr, options.host ?? 'github.com', options.repo ?? ''), stdout: ran.stdout, exitCode: ran.exitCode }
+    return { ok: false, state: classify(ran.exitCode, ran.stderr, options.host ?? 'github.com', options.repo ?? ''), stdout: ran.stdout, stderr: ran.stderr, exitCode: ran.exitCode }
   } catch (error) {
     return { ok: false, state: classifyThrow(error) }
   }
@@ -131,13 +175,31 @@ export function parseJson(text: string): unknown {
   }
 }
 
-function str(value: unknown, fallback = ''): string {
+export function isRecord(value: unknown): value is Json {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+export function asString(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback
 }
 
-function login(value: unknown): string {
-  return typeof value === 'object' && value !== null ? str((value as Json)['login'], '?') : '?'
+/** The `login` of an author or assignee record; `?` when there is none. */
+export function loginOf(value: unknown): string {
+  return isRecord(value) ? asString(value['login'], '?') : '?'
 }
+
+/** The `nodes` of a GraphQL connection (or a gh list that answers one); empty when it is none. */
+export function nodesOf(value: unknown): unknown[] {
+  return isRecord(value) && Array.isArray(value['nodes']) ? (value['nodes'] as unknown[]) : []
+}
+
+/** A count GraphQL or gh answered: a whole number not below zero, else null. */
+export function countOf(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null
+}
+
+const str = asString
+const login = loginOf
 
 function parseRepo(text: string): RepoInfo | null {
   const json = parseJson(text)
@@ -201,47 +263,119 @@ export function stateOf(info: RepoInfo): RepoState {
   return { kind: 'ok' }
 }
 
+/** `host` and `owner/name` of an issue's or a pull request's URL (`https://host/owner/name/issues/n`); null when it names none. */
+export function repoOfUrl(url: string): { host: string; repo: string } | null {
+  try {
+    const parsed = new URL(url)
+    const [owner, name] = parsed.pathname.split('/').filter(part => part !== '')
+    if (owner === undefined || name === undefined) return null
+
+    return { host: parsed.host.toLowerCase(), repo: `${owner}/${name}` }
+  } catch {
+    return null
+  }
+}
+
+/** A related issue from `{ number, state, title, url }`, its title cut to `titleChars` (0 keeps none); null when it is none. */
+export function refOf(node: unknown, titleChars: number = REF_TITLE_CHARS): IssueRef | null {
+  if (!isRecord(node)) return null
+  const number = Number(node['number'])
+  if (!Number.isInteger(number) || number <= 0) return null
+  const url = asString(node['url'])
+
+  return { number, repo: repoOfUrl(url)?.repo ?? '', state: asString(node['state']).toUpperCase(), title: titleChars > 0 ? collapse(asString(node['title'])).slice(0, titleChars) : '', url }
+}
+
+/** `{ completed, total }` of a `subIssuesSummary`; null when it counts no sub-issue. */
+export function progressOf(value: unknown): IssueProgress | null {
+  if (!isRecord(value)) return null
+  const total = countOf(value['total'])
+  if (total === null || total === 0) return null
+
+  return { completed: Math.min(total, countOf(value['completed']) ?? 0), total }
+}
+
+/**
+ * What a row shows of an issue's relations, from gh's list fields or the GraphQL row (same shapes): the parent, the
+ * sub-issue progress, and the open blockers (counted, the first two kept without titles). Undefined when there is
+ * nothing to show, so the store keeps nothing for most rows.
+ */
+export function parseRelations(data: Json): IssueRelations | undefined {
+  const parent = refOf(data['parent'])
+  const subIssues = progressOf(data['subIssuesSummary'])
+  const blockers = nodesOf(data['blockedBy'])
+    .map(node => refOf(node, 0))
+    .filter((ref): ref is IssueRef => ref !== null)
+  const open = blockers.filter(ref => ref.state === 'OPEN')
+  if (parent === null && subIssues === null && open.length === 0) return undefined
+  const total = Math.max(countOf(isRecord(data['blockedBy']) ? data['blockedBy']['totalCount'] : undefined) ?? 0, blockers.length)
+
+  return { parent, subIssues, blockedBy: { open: open.length, total, refs: open.slice(0, 2) } }
+}
+
+/** One row from an issue record whose labels and assignees are lists (gh) or connections (GraphQL). */
+function rowOf(data: Json): IssueRow | null {
+  const number = Number(data['number'])
+  if (!Number.isInteger(number) || number <= 0) return null
+  const listed = (value: unknown): unknown[] => (Array.isArray(value) ? value : nodesOf(value))
+  const labels = listed(data['labels'])
+    .filter(isRecord)
+    .map(label => ({ name: str(label['name']), color: str(label['color']) }))
+    .filter(label => label.name !== '')
+  const assignees = listed(data['assignees'])
+    .map(login)
+    .filter(name => name !== '?')
+  const milestone = data['milestone']
+  const row: IssueRow = {
+    number,
+    title: str(data['title']),
+    url: str(data['url']),
+    createdAt: str(data['createdAt']),
+    updatedAt: str(data['updatedAt']),
+    author: login(data['author']),
+    labels,
+    assignees,
+    milestone: isRecord(milestone) ? str(milestone['title']) || null : null,
+    isPinned: data['isPinned'] === true,
+  }
+  const relations = parseRelations(data)
+  if (relations !== undefined) row.relations = relations
+
+  return row
+}
+
 function parseRows(text: string): IssueRow[] | null {
   const json = parseJson(text)
   if (!Array.isArray(json)) return null
-  const rows: IssueRow[] = []
-  for (const item of json) {
-    if (typeof item !== 'object' || item === null) continue
-    const data = item as Json
-    const number = Number(data['number'])
-    if (!Number.isInteger(number) || number <= 0) continue
-    const labels = Array.isArray(data['labels'])
-      ? (data['labels'] as unknown[])
-          .filter((label): label is Json => typeof label === 'object' && label !== null)
-          .map(label => ({ name: str(label['name']), color: str(label['color']) }))
-          .filter(label => label.name !== '')
-      : []
-    const assignees = Array.isArray(data['assignees']) ? (data['assignees'] as unknown[]).map(login).filter(name => name !== '?') : []
-    const milestone = data['milestone']
-    rows.push({
-      number,
-      title: str(data['title']),
-      url: str(data['url']),
-      createdAt: str(data['createdAt']),
-      updatedAt: str(data['updatedAt']),
-      author: login(data['author']),
-      labels,
-      assignees,
-      milestone: typeof milestone === 'object' && milestone !== null ? str((milestone as Json)['title']) || null : null,
-      isPinned: data['isPinned'] === true,
-    })
-  }
 
-  return rows
+  return json.filter(isRecord).map(rowOf).filter((row): row is IssueRow => row !== null)
 }
 
-/** The open issues of a repository, the most recently updated first, pull requests excluded by gh itself. */
+/** One issue of the GraphQL Row fragment (E7, with E17's relations when asked) as a row; null when it is none. */
+export function parseGraphRow(node: unknown): IssueRow | null {
+  return isRecord(node) ? rowOf(node) : null
+}
+
+/**
+ * The open issues of a repository, the most recently updated first, pull requests excluded by gh itself. Asks the
+ * relation fields too (E17), unless this repository failed with them before: a list that fails with them for any
+ * reason they could cause is asked once more without them (E17-1), and when that answers, the repository lists
+ * without them for good if gh's failure named a relation field, else for half an hour.
+ */
 export async function listIssues($: EngineInterface, info: RepoInfo, limit: number): Promise<{ rows: IssueRow[] } | { state: RepoState }> {
-  const ran = await gh(
-    $,
-    ['issue', 'list', '-R', repoSpec(info), '--state', 'open', '--limit', String(Math.max(1, limit)), '--search', 'sort:updated-desc', '--json', LIST_FIELDS],
-    { host: info.host, repo: repoLabel(info) },
-  )
+  const now = await $.clock.now()
+  const withRelations = hasRelations(info, now)
+  const args = (fields: string) => ['issue', 'list', '-R', repoSpec(info), '--state', 'open', '--limit', String(Math.max(1, limit)), '--search', 'sort:updated-desc', '--json', fields]
+  let ran = await gh($, args(withRelations ? `${LIST_FIELDS},${LIST_RELATIONS}` : LIST_FIELDS), { host: info.host, repo: repoLabel(info) })
+  if (!ran.ok && withRelations && !NOT_THE_RELATIONS.has(ran.state.kind)) {
+    const said = ran.stderr ?? ran.state.detail ?? ''
+    ran = await gh($, args(LIST_FIELDS), { host: info.host, repo: repoLabel(info) })
+    if (ran.ok) {
+      const isNamed = RELATION_FIELD.test(said)
+      dropRelations(info, isNamed ? Number.POSITIVE_INFINITY : now + RELATIONS_PAUSE_MS)
+      $.ui.log(`issue-radar: ${repoLabel(info)} lists without relations ${isNamed ? 'from now on' : 'for 30 minutes'} (${said.replace(/\s+/g, ' ').slice(0, 200)})`, { to: 'debug' })
+    }
+  }
   if (!ran.ok) return { state: ran.state }
   const rows = parseRows(ran.stdout)
   if (rows === null) return { state: { kind: 'error', detail: 'gh issue list answered no JSON' } }
@@ -249,7 +383,7 @@ export async function listIssues($: EngineInterface, info: RepoInfo, limit: numb
   return { rows: rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)) }
 }
 
-function collapse(text: string): string {
+export function collapse(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
@@ -271,41 +405,126 @@ export function excerptOf(body: string, max = EXCERPT_CHARS): string {
   return `${space > max * 0.6 ? cut.slice(0, space) : cut}…`
 }
 
-function parseDetails(text: string, row: IssueRow, now: number): IssueDetails | null {
-  const json = parseJson(text)
-  if (typeof json !== 'object' || json === null) return null
-  const data = json as Json
-  const body = str(data['body'])
-  const comments: IssueComment[] = Array.isArray(data['comments'])
-    ? (data['comments'] as unknown[])
-        .filter((comment): comment is Json => typeof comment === 'object' && comment !== null)
-        .map(comment => ({ author: login(comment['author']), createdAt: str(comment['createdAt']), body: collapse(str(comment['body'])).slice(0, COMMENT_CHARS) }))
-    : []
-  const linkedPrs: LinkedPr[] = Array.isArray(data['closedByPullRequestsReferences'])
-    ? (data['closedByPullRequestsReferences'] as unknown[])
-        .filter((pr): pr is Json => typeof pr === 'object' && pr !== null)
-        .map(pr => ({ number: Number(pr['number']), state: str(pr['state']), url: str(pr['url']) }))
-        .filter(pr => Number.isInteger(pr.number) && pr.number > 0)
-    : []
+/**
+ * The pull requests that will close an issue, from gh's list or a GraphQL connection's nodes: one reader for both
+ * paths (E7-1). gh's items carry no state, so theirs is empty; nobody draws an empty state as `()`.
+ */
+export function linkedPrsOf(items: readonly unknown[]): LinkedPr[] {
+  return items
+    .filter(isRecord)
+    .map(pr => ({ number: Number(pr['number']), state: str(pr['state']).toUpperCase(), url: str(pr['url']) }))
+    .filter(pr => Number.isInteger(pr.number) && pr.number > 0)
+}
 
-  return {
+function commentOf(comment: Json): IssueComment {
+  return { author: login(comment['author']), createdAt: str(comment['createdAt']), body: collapse(str(comment['body'])).slice(0, COMMENT_CHARS) }
+}
+
+/** What the store keeps of an issue's details: no body, no comments. */
+export function metaOf(details: IssueDetails): IssueMeta {
+  return { updatedAt: details.updatedAt, commentCount: details.commentCount, excerpt: details.excerpt, linkedPrs: details.linkedPrs }
+}
+
+/** The issue's tree from gh's view with the tree fields; undefined when it relates to nothing. Titles cut for the brief. */
+export function parseTree(data: Json): IssueTree | undefined {
+  const refs = (value: unknown, max: number) =>
+    nodesOf(value)
+      .map(node => refOf(node, TREE_TITLE_CHARS))
+      .filter((ref): ref is IssueRef => ref !== null)
+      .slice(0, max)
+  const parent = refOf(data['parent'], TREE_TITLE_CHARS)
+  const subIssues = refs(data['subIssues'], 20)
+  const blockedBy = refs(data['blockedBy'], 10)
+  const blocking = refs(data['blocking'], 10)
+  if (parent === null && subIssues.length === 0 && blockedBy.length === 0 && blocking.length === 0) return undefined
+
+  return { parent, parentProgress: null, siblings: [], subIssues, subProgress: progressOf(data['subIssuesSummary']), blockedBy, blocking }
+}
+
+function parseDetails(text: string, row: IssueRow, now: number, hasTree: boolean): IssueDetails | null {
+  const json = parseJson(text)
+  if (!isRecord(json)) return null
+  const data = json
+  const body = str(data['body'])
+  const comments: IssueComment[] = Array.isArray(data['comments']) ? (data['comments'] as unknown[]).filter(isRecord).map(commentOf) : []
+  const linked = data['closedByPullRequestsReferences']
+  const details: IssueDetails = {
     updatedAt: str(data['updatedAt']) || row.updatedAt,
     state: str(data['state'], 'OPEN'),
     commentCount: comments.length,
     comments: comments.slice(-COMMENTS_KEPT),
     excerpt: excerptOf(body),
     body: body.slice(0, BODY_CHARS),
-    linkedPrs,
+    linkedPrs: linkedPrsOf(Array.isArray(linked) ? linked : nodesOf(linked)),
+    fetchedAt: now,
+  }
+  const tree = hasTree ? parseTree(data) : undefined
+  if (tree !== undefined) details.tree = tree
+
+  return details
+}
+
+/**
+ * One issue of the GraphQL Details fragment (E7's tier 2): the body, the last comments with the exact total, and the
+ * pull requests that will close it, open and merged ones only, as gh's view lists them (E7-1).
+ */
+export function parseGraphDetails(node: unknown, row: IssueRow, now: number): IssueDetails {
+  const data = isRecord(node) ? node : {}
+  const body = str(data['body'])
+  const comments = nodesOf(data['comments']).filter(isRecord).map(commentOf)
+  const total = countOf(isRecord(data['comments']) ? data['comments']['totalCount'] : undefined)
+
+  return {
+    updatedAt: str(data['updatedAt']) || row.updatedAt,
+    state: str(data['state'], 'OPEN'),
+    commentCount: Math.max(total ?? 0, comments.length),
+    comments: comments.slice(-COMMENTS_KEPT),
+    excerpt: excerptOf(body),
+    body: body.slice(0, BODY_CHARS),
+    linkedPrs: linkedPrsOf(nodesOf(data['closedByPullRequestsReferences'])),
     fetchedAt: now,
   }
 }
 
-/** The details of one issue: state, body, comments and the pull requests that will close it. */
-export async function viewIssue($: EngineInterface, info: RepoInfo, row: IssueRow, now: number): Promise<{ details: IssueDetails } | { state: RepoState }> {
-  const ran = await gh($, ['issue', 'view', String(row.number), '-R', repoSpec(info), '--json', VIEW_FIELDS], { host: info.host, repo: repoLabel(info) })
+/**
+ * The details of one issue: state, body, comments and the pull requests that will close it. With `tree` (a brief's
+ * fresh read) the tree fields too (E17); a view that fails with them for a reason they could cause is asked once more
+ * without them, and the brief then has no tree.
+ */
+export async function viewIssue($: EngineInterface, info: RepoInfo, row: IssueRow, now: number, options: { tree?: boolean } = {}): Promise<{ details: IssueDetails } | { state: RepoState }> {
+  const withTree = options.tree === true && hasRelations(info, now)
+  const args = (fields: string) => ['issue', 'view', String(row.number), '-R', repoSpec(info), '--json', fields]
+  let ran = await gh($, args(withTree ? `${VIEW_FIELDS},${TREE_FIELDS}` : VIEW_FIELDS), { host: info.host, repo: repoLabel(info) })
+  let hasTree = withTree
+  if (!ran.ok && withTree && !NOT_THE_RELATIONS.has(ran.state.kind)) {
+    $.ui.log(`issue-radar: the tree of #${row.number} failed (${ran.state.kind} ${ran.state.detail ?? ''}); asking without it`, { to: 'debug' })
+    ran = await gh($, args(VIEW_FIELDS), { host: info.host, repo: repoLabel(info) })
+    hasTree = false
+  }
   if (!ran.ok) return { state: ran.state }
-  const details = parseDetails(ran.stdout, row, now)
+  const details = parseDetails(ran.stdout, row, now, hasTree)
   if (details === null) return { state: { kind: 'error', detail: 'gh issue view answered no JSON' } }
 
   return { details }
+}
+
+/**
+ * The parent's sub-issues and progress, for the siblings of a brief's tree (E17): one read of the parent, which may
+ * sit in another repository, on the host its URL names. Null when its URL names no repository; a failure is a state.
+ */
+export async function viewParent($: EngineInterface, parent: IssueRef, fallbackHost: string): Promise<{ subIssues: IssueRef[]; progress: IssueProgress | null } | { state: RepoState } | null> {
+  const where = repoOfUrl(parent.url)
+  const host = where?.host ?? fallbackHost
+  const repo = where?.repo ?? parent.repo
+  const spec = host === 'github.com' ? repo : `${host}/${repo}`
+  if (repo === '' || !isRepoSpec(spec)) return null
+  const ran = await gh($, ['issue', 'view', String(parent.number), '-R', spec, '--json', PARENT_FIELDS], { host, repo })
+  if (!ran.ok) return { state: ran.state }
+  const json = parseJson(ran.stdout)
+  if (!isRecord(json)) return { state: { kind: 'error', detail: 'gh issue view answered no JSON' } }
+  const subIssues = nodesOf(json['subIssues'])
+    .map(node => refOf(node, TREE_TITLE_CHARS))
+    .filter((ref): ref is IssueRef => ref !== null)
+
+  return { subIssues, progress: progressOf(json['subIssuesSummary']) }
 }
