@@ -162,6 +162,8 @@ export type SessionPr = {
   mergeable: string
   /** When it was read. */
   at: number
+  /** The session the app answered for: the row draws it only while its mapping names that session. */
+  sessionId?: string
 }
 
 export type IssueComment = { author: string; createdAt: string; body: string }

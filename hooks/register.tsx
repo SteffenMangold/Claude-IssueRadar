@@ -29,6 +29,8 @@ const SESSION_PR_EVERY_MS = 60_000
 const SESSION_PR_BACKOFF_MS = 10 * 60_000
 /** The texts of a schema that lacks what the pull-request request asks (an older GitHub Enterprise): no more tries there. */
 const SCHEMA_REFUSAL = /doesn't accept argument|doesn't exist on type|undefined ?field|unknown argument|cannot query field/i
+/** The fields only E3's Links fragment asks: a refusal that names one, in a request that mixes fragments, is E3's. */
+const PR_FIELD = /\b(?:closedByPullRequestsReferences|reviewDecision|statusCheckRollup|isDraft)\b/
 const DEFAULT_SETTINGS: RepoSettings = { watch: [], consent: {}, collapsed: {} }
 /** The first characters of a brief: what tells this session's own fills from a hand-off. */
 const BRIEF_HEAD = 80
@@ -243,6 +245,15 @@ async function saveMapping($: EngineInterface, rowKey: string, mapping: Mapping 
 
     return next
   })
+  // A released mapping, or one now naming another session, takes the pull request the app reported for the old one along (E3).
+  await update($, sessionPrs, current => {
+    const had = current[rowKey]
+    if (had === undefined || (mapping !== null && had.sessionId === mapping.sessionId)) return current
+    const next = { ...current }
+    delete next[rowKey]
+
+    return next
+  })
 }
 
 /** Applies a change to the stored settings, read fresh so another pane's writes on the same repository survive, and mirrors the result into the state. */
@@ -413,13 +424,17 @@ async function probeSection($: EngineInterface, options: Options, target: Resolv
     .map(([rowKey]) => Number(rowKey.slice(sectionKey.length + 1)))
     .filter(number => Number.isInteger(number) && number > 0)
     .slice(0, MAPPED_MAX)
-  const outcome = await runTiers($, { info, first: Math.min(PROBE_MAX, options.maxIssues), cache, mapped, withLinks, now })
+  const hasPrFields = !prsOffHosts.has(info.host)
+  const outcome = await runTiers($, { info, first: Math.min(PROBE_MAX, options.maxIssues), cache, mapped, withLinks, hasPrFields, now })
   for (const number of outcome.released) await saveMapping($, rowKeyOf(sectionKey, number), null)
   // A probe that asked the pull requests and did not bring them counts as a failed try of them (E3-2).
   if (withLinks && outcome.kind !== 'done') prTriedAt.set(sectionKey, now)
   if (outcome.kind === 'paused') {
     probeOffUntil.set(sectionKey, now + PROBE_PAUSE_MS)
     if (outcome.isRelations) dropRelations(info)
+    // The probe's Links, or tier 2's, refused by the schema: the host's pull-request states are given up, as a refused
+    // IssueRadarPrs gives them up, so later probes ask without them and patches read the window instead.
+    if (refusesPrFields(outcome.state)) prsOffHosts.add(info.host)
     $.ui.log(`${PLUGIN}: the probe of ${sectionKey} pauses for 30 minutes: ${outcome.state.detail ?? outcome.state.kind}`, { to: 'debug' })
 
     return null
@@ -463,6 +478,13 @@ async function loadPrCache($: EngineInterface, current: readonly Section[], fres
     if (record !== undefined) found[section.key] = record
   }
   await update($, prs, () => found)
+}
+
+/** Whether a failed request that mixes fragments was refused by a schema that lacks a pull-request field E3 asks. */
+function refusesPrFields(state: RepoState): boolean {
+  const said = state.detail ?? ''
+
+  return state.kind === 'error' && SCHEMA_REFUSAL.test(said) && PR_FIELD.test(said)
 }
 
 /** A failed pull-request request: V1's back-off for a rate limit or no network, a host whose schema refused the fields given up, each kind logged once. */
@@ -531,13 +553,14 @@ async function readSessionPrs($: EngineInterface, current: readonly Section[]): 
       }
       await update($, sessionPrs, found => {
         const next = { ...found }
-        if (look.kind === 'pr') next[rowKey] = look.pr
+        // The session it was read for goes with it: the row draws it only while its mapping still names that session.
+        if (look.kind === 'pr') next[rowKey] = { ...look.pr, sessionId: mapping.sessionId }
         else delete next[rowKey]
 
         return next
       })
     }
-    await update($, sessionPrs, found => Object.fromEntries(Object.entries(found).filter(([rowKey]) => live.has(rowKey) && all[rowKey] !== undefined)))
+    await update($, sessionPrs, found => Object.fromEntries(Object.entries(found).filter(([rowKey, pr]) => live.has(rowKey) && all[rowKey] !== undefined && all[rowKey]?.sessionId === pr.sessionId)))
   } catch (error) {
     $.ui.log(`${PLUGIN}: reading the sessions' pull requests failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
   } finally {
@@ -834,11 +857,21 @@ async function hydrateOne($: EngineInterface, options: Options, section: Section
   return have
 }
 
-/** A mapping whose issue is no longer open is dropped; its session closed the issue, or someone did by hand. Only an uncapped list says an issue is gone. */
+/**
+ * Whether a section lists every open issue of its repository, so an issue missing from it is no longer open: it is
+ * shorter than the cap, and its open count, when known, is not above its rows. A probed list that tier 2 shortened (an
+ * issue closed between the probe and the read) is still a capped window of a larger repository: the issues beyond it
+ * are not gone, and the probe's aliases release those that close (E7).
+ */
+function isComplete(section: Section, options: Options): boolean {
+  return section.rows.length < options.maxIssues && (section.total ?? 0) <= section.rows.length
+}
+
+/** A mapping whose issue is no longer open is dropped; its session closed the issue, or someone did by hand. Only a complete list says an issue is gone. */
 async function pruneMappings($: EngineInterface, options: Options, current: readonly Section[]): Promise<void> {
   const all = await read($, mappings)
   for (const section of current) {
-    if (section.state.kind !== 'ok' || section.rows.length >= options.maxIssues) continue
+    if (section.state.kind !== 'ok' || !isComplete(section, options)) continue
     const open = new Set(section.rows.map(row => rowKeyOf(section.key, row.number)))
     for (const rowKey of Object.keys(all)) {
       if (rowKey.startsWith(`${section.key}#`) && !open.has(rowKey)) await saveMapping($, rowKey, null)

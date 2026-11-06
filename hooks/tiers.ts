@@ -50,6 +50,12 @@ export type TierInput = {
   mapped: readonly number[]
   /** Whether the probe asks the pull requests too (E3 due, the pane shown). */
   withLinks: boolean
+  /**
+   * Whether the host's schema answers E3's pull-request fields (false once a request was refused for them). Tier 2's
+   * patch carries them; without them a patch reads the window instead (IssueRadarTop asks none), and hydrate's
+   * `gh issue view` brings the changed issues' stateless links, as V1 has them.
+   */
+  hasPrFields: boolean
   now: number
 }
 
@@ -95,8 +101,9 @@ function sum(a: number | null, b: number | null): number | null {
 /**
  * Tier 1, then tier 2 as the plan says: `same` reads nothing more; `patch` reads rows, details and pull requests of
  * the new and changed issues and keeps the rest from the cache, in the probe's order; `full` reads the window's rows
- * (their details follow as V1 reads them). The meta keeps what the store had for unchanged issues, takes tier 2's for
- * the patched ones, and the probe's comment totals for all.
+ * (their details follow as V1 reads them); on a host that refused the pull-request fields a patch that reads issues is
+ * a `full` read, since the patch's query carries those fields. The meta keeps what the store had for unchanged issues,
+ * takes tier 2's for the patched ones, and the probe's comment totals for all.
  */
 export async function runTiers($: EngineInterface, input: TierInput): Promise<TierOutcome> {
   const { info, first, cache, now } = input
@@ -104,7 +111,8 @@ export async function runTiers($: EngineInterface, input: TierInput): Promise<Ti
   const probe = await probeIssues($, info, first, input.mapped, input.withLinks)
   if ('state' in probe) return failure(probe.state, [], false)
   const released = [...probe.mapped].filter(([, state]) => state !== 'OPEN').map(([number]) => number)
-  const plan = planFromProbe(probe, cache.rows, first)
+  const planned = planFromProbe(probe, cache.rows, first)
+  const plan: ProbePlan = planned.kind === 'patch' && planned.fetch.length > 0 && !input.hasPrFields ? { kind: 'full' } : planned
   const byNumber = new Map(cache.rows.map(row => [row.number, row]))
   let rows: IssueRow[]
   let details = new Map<number, IssueDetails>()

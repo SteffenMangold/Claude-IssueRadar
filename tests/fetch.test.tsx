@@ -6,7 +6,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { TREE_BLOCKED, TREE_EPIC, renderBrief, renderTree, treeTitle } from '../hooks/brief'
-import { LIST_RELATIONS, parseGraphDetails, parseGraphRow, parseRelations, refOf, repoOfUrl } from '../hooks/github'
+import { LIST_FIELDS, LIST_RELATIONS, TREE_FIELDS, VIEW_FIELDS, parseGraphDetails, parseGraphRow, parseRelations, refOf, repoOfUrl } from '../hooks/github'
 import { probeQuery, prsQuery, rowsQuery, topQuery } from '../hooks/graph'
 import { strings } from '../hooks/i18n'
 import { isPrsDue, linksOf, parsePrConnection, prChip, prLine, prStatus } from '../hooks/prs'
@@ -369,6 +369,94 @@ test('mapped issues beyond the cap that closed or vanished release their mapping
   expect(store.get(`session:${SECTION}#9`)).toBeUndefined()
 })
 
+test('a row tier 2 drops leaves the mappings beyond the cap alone: the window is still a capped one', LARGE, async ($, on) => {
+  const { store } = project(on, {
+    stored: { [`session:${SECTION}#5`]: { sessionId: 'local_s5', title: '#5 old', startedAt: 1, startedFrom: 'local_pane', detached: true } },
+    gh: graph({
+      IssueRadarPrs: () => prsAnswer(),
+      // #5 is open beyond the window of two, and has a live session; #42 changed, and closed a moment after the probe saw it.
+      IssueRadarProbe: () => probeAnswer([{ number: 42, updatedAt: CHANGED }, UNCHANGED[1] ?? { number: 7, updatedAt: '' }], 412, { m5: { number: 5, state: 'OPEN' } }),
+      IssueRadarRows: () => graphAnswer({ repository: { i42: graphIssue(42, { state: 'CLOSED' }) }, rateLimit: LIMIT }),
+    }),
+  })
+  const clock = await started($, on)
+  await tick(clock)
+
+  const cache = store.get(`cache:${SECTION}`) as { rows: IssueRow[]; total: number }
+  expect(cache.rows.map(item => item.number)).toEqual([7])
+  expect(cache.total).toBe(412)
+  // One row under the cap, yet 412 open: the list is not complete, and the probe said #5 is open.
+  expect(store.get(`session:${SECTION}#5`)).toMatchObject({ sessionId: 'local_s5' })
+})
+
+test('a complete list still releases the mapping of an issue that left it', async ($, on) => {
+  const { store } = project(on, {
+    stored: { [`session:${SECTION}#9`]: { sessionId: 'local_s9', title: '#9 old', startedAt: 1, startedFrom: 'local_pane', detached: true } },
+    gh: graph({ IssueRadarPrs: () => prsAnswer() }),
+  })
+  await started($, on)
+  // Two open issues under a cap of 30: every open issue is listed, and #9 is not among them.
+  expect(store.get(`session:${SECTION}#9`)).toBeUndefined()
+})
+
+test('a host that refused the pull-request fields reads a changed issue with the window, never with a patch it refuses', LARGE, async ($, on) => {
+  const refused = "Field 'closedByPullRequestsReferences' doesn't accept argument 'last'"
+  const refusal = (): Ran => ran(JSON.stringify({ errors: [{ path: ['query', 'repository', 'i42', 'closedByPullRequestsReferences'], extensions: { code: 'argumentNotAccepted' }, message: refused }] }), 1, `gh: ${refused}`)
+  const asks = (args: readonly string[]) => graphQuery(args).includes('closedByPullRequestsReferences(')
+  let isChanged = false
+  const { argv } = project(on, {
+    gh: graph(
+      {
+        IssueRadarPrs: () => refusal(),
+        IssueRadarProbe: args => (asks(args) ? refusal() : probeAnswer([{ number: 42, updatedAt: CHANGED }, UNCHANGED[1] ?? { number: 7, updatedAt: '' }], 412)),
+        IssueRadarRows: args => (asks(args) ? refusal() : graphAnswer({ repository: { i42: graphIssue(42) }, rateLimit: LIMIT })),
+        IssueRadarTop: args => (asks(args) ? refusal() : graphAnswer({ repository: { issues: { totalCount: 412, nodes: [graphIssue(42), graphIssue(7, { updatedAt: '2026-11-01T09:00:00Z' })] } }, rateLimit: LIMIT })),
+      },
+      args =>
+        isChanged && args[0] === 'issue' && args[1] === 'view' && args[2] === '42'
+          ? ran(issueView(42, 'OPEN', { updatedAt: CHANGED, closedByPullRequestsReferences: [{ id: 'PR_1', number: 57, url: 'https://github.com/acme/widgets/pull/57' }] }))
+          : undefined,
+    ),
+  })
+  const clock = await started($, on)
+  expect(ops(argv, 'IssueRadarPrs')).toHaveLength(1)
+  const before = argv.length
+  isChanged = true
+  await tick(clock)
+
+  // The patch's query carries the refused fields: the window is read instead, and the changed issue's view follows as in V1.
+  const after = argv.slice(before)
+  expect(after.map(call => op(call) ?? call.slice(1, 4).join(' '))).toEqual(['IssueRadarProbe', 'IssueRadarTop', 'issue view 42'])
+  expect(after.filter(asks)).toHaveLength(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: `row-title:${ROW_42}` }))?.text).toContain('Export fails for empty folders')
+  // gh's own link, without a state, as V1 shows it.
+  expect((await ui.find({ key: `pr:${ROW_42}:acme/widgets#57` }))?.text).toBe(chipText('#57'))
+  await ui.unmount()
+  // Nothing paused the probe: the next tick is a probe again, and nothing more.
+  const next = argv.length
+  await tick(clock)
+  expect(argv.slice(next).map(call => op(call) ?? call.slice(1, 3).join(' '))).toEqual(['IssueRadarProbe'])
+})
+
+test("a probe the schema refuses for its pull-request fields gives the host's states up at once", LARGE, async ($, on) => {
+  const refused = "Field 'statusCheckRollup' doesn't exist on type 'Commit'"
+  const refusal = (): Ran =>
+    ran(JSON.stringify({ errors: [{ path: ['fragment Links', 'closedByPullRequestsReferences', 'nodes', 'commits', 'nodes', 'commit', 'statusCheckRollup'], extensions: { code: 'undefinedField', typeName: 'Commit', fieldName: 'statusCheckRollup' }, message: refused }] }), 1, `gh: ${refused}`)
+  const { argv, setShown } = project(on, {
+    isShown: false,
+    gh: graph({ IssueRadarPrs: () => refusal(), IssueRadarProbe: args => (graphQuery(args).includes('fragment Links') ? refusal() : probeAnswer(UNCHANGED, 412)) }),
+  })
+  const clock = await started($, on)
+  expect(ops(argv, 'IssueRadarPrs')).toHaveLength(0)
+  setShown(true)
+  // The first tick's probe asks the states (none read yet) and is refused; past the probe's half-hour pause and beyond,
+  // no request asks them of this host again: not IssueRadarPrs on the lists meanwhile, not the probes after the pause.
+  await tick(clock, 12)
+  expect(argv.filter(call => graphQuery(call).includes('fragment Links')).map(call => op(call))).toEqual(['IssueRadarProbe'])
+  expect(ops(argv, 'IssueRadarProbe').length).toBeGreaterThan(1)
+})
+
 test('a small repository keeps V1 on the timer, and a cap above 100 keeps the probe off', async ($, on) => {
   const { argv } = project(on, { gh: graph({ IssueRadarPrs: () => prsAnswer() }) })
   const clock = await started($, on)
@@ -412,9 +500,13 @@ test('the named queries: one probe point, aliases only for whole numbers, no clo
   expect(probeQuery([], true)).toContain('fragment Links on Issue')
   for (const query of [probeQuery([5], true), rowsQuery([42], true), topQuery(true), prsQuery([42, 7])]) {
     expect(query).not.toContain('includeClosedPrs')
+    // orderByState puts merged pull requests before open ones (measured live): no help in finding the actionable one.
+    expect(query).not.toContain('orderByState')
     expect(query).not.toMatch(/\bmutation\b/)
     expect(query.length).toBeLessThan(12_000)
   }
+  // GitHub lists the references oldest first: the newest three are read, the open attempt after old merged ones too.
+  for (const query of [probeQuery([5], true), rowsQuery([42], true), prsQuery([42, 7])]) expect(query).toContain('closedByPullRequestsReferences(last: 3) { totalCount nodes {')
   expect(rowsQuery([42], true)).toContain('blockedBy(first: 50)')
   expect(rowsQuery([42], false)).not.toContain('parent {')
   expect(topQuery(false)).not.toContain('subIssuesSummary')
@@ -732,6 +824,74 @@ test('a host whose schema refuses the pull-request fields is not asked again, an
   await ui.unmount()
 })
 
+test('the pull-request states are read before the details, so the strip never waits for the issue views (E3-5)', async ($, on) => {
+  const { argv } = project(on, { gh: graph({ IssueRadarPrs: () => prsAnswer({ 42: [prNode(57)] }) }) })
+  await started($, on)
+  const states = argv.findIndex(call => op(call) === 'IssueRadarPrs')
+  const views = argv.findIndex(call => call[1] === 'issue' && call[2] === 'view')
+  expect(states).toBeGreaterThan(-1)
+  expect(views).toBeGreaterThan(-1)
+  expect(states).toBeLessThan(views)
+})
+
+test('a tool refresh while the pane is hidden probes without the pull-request fields and stores no states (D X-1)', LARGE, async ($, on) => {
+  const { argv, store } = project(on, { isShown: false, gh: graph({ IssueRadarPrs: () => prsAnswer(), IssueRadarProbe: () => probeAnswer(UNCHANGED, 412) }) })
+  const clock = await started($, on)
+  // A gh command of this session asks a tool refresh; the probe serves it, as V1's list would have run there anyway.
+  await clock.advance(60_000)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+  await clock.advance(3_000)
+
+  const probes = ops(argv, 'IssueRadarProbe')
+  expect(probes).toHaveLength(1)
+  expect(graphQuery(probes[0] ?? [])).not.toContain('fragment Links')
+  expect(ops(argv, 'IssueRadarPrs')).toHaveLength(0)
+  expect(store.has(`prs:${SECTION}`)).toBe(false)
+})
+
+test("a released mapping takes its session's pull request off the row at once, and a new session does not inherit it", async ($, on) => {
+  const { store } = project(on, {
+    stored: MAPPED_42,
+    gh: graph({ IssueRadarPrs: () => prsAnswer() }),
+    mcp: call => {
+      if (call.tool === 'get_status') return mcpText(GET_STATUS)
+      if (call.tool === 'open_session_in' || call.tool === 'get_session') return mcpText('Session local_abc123 not found.', true)
+      if (call.tool === 'start_session') return mcpText('Started session local_new42 ("#42 Export fails for empty folders").')
+
+      return mcpText('ok')
+    },
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: `pr:${ROW_42}:acme/widgets#57` }))?.text).toBe(chipText('#57', DE.prChecksFailed))
+
+  // The app says the session is gone: the mapping goes, and with it the pull request the app reported for that session.
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(store.get(`session:${ROW_42}`)).toBeUndefined()
+  expect(await ui.find({ key: `prs:${ROW_42}` })).toBeUndefined()
+  // A new session for the issue has no pull request of its own until the app reports one.
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(store.get(`session:${ROW_42}`)).toMatchObject({ sessionId: 'local_new42' })
+  expect(await ui.find({ key: `prs:${ROW_42}` })).toBeUndefined()
+  await ui.unmount()
+})
+
+test("a mapping another pane released no longer draws its session's pull request, though nothing read the app since", async ($, on) => {
+  const { store, setShown } = project(on, { stored: MAPPED_42, gh: graph({ IssueRadarPrs: () => prsAnswer() }), mcp: call => (call.tool === 'get_status' ? mcpText(GET_STATUS) : mcpText('ok')) })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: `pr:${ROW_42}:acme/widgets#57` })).toBeDefined()
+
+  // Behind another tab nothing asks the app; another pane released the mapping, and this pane's refresh re-reads it.
+  setShown(false)
+  store.delete(`session:${ROW_42}`)
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect(String((await ui.find({ key: `work:${ROW_42}` }))?.props['label'])).toBe(DE.workOnIt)
+  expect(await ui.find({ key: `prs:${ROW_42}` })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('the pure pull-request words: precedence, the chip, the cadence, the record and the overlay', () => {
   const S = DE
   const word = (pr: Partial<ShownPr>, session?: SessionPr) => prStatus(shown(pr), session, S)?.word
@@ -929,7 +1089,60 @@ test('the brief carries the issue tree: parent, siblings, blockers, and the phas
   await ui.unmount()
 })
 
-test("an issue without relations keeps the brief as it was, and a failed parent read leaves the siblings out", async ($, on) => {
+test('a parent that cannot be read leaves the siblings out, and the session still starts with the tree', async ($, on) => {
+  const { mcp, argv } = project(on, {
+    gh: args => {
+      if (args[0] !== 'issue' || args[1] !== 'view') return undefined
+      if (args[2] === '42' && (args.at(-1) ?? '').includes('blockedBy')) {
+        return ran(
+          issueView(42, 'OPEN', {
+            parent: { id: 'I_40', number: 40, state: 'OPEN', title: 'Export overhaul', url: 'https://github.com/acme/widgets/issues/40' },
+            blockedBy: { totalCount: 0, nodes: [] },
+            blocking: { totalCount: 0, nodes: [] },
+            subIssues: { totalCount: 0, nodes: [] },
+            subIssuesSummary: { completed: 0, percentCompleted: 0, total: 0 },
+          }),
+        )
+      }
+      // The parent sits where the token cannot read it.
+      if (args[2] === '40') return ran('', 1, 'GraphQL: Could not resolve to an Issue with the number of 40. (repository.issue)')
+
+      return undefined
+    },
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: `work:${ROW_42}` })
+
+  expect(count(argv, 'issue', 'view', '40')).toBe(1)
+  const prompt = String(mcp.find(call => call.tool === 'start_session')?.args['prompt'])
+  expect(prompt).toContain('<issue-tree>')
+  expect(prompt).toContain('Parent: #40 "Export overhaul" (open).')
+  expect(prompt).not.toContain('Sibling sub-issues')
+  await ui.unmount()
+})
+
+test('a tree read that fails is asked again without the tree, and the session starts without one', async ($, on) => {
+  const { mcp, argv } = project(on, {
+    gh: args =>
+      args[0] === 'issue' && args[1] === 'view' && args[2] === '42' && (args.at(-1) ?? '').includes('blockedBy')
+        ? ran('', 1, 'GraphQL: Resource protected by organization SAML enforcement. You must grant your Personal Access token access to this organization. (repository.issue.blockedBy.nodes.0)')
+        : undefined,
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const before = argv.length
+  await ui.press({ key: `work:${ROW_42}` })
+
+  const views = argv.slice(before).filter(call => call[1] === 'issue' && call[2] === 'view' && call[3] === '42')
+  expect(views.map(call => call.at(-1))).toEqual([`${VIEW_FIELDS},${TREE_FIELDS}`, VIEW_FIELDS])
+  const prompt = mcp.find(call => call.tool === 'start_session')?.args['prompt']
+  expect(typeof prompt).toBe('string')
+  expect(String(prompt)).not.toContain('<issue-tree>')
+  await ui.unmount()
+})
+
+test("an issue without relations keeps the brief as it was, and an epic's brief lists its sub-issues", async ($, on) => {
   const { mcp } = project(on)
   await started($, on)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -1004,6 +1217,56 @@ test('failures the relation fields cannot cause are not asked twice', async ($, 
   const { argv } = project(on, { gh: args => (args[0] === 'issue' && args[1] === 'list' ? ran('', 1, 'error connecting to api.github.com') : undefined) })
   await started($, on)
   expect(count(argv, 'issue', 'list')).toBe(1)
+})
+
+test('a list that keeps failing without the relation fields too asks gh once per refresh, and asks them again after half an hour', async ($, on) => {
+  let isFailing = false
+  const { argv } = project(on, {
+    gh: graph({ IssueRadarPrs: () => prsAnswer() }, args => (isFailing && args[0] === 'issue' && args[1] === 'list' ? ran('', 1, 'gh: HTTP 502: Bad Gateway (https://api.github.com/graphql)') : undefined)),
+  })
+  const clock = await started($, on)
+  const lists = () => argv.filter(call => call[1] === 'issue' && call[2] === 'list')
+  expect(lists()).toHaveLength(1)
+  isFailing = true
+  // The first failing tick asks with the fields and once more without them; the ticks after it ask once, as V1 does.
+  await tick(clock)
+  expect(lists()).toHaveLength(3)
+  await tick(clock, 2)
+  expect(lists()).toHaveLength(5)
+  expect(lists().slice(2).map(call => call.at(-1))).toEqual([LIST_FIELDS, LIST_FIELDS, LIST_FIELDS])
+  // The outage ends; half an hour after it began the fields are asked again.
+  isFailing = false
+  await tick(clock, 9)
+  expect(lists().at(-1)?.at(-1)).toBe(`${LIST_FIELDS},${LIST_RELATIONS}`)
+})
+
+test('every chip-line pill is cut to 24 characters: a long label, a parent in another repository', async ($, on) => {
+  const listed = (JSON.parse(ISSUES) as Array<Record<string, unknown>>).map(issue =>
+    issue['number'] === 42
+      ? {
+          ...issue,
+          labels: [{ name: 'help wanted: good first issue', color: '0e8a16' }],
+          parent: { id: 'I_12', number: 12, state: 'OPEN', title: 'Reports', url: 'https://github.com/acme/Daemand-Reports/issues/12' },
+          blockedBy: { nodes: [], totalCount: 0 },
+          subIssuesSummary: { completed: 0, percentCompleted: 0, total: 0 },
+        }
+      : issue,
+  )
+  project(on, { gh: args => (args[0] === 'issue' && args[1] === 'list' ? ran(JSON.stringify(listed)) : undefined) })
+  await started($, on)
+  const parent = `${DE.partOf('acme/Daemand-Reports#12').slice(0, 23)}…`
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const drawn = (await ui.find({ key: `parent:${ROW_42}` }))?.text ?? ''
+    expect(drawn).toBe(parent)
+    expect(drawn.length).toBeLessThanOrEqual(24)
+    // The label's own text is the cut one (the terminal frames it in brackets, as it frames every label).
+    const label = (await ui.findAll({ type: 'Text', text: /help wanted/ })).map(found => found.text.replace(/^\[|\]$/g, ''))
+    expect(label).toEqual(['help wanted: good first…'])
+    expect(label[0]?.length).toBe(24)
+    await ui.unmount()
+  }
 })
 
 test('the pure relations: what a row keeps, the URL of another repository, the tree of a brief', () => {

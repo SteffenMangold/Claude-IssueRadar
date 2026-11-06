@@ -429,7 +429,8 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     if (parent !== null) tail.push(keyedPill(`parent:${key}`, S.partOf(refLabel(parent, sectionRepo)), INK.muted, HUE.gray))
     const labelsShown = lead.length + tail.length > 0 ? LABELS_SHOWN - 1 : LABELS_SHOWN
     const parts: RenderElement[] = [...lead]
-    row.labels.slice(0, labelsShown).forEach(label => parts.push(labelChip(clean(label.name), label.color)))
+    // A label's name runs to 50 characters on GitHub: cut to the pill's room like every chip-line pill (plan 4.6).
+    row.labels.slice(0, labelsShown).forEach(label => parts.push(labelChip(pillText(clean(label.name)), label.color)))
     if (row.labels.length > labelsShown) {
       parts.push(
         <Text size="caption" color={INK.muted}>
@@ -497,10 +498,15 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     )
   }
 
-  /** The pull requests a row shows (E3): GraphQL's states, the details' links, the issue session's own. */
+  /**
+   * The pull requests a row shows (E3): GraphQL's states, the details' links, the issue session's own. The app's
+   * answer for a session speaks only while the row's mapping still names that session: a released or replaced
+   * mapping's pull request is no longer the row's own.
+   */
   const prsOf = (section: Section, item: IssueRow, details: IssueDetails | undefined) => {
     const key = rowKeyOf(section.key, item.number)
-    const session = state.sessionPrs[key]
+    const found = state.sessionPrs[key]
+    const session = found !== undefined && found.sessionId !== undefined && found.sessionId === state.mappings[key]?.sessionId ? found : undefined
 
     return { key, session, sectionRepo: repoOfSection(section), ...linksOf(state.prs[section.key], item.number, details, session, repoOfSection(section), state.now) }
   }

@@ -151,8 +151,13 @@ export const PRS_MAX = 100
 
 /** A pull request as E3 reads it: state, draft, review decision and the head commit's check rollup. */
 const PR_FIELDS = 'number url state isDraft reviewDecision repository { nameWithOwner } commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
-/** An issue's linked pull requests: open and merged, as gh's own view lists them (no includeClosedPrs, E7-1). */
-const LINKS = `fragment Links on Issue { closedByPullRequestsReferences(first: ${PR_LINKS_MAX}) { totalCount nodes { ${PR_FIELDS} } } }`
+/**
+ * An issue's linked pull requests: open and merged, as gh's own view lists them (no includeClosedPrs, E7-1), the
+ * newest three. GitHub lists the references oldest first, so `first` would read an old merged attempt and leave out
+ * the newest, usually the actionable one; `orderByState` does not help, since it puts merged ones before open ones
+ * (both measured live). `totalCount` still counts them all.
+ */
+const LINKS = `fragment Links on Issue { closedByPullRequestsReferences(last: ${PR_LINKS_MAX}) { totalCount nodes { ${PR_FIELDS} } } }`
 /** E17's relations; blockers paged by 50, as gh's list does (E17-2). */
 const RELATIONS = 'parent { number state title url } subIssuesSummary { completed total } blockedBy(first: 50) { totalCount nodes { number state title url } }'
 const DETAILS = 'fragment Details on Issue { body comments(last: 3) { totalCount nodes { author { login } createdAt body } } }'

@@ -7,7 +7,7 @@ import type { IssueDetails, PrChecks, PrLink, PrRecord, PrReview, PrState, Sessi
 import { asString, countOf, isRecord, nodesOf, repoOfUrl } from './github'
 import type { Strings } from './i18n'
 
-/** The pull requests a GraphQL request reads per issue; the opened row lists as many. */
+/** The pull requests a GraphQL request reads per issue, the newest ones; the opened row lists as many. */
 export const PR_LINKS_MAX = 3
 /** How often a repository's pull-request states are read again on the timer. */
 export const PR_EVERY_MS = 10 * 60_000

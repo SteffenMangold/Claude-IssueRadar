@@ -36,7 +36,7 @@ const NOT_THE_RELATIONS: ReadonlySet<RepoStateKind> = new Set<RepoStateKind>(['s
 export const RELATIONS_PAUSE_MS = 30 * 60_000
 
 /**
- * The repositories (by key) whose list failed with the relation fields and listed without them, and until when they
+ * The repositories (by key) whose list failed with the relation fields and was asked again without them, and until when they
  * go without: for the rest of the module's life when gh's failure named a relation field (a host without them, a
  * related issue the token may not read), else for half an hour. A reload, or `/issue-radar reset`, tries them again.
  */
@@ -359,8 +359,8 @@ export function parseGraphRow(node: unknown): IssueRow | null {
 /**
  * The open issues of a repository, the most recently updated first, pull requests excluded by gh itself. Asks the
  * relation fields too (E17), unless this repository failed with them before: a list that fails with them for any
- * reason they could cause is asked once more without them (E17-1), and when that answers, the repository lists
- * without them for good if gh's failure named a relation field, else for half an hour.
+ * reason they could cause is asked once more without them (E17-1), and the repository lists without them for good if
+ * gh's failure named a relation field, else for half an hour, whether that second list answers or fails as well.
  */
 export async function listIssues($: EngineInterface, info: RepoInfo, limit: number): Promise<{ rows: IssueRow[] } | { state: RepoState }> {
   const now = await $.clock.now()
@@ -369,12 +369,15 @@ export async function listIssues($: EngineInterface, info: RepoInfo, limit: numb
   let ran = await gh($, args(withRelations ? `${LIST_FIELDS},${LIST_RELATIONS}` : LIST_FIELDS), { host: info.host, repo: repoLabel(info) })
   if (!ran.ok && withRelations && !NOT_THE_RELATIONS.has(ran.state.kind)) {
     const said = ran.stderr ?? ran.state.detail ?? ''
+    const isNamed = RELATION_FIELD.test(said)
     ran = await gh($, args(LIST_FIELDS), { host: info.host, repo: repoLabel(info) })
-    if (ran.ok) {
-      const isNamed = RELATION_FIELD.test(said)
-      dropRelations(info, isNamed ? Number.POSITIVE_INFINITY : now + RELATIONS_PAUSE_MS)
-      $.ui.log(`issue-radar: ${repoLabel(info)} lists without relations ${isNamed ? 'from now on' : 'for 30 minutes'} (${said.replace(/\s+/g, ' ').slice(0, 200)})`, { to: 'debug' })
-    }
+    // Remembered whether the list without them answers or fails as well: a failure that lasts (a 5xx, an outage) then
+    // costs one call per refresh, as in V1, not two, and the fields are asked again once the half hour is over.
+    dropRelations(info, isNamed ? Number.POSITIVE_INFINITY : now + RELATIONS_PAUSE_MS)
+    $.ui.log(
+      `issue-radar: ${repoLabel(info)} lists without relations ${isNamed ? 'from now on' : 'for 30 minutes'}${ran.ok ? '' : ', and failed without them too'} (${said.replace(/\s+/g, ' ').slice(0, 200)})`,
+      { to: 'debug' },
+    )
   }
   if (!ran.ok) return { state: ran.state }
   const rows = parseRows(ran.stdout)
