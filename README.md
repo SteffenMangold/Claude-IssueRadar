@@ -58,6 +58,10 @@ in a folder that resolves to a GitHub repository; `/issue-radar` or `/issues` op
 
 ## 🧭 What you see
 
+<p align="center">
+  <img src="docs/images/issues-pane.png" width="360" alt="The Issues pane in the Claude desktop app: one repository section with its open issues, each with label chips, age, comment count, an AI recap and the actions GitHub, Work on it (Bearbeiten) and Take it here (Hier übernehmen)">
+</p>
+
 | Part | What it does |
 |---|---|
 | **Title bar** | ↻ refresh · ⚙ settings · ✕ close |
@@ -162,7 +166,7 @@ hooks/view.tsx                    the pane's drawing
 hooks/i18n.ts                     the labels in German and English
 types/index.d.ts                  data types and the state contract
 tests/issue-radar.test.tsx        tests for claude plugin test
-docs/                             CONTEXT.md and PLATFORM.md
+docs/                             CONTEXT.md, PLATFORM.md and the README's screenshot
 ```
 
 Run a working copy with `claude --plugin-dir <this folder>`, and check it with:
