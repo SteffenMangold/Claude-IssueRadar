@@ -215,8 +215,9 @@ function schedule($: EngineInterface, options: Options, delayMs: number, reason:
 }
 
 async function resolveTargets($: EngineInterface, root: string, watch: readonly string[], reason: Reason): Promise<Resolved[]> {
-  // A failed checkout resolution (signed out, offline, gh missing) is tried again on every refresh, so Retry and ↻ recover.
-  if (checkout === null || checkout.root !== root || checkout.info === null) checkout = { root, ...(await resolveCheckout($, root)) }
+  // The refresh resolved the checkout a moment ago (a failed resolution is tried again on every refresh, so Retry and ↻
+  // recover); resolving a failure again here would cost a second gh call and hide the state the refresh just read.
+  if (checkout === null || checkout.root !== root) checkout = { root, ...(await resolveCheckout($, root)) }
   const targets: Resolved[] = [
     { spec: checkout.info === null ? root : repoLabel(checkout.info), info: checkout.info, state: checkout.state, isCheckout: true },
   ]
@@ -738,6 +739,26 @@ async function runSpike($: EngineInterface): Promise<string> {
   return lines.join('\n')
 }
 
+/** `/issue-radar` and `/issues`: opens the pane, or `reset` clears the store, or `spike` measures the session tools. Top-level, as the engine requires of a function `$` is passed to. */
+async function runCommand($: EngineInterface, options: Options, args: string): Promise<{ text: string }> {
+  const S = strings(options.language)
+  const word = args.trim().toLowerCase()
+  if (word === 'reset') {
+    await resetStore($)
+    schedule($, options, 0)
+
+    return { text: S.storeCleared }
+  }
+  if (word === 'spike') return { text: await runSpike($) }
+  if (!(await surfacesAllowPane($))) return { text: S.unsupported }
+  const placed = await $.ui.open({ id: PANE, title: S.title, columns: PANE_COLUMNS })
+  wantsPane = true
+  armTimer($, options)
+  schedule($, options, 0)
+
+  return { text: placed.isPlaced ? S.paneOpened : S.paneWaits(placed.reason) }
+}
+
 export const register: Register = (on, given) => {
   const options = readOptions(given)
   const S = strings(options.language)
@@ -791,26 +812,8 @@ export const register: Register = (on, given) => {
     return next(e)
   })
 
-  const command = async ($: EngineInterface, args: string) => {
-    const word = args.trim().toLowerCase()
-    if (word === 'reset') {
-      await resetStore($)
-      schedule($, options, 0)
-
-      return { text: S.storeCleared }
-    }
-    if (word === 'spike') return { text: await runSpike($) }
-    if (!(await surfacesAllowPane($))) return { text: S.unsupported }
-    const placed = await $.ui.open({ id: PANE, title: S.title, columns: PANE_COLUMNS })
-    wantsPane = true
-    armTimer($, options)
-    schedule($, options, 0)
-
-    return { text: placed.isPlaced ? S.paneOpened : S.paneWaits(placed.reason) }
-  }
-
-  on('command.run', { command: 'issue-radar' }, ($, e) => command($, e.args))
-  on('command.run', { command: 'issues' }, ($, e) => command($, e.args))
+  on('command.run', { command: 'issue-radar' }, ($, e) => runCommand($, options, e.args))
+  on('command.run', { command: 'issues' }, ($, e) => runCommand($, options, e.args))
 
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)

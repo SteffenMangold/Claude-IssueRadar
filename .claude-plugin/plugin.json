@@ -1,6 +1,6 @@
 {
   "name": "issue-radar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Sidebar that lists the open GitHub issues of the current repository, each with a short AI recap and a link, and starts a dedicated Claude session for an issue with one click: summary, interview, proposal, then code.",
   "author": { "name": "Steffen Mangold" },
   "repository": "https://github.com/SteffenMangold/Claude-IssueRadar",
