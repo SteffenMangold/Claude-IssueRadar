@@ -1,0 +1,12 @@
+{
+  "name": "claude-issueradar",
+  "owner": { "name": "Steffen Mangold" },
+  "description": "Issue Radar: the open GitHub issues of your repository beside the conversation, and one click to start a Claude session that understands an issue before it codes.",
+  "plugins": [
+    {
+      "name": "issue-radar",
+      "source": "./",
+      "description": "Sidebar with the open GitHub issues of the current repository, AI recaps, and a button that starts a dedicated session per issue (summary, interview, proposal, then code)."
+    }
+  ]
+}

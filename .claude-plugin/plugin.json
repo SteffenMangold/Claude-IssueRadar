@@ -1,0 +1,48 @@
+{
+  "name": "issue-radar",
+  "version": "0.1.0",
+  "description": "Sidebar that lists the open GitHub issues of the current repository, each with a short AI recap and a link, and starts a dedicated Claude session for an issue with one click: summary, interview, proposal, then code.",
+  "author": { "name": "Steffen Mangold" },
+  "repository": "https://github.com/SteffenMangold/Claude-IssueRadar",
+  "license": "Apache-2.0",
+  "keywords": ["github", "issues", "sidebar", "sessions", "triage"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "openAtStart": {
+      "type": "boolean",
+      "title": "Open at start",
+      "description": "Open the Issues pane when a session starts in a folder that resolves to a GitHub repository.",
+      "default": true
+    },
+    "refreshMinutes": {
+      "type": "number",
+      "title": "Refresh interval (minutes)",
+      "description": "How often the issue list is fetched while the pane is shown; 0 turns the timer off.",
+      "default": 3
+    },
+    "maxIssues": {
+      "type": "number",
+      "title": "Issue cap",
+      "description": "How many open issues are listed per repository, the most recently updated first.",
+      "default": 30
+    },
+    "recaps": {
+      "type": "boolean",
+      "title": "AI recaps",
+      "description": "Master switch for the AI recaps; each repository still needs a one-time consent in the pane.",
+      "default": true
+    },
+    "recapModel": {
+      "type": "string",
+      "title": "Recap model",
+      "description": "Model alias for the recaps: haiku (default) or sonnet.",
+      "default": "haiku"
+    },
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language of the pane's labels and of the recaps: de or en.",
+      "default": "de"
+    }
+  }
+}
