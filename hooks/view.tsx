@@ -332,13 +332,16 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
 
   /**
    * A one-of-several picker: a Select where the surface draws one, else a row of plain chips, the current one in
-   * brackets. The current value is always among the options: a value outside them is not one a Select takes.
+   * brackets. The current value is always among the options: a value outside them is not one a Select takes. Every
+   * value is cleaned here as well as at its source: a control character in one gets the whole tree refused (R2-RT-1).
    */
   const picker = (key: string, label: string, choices: ReadonlyArray<{ value: string; label: string }>, value: string, onPick: (value: string) => void) => {
+    const current = clean(value)
+    const safe = choices.map(choice => ({ value: clean(choice.value), label: choice.label }))
     // Values unique (a Select refuses a repeated one), the current one among them.
-    const unique = choices.filter((choice, index) => choices.findIndex(found => found.value === choice.value) === index)
-    const listed = unique.some(choice => choice.value === value) ? unique : [...unique, { value, label: cutText(clean(value), 40) }]
-    if (Select !== undefined) return <Select key={key} label={label} options={listed.map(choice => ({ value: choice.value, label: choice.label }))} value={value} onSelect={picked => onPick(picked)} />
+    const unique = safe.filter((choice, index) => safe.findIndex(found => found.value === choice.value) === index)
+    const listed = unique.some(choice => choice.value === current) ? unique : [...unique, { value: current, label: cutText(current, 40) }]
+    if (Select !== undefined) return <Select key={key} label={label} options={listed.map(choice => ({ value: choice.value, label: choice.label }))} value={current} onSelect={picked => onPick(picked)} />
 
     return (
       <Box key={key} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} rowGap={step('xs', 0)}>
@@ -346,7 +349,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           {label}:
         </Text>
         {listed.map(choice => (
-          <Button key={`${key}:${choice.value}`} plain label={choice.value === value ? `[${choice.label}]` : choice.label} onPress={() => onPick(choice.value)} />
+          <Button key={`${key}:${choice.value}`} plain label={choice.value === current ? `[${choice.label}]` : choice.label} onPress={() => onPick(choice.value)} />
         ))}
       </Box>
     )
@@ -1064,8 +1067,10 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     )
     if (!isOpen) return header
     const loadingAt = state.closedLoading[key]
-    const isLoading = loadingAt !== undefined && state.now - loadingAt < CLOSED_LOADING_MS
     const failed = state.closedErrors[key]
+    // Loading while a fetch runs, and while the part holds no list of this window and nothing failed: the next refresh
+    // that may fetch brings one (B2-BEH-4), so an expanded part is never a bare header.
+    const isLoading = (loadingAt !== undefined && state.now - loadingAt < CLOSED_LOADING_MS) || (failed === undefined && (cache === undefined || cache.since !== since))
     const drawn = (cache?.rows ?? []).slice(0, Math.min(CLOSED_SHOWN, Math.max(0, rowsLeft)))
     rowsLeft -= drawn.length
 
@@ -1228,7 +1233,10 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     if (!options.assignedToMe) return null
     const box = state.inbox
     const isCollapsed = settings.collapsed['inbox'] !== false
-    const counted = box.fetchedAt === null && box.rows.length === 0 ? '…' : String(box.rows.length)
+    const failed = box.state.kind === 'ok' || box.state.kind === 'loading' ? null : box.state
+    // '…' only before the first answer; a failure with no rows to show is marked, never drawn as loading (B2-BEH-5).
+    const isFailedEmpty = failed !== null && box.rows.length === 0
+    const counted = box.state.kind === 'loading' ? '…' : isFailedEmpty ? '!' : String(box.rows.length)
     const host = clean(box.host === '' ? 'github.com' : box.host)
     const header = (
       <Box flexDirection="row" alignItems="center" columnGap={step('sm', 1)} paddingX={step('sm', 1)} paddingY={step('xs', 0)}>
@@ -1241,7 +1249,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           </Button>
         </Box>
         <Box key="count:inbox" flexShrink={0}>
-          {pill(counted, box.rows.length > 0 ? INK.text : INK.muted, HUE.gray)}
+          {pill(counted, isFailedEmpty ? INK.warning : box.rows.length > 0 ? INK.text : INK.muted, isFailedEmpty ? HUE.amber : HUE.gray)}
         </Box>
       </Box>
     )
@@ -1252,7 +1260,6 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         </Box>
       )
     }
-    const failed = box.state.kind === 'ok' || box.state.kind === 'loading' ? null : box.state
     const drawn = box.rows.slice(0, Math.max(0, rowsLeft))
     rowsLeft -= drawn.length
 

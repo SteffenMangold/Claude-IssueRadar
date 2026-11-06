@@ -4,6 +4,7 @@
 // columns, no drag, no status write. The read itself lives in graph.ts.
 import type { BoardItem } from '../types'
 import { asString, isRecord, loginOf, nodesOf } from './github'
+import { clean } from './text'
 
 /** The status a pill shows, in characters: with its mark it stays within a pill's 24. */
 export const BOARD_STATUS_CHARS = 20
@@ -29,9 +30,13 @@ export function parseBoardItems(connection: unknown): BoardItem[] {
   return items
 }
 
-/** The facet value of one project and status: `<owner>/<number>:<status>`, the status empty when unset. */
+/**
+ * The facet value of one project and status: `<owner>/<number>:<status>`, the status empty when unset. Cleaned, since
+ * it is a Select's option value and current value: one control character there gets the whole tree refused, and the
+ * pane closed (R2-RT-1). The options, the current value and `matchesBoard` all use this one spelling.
+ */
 export function boardValue(item: Pick<BoardItem, 'owner' | 'project' | 'status'>): string {
-  return `${item.owner}/${item.project}:${item.status ?? ''}`
+  return clean(`${item.owner}/${item.project}:${item.status ?? ''}`)
 }
 
 /** Whether a row with these items stays drawn under the facet; an empty facet keeps every row. */

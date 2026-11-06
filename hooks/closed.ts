@@ -80,13 +80,15 @@ export async function listClosed($: EngineInterface, info: RepoInfo, since: stri
 }
 
 /**
- * Whether an expanded list is read again: at once when there is none or it covers another window (a new day);
- * after an issue left the open list once it is 30 s old; on expanding once it is 10 minutes old; for a press, a
- * command or a tool once it is 30 s old; on the timer and at the start once it is 15 minutes old.
+ * Whether an expanded list is read again, timed from the last read of this window or the last try at it (`triedAt`,
+ * answered or not), whichever is later, so a list that keeps failing waits as a read one does (E3-2): at once when
+ * this window has neither; after an issue left the open list once 30 s passed; on expanding once 10 minutes passed;
+ * for a press, a command or a tool once 30 s passed; on the timer and at the start once 15 minutes passed.
  */
-export function isClosedDue(cache: ClosedCache | undefined, since: string, reason: ClosedReason, now: number, isNudged: boolean): boolean {
-  if (cache === undefined || cache.since !== since) return true
-  const age = now - cache.fetchedAt
+export function isClosedDue(cache: ClosedCache | undefined, since: string, reason: ClosedReason, now: number, isNudged: boolean, triedAt?: number): boolean {
+  const readAt = cache !== undefined && cache.since === since ? cache.fetchedAt : undefined
+  if (readAt === undefined && triedAt === undefined) return true
+  const age = now - Math.max(readAt ?? Number.NEGATIVE_INFINITY, triedAt ?? Number.NEGATIVE_INFINITY)
   if (isNudged) return age >= CLOSED_MIN_MS
   if (reason === 'expand') return age >= CLOSED_EXPAND_FRESH_MS
   if (reason === 'press' || reason === 'manual' || reason === 'tool') return age >= CLOSED_MIN_MS

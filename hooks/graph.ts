@@ -149,7 +149,7 @@ export const MAPPED_MAX = 10
 export const PROBE_PAUSE_MS = 30 * 60_000
 /** At most this many issues one pull-request request names (E3). */
 export const PRS_MAX = 100
-/** At most this many issues one board request names (E18): one request per section up to the largest cap. */
+/** At most this many issues one board request names (E18): one request per section up to 100 rows, one more per 100 beyond. */
 export const BOARDS_MAX = 100
 
 /** A pull request as E3 reads it: state, draft, review decision and the head commit's check rollup. */
@@ -353,20 +353,27 @@ export async function fetchPrLinks($: EngineInterface, info: RepoInfo, numbers: 
 }
 
 /**
- * E18: the listed issues' board items, at most BOARDS_MAX issues in one request (~1 point). A missing `read:project`
- * comes back as the state `missing-scope`; an alias that misses (a pull request's number, an issue gone) has none.
+ * E18: the listed issues' board items, one request (~1 point) per BOARDS_MAX issues, so every listed row is asked
+ * whatever the issue cap (R2-RT-3). A missing `read:project` comes back as the state `missing-scope`; the first
+ * request that fails is the answer, so the caller keeps its last items. An alias that misses (a pull request's
+ * number, an issue gone) has none.
  */
 export async function fetchBoards($: EngineInterface, info: RepoInfo, numbers: readonly number[]): Promise<{ items: Map<number, BoardItem[]>; cost: number | null } | { state: RepoState }> {
-  const asked = numbersOf(numbers).slice(0, BOARDS_MAX)
-  const answer = await graphql($, info, boardsQuery(asked), { owner: info.owner, name: info.name })
-  if (!answer.ok) return { state: answer.state }
-  const repository = answer.data['repository']
-  if (!isRecord(repository)) return noData(info, 'repository')
+  const all = numbersOf(numbers)
   const items = new Map<number, BoardItem[]>()
-  for (const number of asked) {
-    const node = repository[`i${number}`]
-    items.set(number, isRecord(node) ? parseBoardItems(node['projectItems']) : [])
+  let cost: number | null = null
+  for (let start = 0; start < all.length; start += BOARDS_MAX) {
+    const asked = all.slice(start, start + BOARDS_MAX)
+    const answer = await graphql($, info, boardsQuery(asked), { owner: info.owner, name: info.name })
+    if (!answer.ok) return { state: answer.state }
+    const repository = answer.data['repository']
+    if (!isRecord(repository)) return noData(info, 'repository')
+    for (const number of asked) {
+      const node = repository[`i${number}`]
+      items.set(number, isRecord(node) ? parseBoardItems(node['projectItems']) : [])
+    }
+    if (answer.cost !== null) cost = (cost ?? 0) + answer.cost
   }
 
-  return { items, cost: answer.cost }
+  return { items, cost }
 }

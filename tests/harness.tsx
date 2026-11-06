@@ -156,6 +156,11 @@ export type Setup = {
   isShown?: boolean
   /** Which `$.store.set` keys the store refuses, asked at each write (a store past 4 MiB rejects every write); none by default. */
   storeRefuses?: (key: string) => boolean
+  /**
+   * Holds the answer to `$.store.get` of a key until the promise it returns settles, the value read before the wait (a
+   * slow store, so two readers both see what was there); undefined answers at once, as the default does for every key.
+   */
+  storeDelay?: (key: string) => Promise<unknown> | undefined
 }
 
 export type Project = {
@@ -211,7 +216,12 @@ export function project(on: On, setup: Setup = {}): Project {
   const panes = new Map<string, { title: string; isPlaced: boolean }>()
   let isShown = setup.isShown ?? true
   let draft = ''
-  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.get', (_, e) => {
+    const value = store.get(e.key)
+    const delay = setup.storeDelay?.(e.key)
+
+    return delay === undefined ? { value } : delay.then(() => ({ value }))
+  })
   on('store.set', (_, e) => {
     if (setup.storeRefuses?.(e.key) === true) throw new Error('the store is over 4 MiB of JSON text')
     store.set(e.key, e.value)

@@ -13,7 +13,7 @@ import { DEFAULT_FILTER, MAX_VIEWS, TYPED_CHARS, asSavedViews, cleanViewName, cu
 import { dropRelations, firstLine, isRepoSpec, listIssues, metaOf, repoKey, repoLabel, resetRelations, resolveCheckout, resolveNamed, stateOf, viewIssue, viewParent } from './github'
 import { MAPPED_MAX, PROBE_MAX, PROBE_PAUSE_MS, fetchBoards, fetchPrLinks } from './graph'
 import { asLanguage, strings } from './i18n'
-import { INBOX_CAP, asInboxCache, failedInbox, inboxPeriod, isInboxDue, searchAssigned } from './inbox'
+import { INBOX_CAP, asInboxCache, failedInbox, inboxFromRecord, inboxPeriod, isInboxDue, searchAssigned } from './inbox'
 import { asRecord, isPrsDue, mergeLinks, recordOf } from './prs'
 import { recapIssue } from './recap'
 import { commandConsent, detachSession, focusSession, lookUpSession, parseObject, pressConsent, quietDesktop, readPrStatus, routeInUse, startDesktopSession } from './session'
@@ -123,10 +123,15 @@ const filteredPrs = new Map<string, { query: string; record: PrRecord }>()
 const filteredPrTried = new Map<string, { query: string; at: number }>()
 /** E18: when each section's board items were last asked, and for which rows. */
 const boardsReadAt = new Map<string, { at: number; rows: string }>()
-/** E22: the closed lists in flight, claimed synchronously; a reload clears them, unlike a flag in `$.state` (E22-1). */
+/**
+ * E22: each repository's step that reads its closed part, claimed before its first wait, so a press and a refresh
+ * never both fetch it; a reload clears it, unlike a flag in `$.state` (E22-1).
+ */
 const closedInFlight = new Set<string>()
 /** E22: until when a repository's closed list waits after a rate limit or no network. */
 const closedBackoff = new Map<string, number>()
+/** E22: when each repository's closed list was last asked, answered or not, and for which window: a failure waits as a read does (E3-2). */
+const closedTriedAt = new Map<string, { at: number; since: string }>()
 /** E22: repositories an issue just left (a complete list lost it, or Work on it found it closed): read again after 30 s. */
 const closedNudge = new Set<string>()
 
@@ -145,12 +150,18 @@ function strongerReason(a: Reason | null, b: Reason): Reason {
 }
 
 function readOptions(given: PluginOptions): Options {
-  const num = (key: string, fallback: number) => {
+  const parse = (key: string) => {
     const value = given[key]
-    const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN
+
+    return typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN
+  }
+  const num = (key: string, fallback: number) => {
+    const parsed = parse(key)
 
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
   }
+  // E22: every number is clamped to 0–90, a negative one to 0 (hidden); only a missing or non-numeric value means 7 (B2-BEH-6).
+  const days = parse('closedDays')
   const flag = (key: string, fallback: boolean) => (typeof given[key] === 'boolean' ? (given[key] as boolean) : fallback)
   const model = typeof given['recapModel'] === 'string' && (given['recapModel'] as string).trim() !== '' ? (given['recapModel'] as string).trim() : 'haiku'
 
@@ -161,7 +172,7 @@ function readOptions(given: PluginOptions): Options {
     recaps: flag('recaps', true),
     recapModel: model,
     language: asLanguage(given['language']) as Language,
-    closedDays: Math.min(90, Math.round(num('closedDays', 7))),
+    closedDays: Number.isFinite(days) ? Math.max(0, Math.min(90, Math.round(days))) : 7,
     assignedToMe: flag('assignedToMe', false),
   }
 }
@@ -856,8 +867,9 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     // The stored pull-request states draw at once; then the due ones are read, before the details (E3-5).
     await loadPrCache($, nextSections, prUpdates)
     if (isShown) await refreshPrs($, nextSections, reason, now, probed, prLog)
-    // E11 and E18 run before the details, and only while the pane is shown (D X-1).
-    const inboxLog = isShown ? await refreshInbox($, options, reason, now) : 'not shown'
+    // E11 and E18 run before the details, their searches and reads only while the pane is shown (D X-1); a hidden pane
+    // still draws the inbox another pane left in the store, which costs no GitHub call (B2-BEH-4).
+    const inboxLog = await refreshInbox($, options, reason, now, isShown)
     if (isShown) await refreshBoards($, nextSections, reason, now, false)
     // The last refresh's outcome, for the spike notes and a look at the store file.
     await writeStore($, 'debug:last', {
@@ -879,8 +891,9 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
 
     await hydrate($, options, nextSections, now)
     await pruneMappings($, options, nextSections)
-    // E22 after the details: the expanded closed lists that are due, only while the pane is shown (D X-1).
-    if (isShown) await refreshClosed($, options, nextSections, reason, now)
+    // E22 after the details: the expanded closed lists that are due, fetched only while the pane is shown (D X-1); the
+    // store's lists are drawn either way (B2-BEH-4).
+    await refreshClosed($, options, nextSections, reason, now, isShown)
     // The desktop's part comes last and is not awaited: no desktop call holds up the GitHub part (A-F4).
     void readSessionPrs($, nextSections)
   } catch (error) {
@@ -928,12 +941,16 @@ async function hydrate($: EngineInterface, options: Options, current: readonly S
     await Promise.all(Array.from({ length: Math.min(DETAILS_CONCURRENCY, tasks.length) }, worker))
   }
   // One store write per touched repository: the meta and the recaps of its rows as they stand now, merged into what
-  // the store keeps of the other issues within E14-1's bound. A filtered section never writes the list itself.
+  // the store keeps of the other issues within E14-1's bound. A filtered section never writes the list itself. A
+  // filtered list that listed in this refresh marks its rows shown even when none of them needed a read, as the
+  // default list does where it is written, so the bound evicts the issues no list showed for longest (B2-BEH-1).
   const allDetails = await read($, details)
   const allRecaps = await read($, recaps)
   for (const section of current) {
-    if (!touchedRepos.has(section.key)) continue
     const isFiltered = section.query !== undefined
+    const isTouched = touchedRepos.has(section.key)
+    const isStampOnly = !isTouched && isFiltered && section.state.kind === 'ok' && section.fetchedAt === now && section.rows.length > 0
+    if (!isTouched && !isStampOnly) continue
     const cache = await readStore<RepoCache>($, storeKeyOf('cache:', section.key))
     const merged: Record<string, IssueMeta> = { ...(typeof cache?.meta === 'object' && cache?.meta !== null ? cache.meta : {}) }
     const listed = new Set<string>()
@@ -947,6 +964,11 @@ async function hydrate($: EngineInterface, options: Options, current: readonly S
       if (recap !== undefined && recap.error === undefined) repoRecaps[String(row.number)] = recap
     }
     const meta = retainMeta(merged, listed, !isFiltered && isComplete(section, options), metaBound(options.maxIssues), now)
+    if (isStampOnly) {
+      // Nothing was read: only when the rows were shown changes; the list and the recaps stay as stored.
+      if (Object.keys(meta).length > 0) await writeStore($, storeKeyOf('cache:', section.key), { ...(cache ?? { fetchedAt: 0, rows: [] }), meta })
+      continue
+    }
     const total = cache?.total ?? section.total
     const written: RepoCache = isFiltered
       ? { ...(cache ?? { fetchedAt: 0, rows: [] }), meta }
@@ -1408,22 +1430,21 @@ async function retryBoards($: EngineInterface, host: string): Promise<void> {
  * The search for the issues assigned to the signed-in account on the checkout's host, shared through the store by
  * every pane on the machine. Due by age only (E11-1): the attach refresh that finds the pane placed searches; ↻ asks
  * once the last try is a minute old (E11-2); a back-off kept in the store holds after a failure (E11-6), so a reload
- * cannot fire a rate-limited search again. Not due, the pane adopts what another pane found. The caller runs it only
- * while the pane is shown.
+ * cannot fire a rate-limited search again. It searches only when `maySearch` (the pane is shown, D X-1). Otherwise, or
+ * when not due, the pane draws the store's record when it is newer than what the pane draws: another pane's rows, or
+ * the failure its search met (R2-RT-4); reading it costs no GitHub call, so a hidden pane draws it too (B2-BEH-4).
  */
-async function refreshInbox($: EngineInterface, options: Options, reason: Reason, now: number): Promise<string> {
+async function refreshInbox($: EngineInterface, options: Options, reason: Reason, now: number, maySearch: boolean): Promise<string> {
   if (!options.assignedToMe) return 'off'
   const host = checkout?.info?.host ?? 'github.com'
   const key = storeKeyOf('inbox:', host)
   const stored = asInboxCache(await readStore<unknown>($, key))
   const period = inboxPeriod(options.refreshMinutes)
-  if (!isInboxDue(stored, reason, now, period)) {
-    const have = await read($, inbox)
-    if (stored !== undefined && stored.fetchedAt > 0 && (have.host !== host || have.fetchedAt === null || stored.fetchedAt > have.fetchedAt)) {
-      await update($, inbox, (): Inbox => ({ host, state: { kind: 'ok' }, rows: stored.rows, fetchedAt: stored.fetchedAt }))
-    }
+  if (!maySearch || !isInboxDue(stored, reason, now, period)) {
+    const shared = inboxFromRecord(stored, await read($, inbox), host)
+    if (shared !== undefined) await update($, inbox, () => shared)
 
-    return 'shared'
+    return maySearch ? 'shared' : 'not shown'
   }
   const found = await searchAssigned($, host, Math.min(INBOX_CAP, options.maxIssues))
   if ('state' in found) {
@@ -1431,12 +1452,12 @@ async function refreshInbox($: EngineInterface, options: Options, reason: Reason
     await writeStore($, key, failedInbox(stored, failed, now, period))
     const lastRows = stored?.rows ?? []
     const lastAt = stored !== undefined && stored.fetchedAt > 0 ? stored.fetchedAt : null
-    await update($, inbox, (had): Inbox => (had.host === host && had.fetchedAt !== null ? { ...had, state: failed } : { host, state: failed, rows: lastRows, fetchedAt: lastAt }))
+    await update($, inbox, (had): Inbox => (had.host === host && had.fetchedAt !== null ? { ...had, state: failed, at: now } : { host, state: failed, rows: lastRows, fetchedAt: lastAt, at: now }))
 
     return `failed: ${failed.kind}`
   }
   await writeStore($, key, { v: 1, fetchedAt: now, triedAt: now, rows: found.rows })
-  await update($, inbox, (): Inbox => ({ host, state: { kind: 'ok' }, rows: found.rows, fetchedAt: now }))
+  await update($, inbox, (): Inbox => ({ host, state: { kind: 'ok' }, rows: found.rows, fetchedAt: now, at: now }))
 
   return `searched: ${found.rows.length}`
 }
@@ -1475,29 +1496,38 @@ async function sweepInbox($: EngineInterface): Promise<void> {
 // E22: recently closed ---------------------------------------------------------
 
 /**
- * Reads the expanded "recently closed" parts that are due (isClosedDue), one gh call each; a part that is
- * collapsed, or whose section is, never fetches (E22-2). A fetch in flight is claimed in module memory (E22-1); the
- * loading flag in the state only draws. A failure keeps the last list under its state and backs off: 10 minutes
- * after a rate limit, 2 without a network. Another pane's newer list in the store is adopted.
+ * Reads the expanded "recently closed" parts that are due (isClosedDue), one gh call each, when `mayFetch` (the pane
+ * is shown, or a press asked); a part whose section is collapsed never fetches (E22-2). Each repository's step is
+ * claimed in module memory before its first wait (E22-1), so a press and a refresh never both fetch one list; the
+ * loading flag in the state only draws, and only the call that set it clears it. Another pane's newer list in the
+ * store is drawn whether or not this call may fetch: reading it costs no GitHub call (B2-BEH-4). A failure keeps the
+ * last list under its state and counts as a try, so it waits as a read would (E3-2); a rate limit backs off 10 minutes,
+ * no network 2.
  */
-async function refreshClosed($: EngineInterface, options: Options, current: readonly Section[], reason: ClosedReason, now: number, only?: string): Promise<void> {
+async function refreshClosed($: EngineInterface, options: Options, current: readonly Section[], reason: ClosedReason, now: number, mayFetch: boolean, only?: string): Promise<void> {
   if (options.closedDays <= 0) return
   const chosen = await read($, settings)
   const since = sinceDate(now, options.closedDays)
   for (const section of current) {
     const info = section.info
     if (only !== undefined && section.key !== only) continue
-    if (info === null || section.state.kind !== 'ok' || chosen.showClosed?.[section.key] !== true || chosen.collapsed[section.key] === true) continue
-    if (closedInFlight.has(section.key) || now < (closedBackoff.get(section.key) ?? 0)) continue
-    const have = (await read($, closed))[section.key]
-    const stored = asClosedCache(await readStore<unknown>($, storeKeyOf('closed:', section.key)))
-    const cache = stored !== undefined && (have === undefined || stored.fetchedAt > have.fetchedAt) ? stored : have
-    if (cache !== undefined && cache !== have) await update($, closed, all => ({ ...all, [section.key]: cache }))
-    if (!isClosedDue(cache, since, reason, now, closedNudge.has(section.key))) continue
+    if (info === null || section.state.kind !== 'ok' || chosen.showClosed?.[section.key] !== true) continue
+    // Claimed before the first wait: a check and a claim with waits between them let two calls fetch (B2-BEH-3).
+    if (closedInFlight.has(section.key)) continue
     closedInFlight.add(section.key)
-    closedNudge.delete(section.key)
-    await update($, closedLoading, all => ({ ...all, [section.key]: now }))
+    let isLoading = false
     try {
+      const have = (await read($, closed))[section.key]
+      const stored = asClosedCache(await readStore<unknown>($, storeKeyOf('closed:', section.key)))
+      const cache = stored !== undefined && (have === undefined || stored.fetchedAt > have.fetchedAt) ? stored : have
+      if (cache !== undefined && cache !== have) await update($, closed, all => ({ ...all, [section.key]: cache }))
+      if (!mayFetch || chosen.collapsed[section.key] === true || now < (closedBackoff.get(section.key) ?? 0)) continue
+      const tried = closedTriedAt.get(section.key)
+      if (!isClosedDue(cache, since, reason, now, closedNudge.has(section.key), tried?.since === since ? tried.at : undefined)) continue
+      closedTriedAt.set(section.key, { at: now, since })
+      closedNudge.delete(section.key)
+      isLoading = true
+      await update($, closedLoading, all => ({ ...all, [section.key]: now }))
       const listed = await listClosed($, info, since)
       if ('state' in listed) {
         const failed = listed.state
@@ -1518,12 +1548,14 @@ async function refreshClosed($: EngineInterface, options: Options, current: read
       })
     } finally {
       closedInFlight.delete(section.key)
-      await update($, closedLoading, all => {
-        const next = { ...all }
-        delete next[section.key]
+      if (isLoading) {
+        await update($, closedLoading, all => {
+          const next = { ...all }
+          delete next[section.key]
 
-        return next
-      })
+          return next
+        })
+      }
     }
   }
 }
@@ -1540,7 +1572,7 @@ async function toggleClosed($: EngineInterface, options: Options, sectionKey: st
 
     return rest
   })
-  if (next.showClosed?.[sectionKey] === true) await refreshClosed($, options, await read($, sections), 'expand', await $.clock.now(), sectionKey)
+  if (next.showClosed?.[sectionKey] === true) await refreshClosed($, options, await read($, sections), 'expand', await $.clock.now(), true, sectionKey)
 }
 
 async function resetStore($: EngineInterface): Promise<void> {
@@ -1559,6 +1591,7 @@ async function resetStore($: EngineInterface): Promise<void> {
   filteredPrTried.clear()
   boardsReadAt.clear()
   closedBackoff.clear()
+  closedTriedAt.clear()
   closedNudge.clear()
   resetRelations()
   settingsKey = null

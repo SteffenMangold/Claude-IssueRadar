@@ -309,7 +309,14 @@ export type InboxRow = {
 }
 
 /** E11's section as the pane draws it. */
-export type Inbox = { host: string; state: RepoState; rows: InboxRow[]; fetchedAt: number | null }
+export type Inbox = {
+  host: string
+  state: RepoState
+  rows: InboxRow[]
+  fetchedAt: number | null
+  /** When what is drawn was decided: this pane's search answered or failed, or it took the store's record; absent before. */
+  at?: number
+}
 
 /** The store's `inbox:<host>`, shared by every pane on the machine, so the search budget is spent once. */
 export type InboxCache = {
@@ -323,6 +330,8 @@ export type InboxCache = {
   retryAt?: number
   /** No search at all before this, ↻ included (a rate limit). */
   holdUntil?: number
+  /** What the last search met when it failed (gh's state and first line, never a token); absent once one answers. */
+  failed?: RepoState
 }
 
 /** A pull request that closed an issue, as gh names it (E22). */

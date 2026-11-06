@@ -25,7 +25,7 @@ import { strings } from '../hooks/i18n'
 import { asInboxCache, failedInbox, inboxPeriod, isInboxDue, parseInbox, searchArgs } from '../hooks/inbox'
 import type { ClosedCache, Filter, InboxCache, IssueMeta, IssueRow } from '../types'
 import type { Ran } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, count, graphAnswer, issueView, op, ops, pairs, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, count, graphAnswer, graphQuery, issueView, op, ops, pairs, project, ran, started, tick } from './harness'
 
 const DE = strings('de')
 const SETTINGS = 'settings:github.com/acme/widgets'
@@ -182,6 +182,50 @@ test('a filtered list never rewrites the default list, and keeps its issues know
   expect(recapped.filter(title => title.startsWith('Dark mode'))).toHaveLength(1)
   expect(recapped.filter(title => title.startsWith('Export fails'))).toHaveLength(2)
   expect(store.get(`session:${ROW_42}`)).toBeDefined()
+  await ui.unmount()
+})
+
+test('a filter shown again marks its issues shown though none needed a read, so the bound keeps them (B2-BEH-1)', { options: { maxIssues: 1 } }, async ($, on) => {
+  let window = 42
+  const { argv, store, prompts } = project(on, {
+    stored: { [SETTINGS]: { watch: [], consent: { [SECTION]: true }, collapsed: {} } },
+    gh: args => {
+      if (!isList(args)) return undefined
+      if (searchOf(args) !== null) return ran(listOf([7]))
+      if (window === 42) return ran(listOf([42]))
+
+      // The default list's one-row window moves on to issues the filter never shows.
+      return ran(JSON.stringify([{ ...(ROWS[1] ?? {}), number: window, title: `Issue ${window}`, url: `https://github.com/acme/widgets/issues/${window}` }]))
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await openFilter(ui)
+
+  // #7 is read and recapped once; the default list then shows #42; the filter shows #7 twice more with nothing to read.
+  await ui.select({ key: 'filter-view', value: 'mine' })
+  await clock.advance(1_000)
+  await ui.press({ key: 'filter-clear' })
+  await clock.advance(1_000)
+  await ui.select({ key: 'filter-view', value: 'mine' })
+  await clock.advance(1_000)
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  // The default window moves twice: of four issues, the store keeps three (3 x maxIssues), and #42 was shown last.
+  window = 43
+  await ui.press({ key: 'filter-clear' })
+  await clock.advance(1_000)
+  window = 44
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect(Object.keys((store.get(`cache:${SECTION}`) as { meta: Record<string, IssueMeta> }).meta).sort()).toEqual(['43', '44', '7'])
+
+  await ui.select({ key: 'filter-view', value: 'mine' })
+  await clock.advance(1_000)
+  expect(await ui.find({ key: `row-title:${ROW_7}` })).toBeDefined()
+  expect(count(argv, 'issue', 'view', '7')).toBe(1)
+  const recapped = prompts.map(prompt => /Titel: (.*)/.exec(prompt)?.[1] ?? '?')
+  expect(recapped.filter(title => title.startsWith('Dark mode'))).toHaveLength(1)
   await ui.unmount()
 })
 
@@ -504,6 +548,62 @@ test('with the scope, rows carry their board status, and the facet filters witho
   }
 })
 
+test('a control character in a board status reaches no picker value, so the panel draws on every surface (R2-RT-1)', async ($, on) => {
+  const odd = graphAnswer({ repository: { i42: { projectItems: { nodes: [item('Done\u0085')] } }, i7: { projectItems: { nodes: [item('Todo')] } } }, rateLimit: LIMIT })
+  project(on, { stored: BOARDS_ON, gh: boardsWith(() => odd) })
+  const clock = await started($, on)
+
+  // The panel stays open from one mount to the next, as it does across a reload: a refused tree would close the pane
+  // on every later draw.
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await openFilter(ui)
+    expect(await ui.drawn()).toMatchObject({ type: 'Box' })
+    expect((await ui.find({ key: 'filter-board' }))?.props['options']).toContainEqual({ value: 'acme/3:Done', label: DE.boardOption('Roadmap', 'Done') })
+    expect((await ui.find({ key: `board:${ROW_42}` }))?.text).toBe(DE.boardChip('Done'))
+    await ui.select({ key: 'filter-board', value: 'acme/3:Done' })
+    await clock.advance(1_000)
+    expect((await ui.find({ key: 'filter-board' }))?.props['value']).toBe('acme/3:Done')
+    expect(await ui.find({ key: `row-title:${ROW_42}` })).toBeDefined()
+    expect(await ui.find({ key: `row-title:${ROW_7}` })).toBeUndefined()
+    await ui.select({ key: 'filter-board', value: '*' })
+    await ui.unmount()
+  }
+  for (const surface of ['vscode', 'mobile'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.drawn()).toMatchObject({ type: 'Box' })
+    if (surface === 'mobile') expect(await ui.find({ key: 'filter-board:acme/3:Done' })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('more than 100 rows read their board status in more than one request (R2-RT-3)', { options: { maxIssues: 150 } }, async ($, on) => {
+  const many = Array.from({ length: 120 }, (_, index) => ({ ...(ROWS[1] ?? {}), number: 1000 - index, title: `Issue ${1000 - index}`, url: `https://github.com/acme/widgets/issues/${1000 - index}` }))
+  const asked: number[] = []
+  const { argv } = project(on, {
+    stored: BOARDS_ON,
+    gh: args => {
+      if (isList(args)) return ran(JSON.stringify(many))
+      if (args[0] !== 'api' || op(args) !== 'IssueRadarBoards') return undefined
+      const numbers = [...graphQuery(args).matchAll(/ i(\d+): issue/g)].map(match => Number(match[1]))
+      asked.push(...numbers)
+
+      return graphAnswer({ repository: Object.fromEntries(numbers.map(number => [`i${number}`, { projectItems: { nodes: [item('Todo')] } }])), rateLimit: LIMIT })
+    },
+  })
+  await started($, on)
+  expect(ops(argv, 'IssueRadarBoards')).toHaveLength(2)
+  expect(new Set(asked).size).toBe(120)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // The 111th row has its status too, and the facet keeps every row on the board.
+  expect((await ui.find({ key: `board:${SECTION}#890` }))?.text).toBe(DE.boardChip('Todo'))
+  await openFilter(ui)
+  await ui.select({ key: 'filter-board', value: 'acme/3:Todo' })
+  expect((await ui.find({ key: `count:${SECTION}` }))?.text).toBe('120')
+  await ui.unmount()
+})
+
 test('boards off: no board request and no board facet', async ($, on) => {
   const { argv } = project(on, { gh: boardsWith(() => ON_BOARDS) })
   const clock = await started($, on)
@@ -573,6 +673,9 @@ test('the pure boards: items, the facet, the pill and the query', () => {
     { owner: 'me', project: 5, title: 'Triage', status: null },
   ])
   expect(boardValue({ owner: 'me', project: 5, status: null })).toBe('me/5:')
+  // A picker value never holds a control character (R2-RT-1); the row still matches the value it is offered under.
+  expect(boardValue({ owner: 'acme', project: 3, status: 'Done\u0085\u0007' })).toBe('acme/3:Done')
+  expect(matchesBoard([{ owner: 'acme', project: 3, title: 'Roadmap', status: 'Done\u0085' }], 'acme/3:Done')).toBe(true)
   expect(matchesBoard(items, 'me/5:')).toBe(true)
   expect(matchesBoard(items, 'acme/3:Todo')).toBe(false)
   expect(matchesBoard(undefined, '')).toBe(true)
@@ -723,6 +826,48 @@ test('a rate-limited search keeps the last inbox and holds even ↻ for ten minu
   await ui.unmount()
 })
 
+const BAD_GATEWAY = 'gh: HTTP 502: Bad Gateway'
+
+test('a first search that fails marks the collapsed header instead of loading, and the store keeps what failed (B2-BEH-5)', ME, async ($, on) => {
+  const { argv, store } = project(on, { gh: searchWith(() => ran('', 1, BAD_GATEWAY)) })
+  await started($, on)
+  expect(searches(argv)).toBe(1)
+  expect((store.get('inbox:github.com') as InboxCache).failed).toEqual({ kind: 'error', host: 'github.com', detail: BAD_GATEWAY })
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'count:inbox' }))?.text).toBe('!')
+    await ui.press({ key: 'section:inbox' })
+    expect(await ui.find({ type: 'Text', text: DE.error(BAD_GATEWAY) })).toBeDefined()
+    await ui.press({ key: 'section:inbox' })
+    await ui.unmount()
+  }
+})
+
+test("another pane's failed search is drawn as that failure and asks nothing until its back-off ends (R2-RT-4)", ME, async ($, on) => {
+  const failed = failedInbox(undefined, { kind: 'error', host: 'github.com', detail: BAD_GATEWAY }, NOW - 120_000, inboxPeriod(3))
+  const { argv } = project(on, { stored: { 'inbox:github.com': failed }, gh: searchWith() })
+  const clock = await started($, on)
+  expect(searches(argv)).toBe(0)
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'count:inbox' }))?.text).toBe('!')
+    await ui.press({ key: 'section:inbox' })
+    expect(await ui.find({ type: 'Text', text: DE.error(BAD_GATEWAY) })).toBeDefined()
+    await ui.press({ key: 'section:inbox' })
+    await ui.unmount()
+  }
+  // The other pane's try was two minutes ago: the 15-minute back-off ends at the fifth tick, and that search answers.
+  await tick(clock, 4)
+  expect(searches(argv)).toBe(0)
+  await tick(clock)
+  expect(searches(argv)).toBe(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'count:inbox' }))?.text).toBe('2')
+  await ui.unmount()
+})
+
 test('+ Beobachten watches the repository; ↓ Zeigen opens the row, also in a collapsed section, and scrolls to it', ME, async ($, on) => {
   const { store, logs } = project(on, { gh: searchWith() })
   const clock = await started($, on)
@@ -786,6 +931,11 @@ test('the pure inbox: the search, its rows, when it is due and how a failure wai
   expect(isInboxDue(broken, 'timer', at + period + 180_000, period)).toBe(false)
   expect(isInboxDue(broken, 'timer', at + 2 * period, period)).toBe(true)
   expect(isInboxDue(broken, 'press', at + period + 60_000, period)).toBe(true)
+  // R2-RT-4: the record says what failed, for every pane; an answered search clears it.
+  expect(broken.failed).toEqual({ kind: 'error', detail: 'boom' })
+  expect(asInboxCache(JSON.parse(JSON.stringify(broken)))?.failed).toEqual({ kind: 'error', detail: 'boom' })
+  expect(asInboxCache({ v: 1, fetchedAt: 5, rows: [], failed: { kind: 'ok' } })?.failed).toBeUndefined()
+  expect(asInboxCache({ v: 1, fetchedAt: 5, rows: [], failed: { kind: 'rate-limited', detail: 7 } })?.failed).toEqual({ kind: 'rate-limited' })
   expect(asInboxCache({ v: 1, fetchedAt: 5, rows: [{ repo: 'a/b', number: 1 }, { repo: 'nope', number: 2 }], retryAt: 9 })).toMatchObject({ fetchedAt: 5, retryAt: 9, rows: [{ repo: 'a/b', number: 1, host: 'github.com' }] })
   expect(asInboxCache({ v: 2, fetchedAt: 5, rows: [] })).toBeUndefined()
 })
@@ -936,13 +1086,47 @@ test('a failed fetch keeps the last list under its state', async ($, on) => {
   await ui.unmount()
 })
 
-test('closedDays 0 hides the part and fetches nothing', { options: { closedDays: 0 } }, async ($, on) => {
-  const { argv } = project(on, { stored: EXPANDED, gh: closedWith() })
+const SCHEMA_ERROR = "GraphQL: Field 'stateReason' doesn't exist on type 'Issue'"
+
+test('a closed list that keeps failing waits as long between tries as a read one does (B2-BEH-2, E3-2)', async ($, on) => {
+  const { argv } = project(on, { stored: EXPANDED, gh: closedWith(() => ran('', 1, SCHEMA_ERROR)) })
   const clock = await started($, on)
-  await tick(clock)
-  expect(closedLists(argv)).toHaveLength(0)
+  expect(closedLists(argv)).toHaveLength(1)
+
+  // Thirty minutes of ticks: tried at 0.6 s and once 15 minutes later (the 1,080 s tick), not on every tick.
+  await tick(clock, 10)
+  expect(closedLists(argv)).toHaveLength(2)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ key: `closed-toggle:${SECTION}` })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: DE.error(SCHEMA_ERROR) })).toBeDefined()
+  // ↻ asks once the last try is 30 s old, and not again right after.
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect(closedLists(argv)).toHaveLength(3)
+  await clock.advance(10_000)
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect(closedLists(argv)).toHaveLength(3)
+  await ui.unmount()
+})
+
+for (const closedDays of [0, -1]) {
+  test(`closedDays ${closedDays} hides the part and fetches nothing`, { options: { closedDays } }, async ($, on) => {
+    const { argv } = project(on, { stored: EXPANDED, gh: closedWith() })
+    const clock = await started($, on)
+    await tick(clock)
+    expect(closedLists(argv)).toHaveLength(0)
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    expect(await ui.find({ key: `closed-toggle:${SECTION}` })).toBeUndefined()
+    await ui.unmount()
+  })
+}
+
+test('closedDays past 90 reaches back 90 days (B2-BEH-6)', { options: { closedDays: 200 } }, async ($, on) => {
+  const { argv } = project(on, { stored: EXPANDED, gh: closedWith() })
+  await started($, on)
+  expect(pairs(closedLists(argv)[0] ?? [])).toContain('--search closed:>=2026-08-08 sort:updated-desc')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: `closed-toggle:${SECTION}` }))?.text).toMatch(/Kürzlich geschlossen \(90 Tage\)/)
   await ui.unmount()
 })
 
@@ -989,6 +1173,52 @@ test('a closed list another pane read a moment ago is drawn, not read again', as
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ key: `closed-row:${SECTION}#40` })).toBeDefined()
   expect((await ui.find({ key: `closed-count:${SECTION}` }))?.text).toBe('3')
+  await ui.unmount()
+})
+
+test("a pane behind another draws the store's closed list and inbox without a fetch (B2-BEH-4)", ME, async ($, on) => {
+  const inboxRecord: InboxCache = { v: 1, fetchedAt: NOW - 60_000, triedAt: NOW - 60_000, rows: [{ host: 'github.com', repo: 'other/thing', number: 3, title: 'Crash on start', url: 'https://github.com/other/thing/issues/3', createdAt: '', updatedAt: '2026-11-05T09:00:00Z', commentCount: 0, labels: [] }] }
+  const closedRecordStored = closedRecord(parseClosed(CLOSED) ?? [], '2026-10-30', NOW - 60_000)
+  const { argv } = project(on, { isShown: false, stored: { ...EXPANDED, 'inbox:github.com': inboxRecord, [`closed:${SECTION}`]: closedRecordStored }, gh: (args: readonly string[]) => searchWith()(args) ?? closedWith()(args) })
+  await started($, on)
+  expect(searches(argv)).toBe(0)
+  expect(closedLists(argv)).toHaveLength(0)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'count:inbox' }))?.text).toBe('1')
+  expect(await ui.find({ key: `closed-row:${SECTION}#40` })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: DE.closedLoading })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('an expanded part with no list yet says one is coming, and the first shown refresh reads it (B2-BEH-4)', async ($, on) => {
+  const { argv, setShown } = project(on, { isShown: false, stored: EXPANDED, gh: closedWith() })
+  const clock = await started($, on)
+  expect(closedLists(argv)).toHaveLength(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: DE.closedLoading })).toBeDefined()
+
+  setShown(true)
+  await tick(clock)
+  expect(closedLists(argv)).toHaveLength(1)
+  expect(await ui.find({ key: `closed-row:${SECTION}#40` })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: DE.closedLoading })).toBeUndefined()
+  await ui.unmount()
+})
+
+test("an expand pressed while a refresh's closed step waits on the store starts no second list (B2-BEH-3, R2-RT-2)", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const { argv } = project(on, { stored: EXPANDED, storeDelay: key => (key === `closed:${SECTION}` ? clock.sleep(2_000) : undefined), gh: closedWith() })
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(1_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // The start refresh is reading the stored closed list; the owner collapses and expands the part meanwhile.
+  await ui.press({ key: `closed-toggle:${SECTION}` })
+  await ui.press({ key: `closed-toggle:${SECTION}` })
+  await clock.advance(5_000)
+  expect(closedLists(argv)).toHaveLength(1)
+  expect(await ui.find({ key: `closed-row:${SECTION}#40` })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: DE.closedLoading })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -1039,6 +1269,14 @@ test('the pure closed list: parsing, the window, when it is due, the count', () 
   expect(isClosedDue(cache, '2026-10-30', 'tool', at + 30_000, false)).toBe(true)
   expect(isClosedDue(cache, '2026-10-30', 'timer', at + 29_999, true)).toBe(false)
   expect(isClosedDue(cache, '2026-10-30', 'timer', at + 30_000, true)).toBe(true)
+  // B2-BEH-2 (E3-2): a try that failed counts as a read for when the next one is due, with or without a list.
+  expect(isClosedDue(undefined, '2026-10-30', 'timer', at + 899_999, false, at)).toBe(false)
+  expect(isClosedDue(undefined, '2026-10-30', 'start', at + 900_000, false, at)).toBe(true)
+  expect(isClosedDue(undefined, '2026-10-30', 'press', at + 29_999, false, at)).toBe(false)
+  expect(isClosedDue(undefined, '2026-10-30', 'expand', at + 599_999, false, at)).toBe(false)
+  expect(isClosedDue(cache, '2026-10-30', 'timer', at + 900_000, false, at + 600_000)).toBe(false)
+  expect(isClosedDue(cache, '2026-10-30', 'timer', at + 1_500_000, false, at + 600_000)).toBe(true)
+  expect(isClosedDue(cache, '2026-10-31', 'timer', at + 1, false)).toBe(true)
 
   const many = closedRecord(
     Array.from({ length: 14 }, (_, index) => ({ number: index + 1, title: '', url: '', closedAt: '', stateReason: '', prs: [] })),

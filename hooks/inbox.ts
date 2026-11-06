@@ -5,8 +5,11 @@
 // the machine, an age gate and a back-off kept in the store, never in memory.
 import type { EngineInterface } from 'claude-code'
 
-import type { InboxCache, InboxRow, IssueLabel, RepoState } from '../types'
+import type { Inbox, InboxCache, InboxRow, IssueLabel, RepoState, RepoStateKind } from '../types'
 import { asString, countOf, gh, isRecord, parseJson, repoOfUrl } from './github'
+
+/** The kinds a failed search leaves in the store (R2-RT-4); any other kind read back is no failure. */
+const FAILURES: ReadonlySet<string> = new Set<RepoStateKind>(['signed-out', 'gh-missing', 'token-invalid', 'no-access', 'offline', 'rate-limited', 'missing-scope', 'error'])
 
 /** At most this many assigned issues are listed (and the issue cap, when that is lower). */
 export const INBOX_CAP = 30
@@ -107,6 +110,16 @@ function timeOf(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
+/** A failure as the store keeps it: a known failure kind, with its host and gh's line where they are text. */
+function failureOf(value: unknown): RepoState | undefined {
+  if (!isRecord(value) || typeof value['kind'] !== 'string' || !FAILURES.has(value['kind'])) return undefined
+  const failed: RepoState = { kind: value['kind'] as RepoStateKind }
+  if (typeof value['host'] === 'string') failed.host = value['host']
+  if (typeof value['detail'] === 'string') failed.detail = value['detail']
+
+  return failed
+}
+
 /** The store's record as the mod can use it, every row checked; anything else is none. */
 export function asInboxCache(value: unknown): InboxCache | undefined {
   if (!isRecord(value) || value['v'] !== 1) return undefined
@@ -116,11 +129,30 @@ export function asInboxCache(value: unknown): InboxCache | undefined {
   const triedAt = timeOf(value['triedAt'])
   const retryAt = timeOf(value['retryAt'])
   const holdUntil = timeOf(value['holdUntil'])
+  const failed = failureOf(value['failed'])
   if (triedAt !== undefined) cache.triedAt = triedAt
   if (retryAt !== undefined) cache.retryAt = retryAt
   if (holdUntil !== undefined) cache.holdUntil = holdUntil
+  if (failed !== undefined) cache.failed = failed
 
   return cache
+}
+
+/** When a record was last decided: its last answer, or its last try when that came later. */
+function recordAt(stored: InboxCache): number {
+  return Math.max(stored.fetchedAt, stored.triedAt ?? 0)
+}
+
+/**
+ * The section a stored record draws in a pane that did not search itself (another pane did, or this one is hidden,
+ * B2-BEH-4): the last rows, under the last search's failure when it failed (R2-RT-4). Undefined while the record has
+ * neither, and when the pane already draws something as new; another host's section always gives way.
+ */
+export function inboxFromRecord(stored: InboxCache | undefined, have: Inbox, host: string): Inbox | undefined {
+  if (stored === undefined || (stored.fetchedAt <= 0 && stored.failed === undefined)) return undefined
+  if (have.host === host && recordAt(stored) <= (have.at ?? have.fetchedAt ?? Number.NEGATIVE_INFINITY)) return undefined
+
+  return { host, state: stored.failed ?? { kind: 'ok' }, rows: stored.rows, fetchedAt: stored.fetchedAt > 0 ? stored.fetchedAt : null, at: recordAt(stored) }
 }
 
 /**
@@ -137,12 +169,13 @@ export function isInboxDue(stored: InboxCache | undefined, reason: string, now: 
 }
 
 /**
- * The store's record after a failed search: the last rows kept, the next try put off by what failed (E11-6): a rate
- * limit holds every search for 10 minutes, no network 2 minutes, anything else (signed out, an error, no gh) a whole
- * period, so a search that keeps failing never runs on every tick.
+ * The store's record after a failed search: the last rows kept, what failed (so every pane draws it, R2-RT-4), the
+ * next try put off by it (E11-6): a rate limit holds every search for 10 minutes, no network 2 minutes, anything else
+ * (signed out, an error, no gh) a whole period, so a search that keeps failing never runs on every tick.
  */
 export function failedInbox(stored: InboxCache | undefined, state: RepoState, now: number, period: number): InboxCache {
-  const base: InboxCache = { v: 1, fetchedAt: stored?.fetchedAt ?? 0, rows: stored?.rows ?? [], triedAt: now }
+  const failed: RepoState = { kind: state.kind, ...(state.host === undefined ? {} : { host: state.host }), ...(state.detail === undefined ? {} : { detail: state.detail }) }
+  const base: InboxCache = { v: 1, fetchedAt: stored?.fetchedAt ?? 0, rows: stored?.rows ?? [], triedAt: now, failed }
   if (state.kind === 'rate-limited') return { ...base, retryAt: now + INBOX_RATE_MS, holdUntil: now + INBOX_RATE_MS }
   if (state.kind === 'offline') return { ...base, retryAt: now + INBOX_OFFLINE_MS }
 
