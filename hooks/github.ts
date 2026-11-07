@@ -19,7 +19,8 @@ export const TOOL_COMMENT_CHARS = 1_200
 export const TREE_FIELDS = 'parent,subIssues,subIssuesSummary,blockedBy,blocking'
 /** What the parent read asks: its sub-issues are the siblings. */
 export const PARENT_FIELDS = 'number,title,state,subIssues,subIssuesSummary'
-const REPO_FIELDS = 'nameWithOwner,isPrivate,hasIssuesEnabled,isArchived,isFork,url,defaultBranchRef'
+/** The repository's fields; `viewerPermission` (batch 7) rides along at no cost: which write buttons a row offers. */
+const REPO_FIELDS = 'nameWithOwner,isPrivate,hasIssuesEnabled,isArchived,isFork,url,defaultBranchRef,viewerPermission'
 export const BODY_CHARS = 6_000
 export const EXCERPT_CHARS = 160
 export const COMMENT_CHARS = 600
@@ -176,18 +177,37 @@ function classifyThrow(error: unknown): RepoState {
   return { kind: 'error', detail: firstLine(error instanceof Error ? error.message : String(error)) }
 }
 
-/** Runs gh with the given arguments; `host` and `repo` only name the state a failure gets. */
-export async function gh($: EngineInterface, args: readonly string[], options: GhOptions = {}): Promise<GhResult> {
+/** What gh did when it ran at all (its exit, both streams), or the state of a gh that could not run or ran out of time. */
+export type GhRaw = { ran: true; exitCode: number; stdout: string; stderr: string } | { ran: false; state: RepoState }
+
+/**
+ * The one place gh runs: its arguments, the folder, variables over the host's environment (never a token) and text on
+ * standard input (batch 7's writes send a body through `--body-file -`). A throw (gh missing, a timeout) is a state.
+ */
+export async function ghRaw($: EngineInterface, args: readonly string[], options: { cwd?: string; env?: Record<string, string>; stdin?: string; timeoutMs?: number } = {}): Promise<GhRaw> {
   try {
     // Only variables a caller names go on top of the host's environment: gh prompts nothing without a TTY,
     // and the host's PATH must stay as it is (Doc Radar's precedent).
-    const ran = await $.process.run(['gh', ...args], { cwd: options.cwd, timeoutMs: options.timeoutMs ?? 30_000, ...(options.env === undefined ? {} : { env: options.env }) })
-    if (ran.exitCode === 0) return { ok: true, stdout: ran.stdout }
+    const ran = await $.process.run(['gh', ...args], {
+      cwd: options.cwd,
+      timeoutMs: options.timeoutMs ?? 30_000,
+      ...(options.env === undefined ? {} : { env: options.env }),
+      ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
+    })
 
-    return { ok: false, state: classify(ran.exitCode, ran.stderr, options.host ?? 'github.com', options.repo ?? ''), stdout: ran.stdout, stderr: ran.stderr, exitCode: ran.exitCode }
+    return { ran: true, exitCode: ran.exitCode, stdout: ran.stdout, stderr: ran.stderr }
   } catch (error) {
-    return { ok: false, state: classifyThrow(error) }
+    return { ran: false, state: classifyThrow(error) }
   }
+}
+
+/** Runs gh with the given arguments; `host` and `repo` only name the state a failure gets. */
+export async function gh($: EngineInterface, args: readonly string[], options: GhOptions = {}): Promise<GhResult> {
+  const ran = await ghRaw($, args, { ...(options.cwd === undefined ? {} : { cwd: options.cwd }), ...(options.env === undefined ? {} : { env: options.env }), timeoutMs: options.timeoutMs ?? 30_000 })
+  if (!ran.ran) return { ok: false, state: ran.state }
+  if (ran.exitCode === 0) return { ok: true, stdout: ran.stdout }
+
+  return { ok: false, state: classify(ran.exitCode, ran.stderr, options.host ?? 'github.com', options.repo ?? ''), stdout: ran.stdout, stderr: ran.stderr, exitCode: ran.exitCode }
 }
 
 export function parseJson(text: string): unknown {
@@ -240,8 +260,7 @@ function parseRepo(text: string): RepoInfo | null {
   })()
   if (owner === undefined || name === undefined || owner === '' || name === '') return null
   const branch = data['defaultBranchRef']
-
-  return {
+  const info: RepoInfo = {
     host,
     owner,
     name,
@@ -252,6 +271,18 @@ function parseRepo(text: string): RepoInfo | null {
     isArchived: data['isArchived'] === true,
     isFork: data['isFork'] === true,
   }
+  // Batch 7: kept only when gh named a role, so a record without one reads as before (unknown: allowed).
+  const permission = asPermission(data['viewerPermission'])
+  if (permission !== '') info.permission = permission
+
+  return info
+}
+
+/** The role GitHub's `viewerPermission` names, as RepoInfo keeps it; empty for none or anything else. */
+export function asPermission(value: unknown): string {
+  const role = typeof value === 'string' ? value.toUpperCase() : ''
+
+  return /^(?:ADMIN|MAINTAIN|WRITE|TRIAGE|READ)$/.test(role) ? role : ''
 }
 
 /** Resolves the repository of the checkout at `root`; `$.session.repo()` null means no git repository at all. */
@@ -645,4 +676,33 @@ export async function viewParent($: EngineInterface, parent: IssueRef, fallbackH
     .filter((ref): ref is IssueRef => ref !== null)
 
   return { subIssues, progress: progressOf(json['subIssuesSummary']) }
+}
+
+// Batch 7: the reads the write path asks for on demand --------------------------
+
+/** E19: the signed-in account's login on a host (one call per host and session, on demand); null when gh did not say. */
+export async function viewerLogin($: EngineInterface, host: string): Promise<string | null> {
+  const ran = await gh($, ['api', 'user', '--jq', '.login', ...(host === 'github.com' ? [] : ['--hostname', host])], { host })
+  const login = ran.ok ? ran.stdout.trim() : ''
+
+  return /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(login) ? login : null
+}
+
+/** E19/E16: a repository's labels for the editors, at most 100 (one call per repository and session, on demand). */
+export async function listLabels($: EngineInterface, info: RepoInfo): Promise<{ stdout: string } | { state: RepoState }> {
+  const ran = await gh($, ['label', 'list', '-R', repoSpec(info), '--json', 'name,color', '--limit', '100'], { host: info.host, repo: repoLabel(info) })
+
+  return ran.ok ? { stdout: ran.stdout } : { state: ran.state }
+}
+
+/**
+ * E15: a branch's tip on GitHub (`gh api .../git/ref/heads/<branch>`), so a link is offered only for a branch GitHub
+ * does not have yet (E15-1): `missing` when GitHub answers 404, a state for any other failure.
+ */
+export async function remoteBranchTip($: EngineInterface, info: RepoInfo, branch: string): Promise<{ stdout: string } | { missing: true } | { state: RepoState }> {
+  const path = `repos/${info.owner}/${info.name}/git/ref/heads/${branch.split('/').map(encodeURIComponent).join('/')}`
+  const ran = await gh($, ['api', path, '--jq', '.object.sha', ...(info.host === 'github.com' ? [] : ['--hostname', info.host])], { host: info.host, repo: repoLabel(info) })
+  if (ran.ok) return { stdout: ran.stdout }
+
+  return /http 404|not found/i.test(`${ran.stderr ?? ''} ${ran.state.detail ?? ''}`) || ran.state.kind === 'no-access' ? { missing: true } : { state: ran.state }
 }

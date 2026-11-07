@@ -152,8 +152,11 @@ export const PRS_MAX = 100
 /** At most this many issues one board request names (E18): one request per section up to 100 rows, one more per 100 beyond. */
 export const BOARDS_MAX = 100
 
-/** A pull request as E3 reads it: state, draft, review decision and the head commit's check rollup. */
-const PR_FIELDS = 'number url state isDraft reviewDecision repository { nameWithOwner } commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
+/**
+ * A pull request as E3 reads it: state, draft, review decision and the head commit's check rollup; when and into which
+ * branch it merged (E19-2: the close-out waits while GitHub closes the issue itself).
+ */
+const PR_FIELDS = 'number url state isDraft reviewDecision mergedAt baseRefName repository { nameWithOwner } commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
 /**
  * An issue's linked pull requests: open and merged, as gh's own view lists them (no includeClosedPrs, E7-1), the
  * newest three. GitHub lists the references oldest first, so `first` would read an old merged attempt and leave out
@@ -402,4 +405,19 @@ export async function fetchBoards($: EngineInterface, info: RepoInfo, numbers: r
   }
 
   return { items, cost }
+}
+
+/**
+ * E15: the branches linked to one issue (X-2): the last 50, a deleted branch's `ref: null` skipped by the reader, each
+ * with its repository, so a link is matched by name and repository. One point.
+ */
+export function linkedBranchesQuery(): string {
+  return 'query IssueRadarLinkedBranches($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { linkedBranches(last: 50) { totalCount nodes { ref { name repository { nameWithOwner } } } } } } }'
+}
+
+/** E15: the branches GitHub lists under the issue's Development section; partial data is used (plan 4.9). */
+export async function fetchLinkedBranches($: EngineInterface, info: RepoInfo, number: number): Promise<{ data: Record<string, unknown> } | { state: RepoState }> {
+  const answer = await graphql($, info, linkedBranchesQuery(), { owner: info.owner, name: info.name, number })
+
+  return answer.ok ? { data: answer.data } : { state: answer.state }
 }

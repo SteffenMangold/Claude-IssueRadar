@@ -23,6 +23,8 @@ export type Options = {
   arrivalToasts: boolean
   /** E2: the `#` typeahead in the prompt box, and the context block for the open issues a sent prompt mentions. */
   issueMentions: boolean
+  /** Batch 7: the write buttons (E19 quick actions, E16 new issue, E15 branch link); each write runs only after its confirmation. */
+  writes: boolean
 }
 
 /** E2: an issue this conversation already carries, and since when (the user turn it entered at). */
@@ -54,6 +56,11 @@ export type RepoInfo = {
   hasIssues: boolean
   isArchived: boolean
   isFork: boolean
+  /**
+   * Batch 7: the signed-in account's role (`viewerPermission`): ADMIN, MAINTAIN, WRITE, TRIAGE or READ; absent or empty
+   * when gh did not say (an unknown role counts as allowed, and GitHub decides).
+   */
+  permission?: string
 }
 
 /** Why a repository shows no list, or that it does (`ok`). */
@@ -164,6 +171,9 @@ export type PrLink = {
   review: PrReview | null
   /** The head commit's check rollup; null when it has no checks. */
   checks: PrChecks | null
+  /** E19: when a merged pull request merged, and into which branch (E19-2); absent on records read before. */
+  mergedAt?: string
+  base?: string
 }
 
 /** One repository's pull-request states (E3), the store's `prs:<repoKey>`: metadata only, no titles or bodies. */
@@ -319,6 +329,11 @@ export type Mapping = {
   mode?: StartMode
   /** E20/E21: where it works; absent in mappings written before (read as `worktree`). */
   place?: StartPlace
+  /** E15: the session's branch as linked to the issue on GitHub (`gh issue develop`), and when. */
+  linkedBranch?: string
+  linkedAt?: number
+  /** E15-1: the session's branch is on GitHub already (pushed): no link is offered; its pull request's "Closes" links the issue. */
+  branchOnRemote?: true
 }
 
 /** E20: how an issue session works: V1's five phases (understand first), or plan section 3's "just fix it". */
@@ -619,6 +634,92 @@ export type RepoCache = {
   total?: number
 }
 
+/** Batch 7 (F0): what a confirmed write does. */
+export type WriteKind = 'comment' | 'labels' | 'assign' | 'unassign' | 'close' | 'create' | 'develop'
+
+/** E19: why an issue is closed, in gh's words. */
+export type CloseReason = 'completed' | 'not planned' | 'duplicate'
+
+/**
+ * F0: the one card a pane shows before a write runs: the exact command, frozen at Review, and what it sends. The confirm
+ * press carries `id`; nothing else runs it. The session's state only (never the store).
+ */
+export type PendingWrite = {
+  /** `<kind>:<target>:<createdAt>`. */
+  id: string
+  kind: WriteKind
+  /** A row key, or `create:<repoKey>` for a new issue. */
+  target: string
+  repoKey: string
+  number: number | null
+  /** Starts with `gh`; shown and run as is. */
+  argv: string[]
+  /** Sent through `--body-file -`; shown whole. */
+  stdin?: string
+  cwd?: string
+  env?: Record<string, string>
+  summary: string
+  isPublic: boolean
+  /** What looks like a secret, in the pane's words; a non-empty list relabels Confirm. */
+  secrets: string[]
+  warnings: string[]
+  notes: string[]
+  /** E15: the branch the link names, and the tip of the base branch when the card was made (E15-1). */
+  expect?: { branch?: string; base?: string; baseSha?: string }
+  createdAt: number
+  phase: 'confirm' | 'running'
+}
+
+/** F0: how a write went, drawn under its row (or its section, for a new issue) for two minutes. */
+export type WriteOutcome = { target: string; kind: WriteKind; ok: boolean; text: string; url?: string; at: number }
+
+/** E19: the inline editor under an opened row (one per pane); the typing itself lives in the module's drafts. */
+export type RowEditor = {
+  rowKey: string
+  kind: 'comment' | 'labels' | 'close'
+  add: string[]
+  remove: string[]
+  reason: CloseReason
+  /** The text the field is drawn with (a Cancel of the card, a close-out); undefined draws it empty. */
+  prefill?: string
+  /** The close editor's duplicate field, drawn with this. */
+  duplicateOf?: string
+  message?: string
+}
+
+/** E16: where a draft comes from. */
+export type DraftSource = 'conversation' | 'selection' | 'todo' | 'blank'
+
+/** E16: one TODO or FIXME line of the checkout. */
+export type Todo = { path: string; line: number; text: string; isTouched: boolean }
+
+/** E16: the new issue being drafted, the session's state only (never the store). */
+export type IssueDraft = {
+  id: string
+  repoKey: string
+  phase: 'choose' | 'drafting' | 'edit' | 'failed'
+  source: DraftSource | null
+  contextTokens: number | null
+  /** The owner's selection (at least 20 characters, at most 4,000), when there was one. */
+  selection: string | null
+  todo: Todo | null
+  /** The seeds the fields draw: the model's draft, or what Review committed. */
+  title: string
+  body: string
+  labels: string[]
+  assignMe: boolean
+  usage: RecapUsage | null
+  model: string
+  via: 'fork' | 'messages' | 'todo' | 'blank' | null
+  message?: string
+  createdAt: number
+  /** E16-2: the main loop's last turn ended more than five minutes before the form opened: the fork's cache has likely lapsed. */
+  isCacheCold?: true
+}
+
+/** E19/E16: a repository's labels, read once per session on demand. */
+export type RepoLabels = { at: number; labels: IssueLabel[]; error?: string }
+
 /** Which route started a desktop session, or that none did. */
 export type StartRoute = 'mcp' | 'tool' | 'none'
 
@@ -705,6 +806,22 @@ declare module 'claude-code' {
        * fork) or the brief was pasted: its first user message is another session's and never names its issue.
        */
       isCarried: boolean
+      /** F0: the pane's one confirmation card; null while none waits. */
+      pendingWrite: Shaped<PendingWrite | null>
+      /** F0: how the last writes went, by target, for two minutes. */
+      writeOutcomes: Shaped<Record<string, WriteOutcome>>
+      /** Batch 7: what a press is preparing (`link:<rowKey>`, `labels:<repoKey>`, `draft`); `{}` after a reload. */
+      busy: Record<string, boolean>
+      /** E19: the inline editor under an opened row; null while none is open. */
+      editor: Shaped<RowEditor | null>
+      /** E19/E16: each repository's labels, by repository key. */
+      repoLabels: Shaped<Record<string, RepoLabels>>
+      /** E19: the signed-in account per host, read on demand. */
+      viewer: Record<string, string>
+      /** E16: the new issue's form; null while none is open. */
+      draft: Shaped<IssueDraft | null>
+      /** E16: the checkout's TODO lines the form offers. */
+      todos: Shaped<Todo[]>
     }
   }
 }

@@ -122,19 +122,25 @@ export type LayoutInput = {
   asking: ReadonlySet<string>
   /** E20: the row whose start form is open beneath its actions line (it draws taller). */
   form?: string
+  /** Batch 7: the row whose inline editor, confirmation card or outcome line is drawn beneath its actions line. */
+  write?: string
 }
 
 export type RowTop = { key: string; sectionKey: string; row: IssueRow; top: number }
 
 /** E20: how many rows the start form adds beneath its row's actions line, about (its fields, captions and buttons). */
 export const FORM_ROWS = 14
+/** Batch 7: how many rows a row's editor or confirmation card adds beneath its actions line, about. */
+export const WRITE_ROWS = 10
+/** E16: how many rows the new issue's form adds above the sections, about (closed: none). */
+export const DRAFT_ROWS = 16
 
 /**
  * Rows above the sections beyond the title bar: the filter line, the filter panel, the settings panel (with E20's
  * guidance, E8's and E13's switches), and E13's question whether to file issue sessions in the sidebar.
  */
-export function headRows(hasFilterLine: boolean, isFilterOpen: boolean, isSettingsOpen: boolean, isSidebarAsking = false): number {
-  return (hasFilterLine ? 1 : 0) + (isFilterOpen ? 9 : 0) + (isSettingsOpen ? 24 : 0) + (isSidebarAsking ? 6 : 0)
+export function headRows(hasFilterLine: boolean, isFilterOpen: boolean, isSettingsOpen: boolean, isSidebarAsking = false, isDraftOpen = false): number {
+  return (hasFilterLine ? 1 : 0) + (isFilterOpen ? 9 : 0) + (isSettingsOpen ? 24 : 0) + (isSidebarAsking ? 6 : 0) + (isDraftOpen ? DRAFT_ROWS : 0)
 }
 
 /** How many lines `chars` characters take at `width`. */
@@ -164,7 +170,7 @@ export function rowTops(plan: DrawnPlan, layout: LayoutInput): RowTop[] {
         const text = recap !== undefined && recap.error === undefined ? recap.text.length : (layout.details[key]?.excerpt.length ?? 40)
         const hasSessionLine = layout.mappings[key] !== undefined || (layout.attempts?.[key]?.length ?? 0) > 0
         const hasForm = layout.form === key && layout.mappings[key] === undefined
-        const extra = (hasSessionLine ? 1 : 0) + (layout.opened === key ? 16 : 0) + (hasForm ? FORM_ROWS : 0)
+        const extra = (hasSessionLine ? 1 : 0) + (layout.opened === key ? 16 : 0) + (hasForm ? FORM_ROWS : 0) + (layout.write === key ? WRITE_ROWS : 0)
         top += 3 + lines(row.title.length + 6, width) + lines(text, width) + extra
       }
     }
@@ -211,6 +217,10 @@ export type PaneLike = Omit<DrawnInput, 'closedDays'> & {
   startForm?: { rowKey: string } | null
   /** E13: whether the question to file issue sessions in the sidebar is drawn above the sections. */
   isSidebarAsking?: boolean
+  /** E16: whether the new issue's form is drawn above the sections. */
+  isDraftOpen?: boolean
+  /** Batch 7: the row whose editor, confirmation card or outcome line is drawn beneath it. */
+  writeAt?: string
   isFilterOpen: boolean
   isSettingsOpen: boolean
   columns: number
@@ -221,13 +231,13 @@ export function paneLayout(pane: PaneLike): { plan: DrawnPlan; tops: RowTop[] } 
   const plan = drawnRowsOf({ ...pane, closedDays: pane.options.closedDays })
   const facet = pane.settings.boards === true ? pane.filter.board : ''
   const asking = new Set(pane.sections.filter(section => pane.options.recaps && section.info !== null && section.state.kind === 'ok' && pane.settings.consent[section.key] === undefined).map(section => section.key))
-  const head = headRows(!isDefaultFilter({ ...pane.filter, board: facet }), pane.isFilterOpen, pane.isSettingsOpen, pane.isSidebarAsking === true)
+  const head = headRows(!isDefaultFilter({ ...pane.filter, board: facet }), pane.isFilterOpen, pane.isSettingsOpen, pane.isSidebarAsking === true, pane.isDraftOpen === true)
   // E22-b (R5-INT-3): the drawn closed rows (the first of each expanded part, as the pane draws them) that keep a session.
   const done = pane.done ?? {}
   const closedSessions = Object.fromEntries(
     plan.sections.map(drawn => [drawn.section.key, (pane.closed[drawn.section.key]?.rows ?? []).slice(0, drawn.closed).filter(row => done[rowKeyOf(drawn.section.key, row.number)] !== undefined).length]),
   )
-  const tops = rowTops(plan, { columns: pane.columns, head, opened: pane.opened, recaps: pane.recaps, details: pane.details, mappings: pane.mappings, ...(pane.attempts === undefined ? {} : { attempts: pane.attempts }), closedSessions, asking, ...(pane.startForm === null || pane.startForm === undefined ? {} : { form: pane.startForm.rowKey }) })
+  const tops = rowTops(plan, { columns: pane.columns, head, opened: pane.opened, recaps: pane.recaps, details: pane.details, mappings: pane.mappings, ...(pane.attempts === undefined ? {} : { attempts: pane.attempts }), closedSessions, asking, ...(pane.startForm === null || pane.startForm === undefined ? {} : { form: pane.startForm.rowKey }), ...(pane.writeAt === undefined ? {} : { write: pane.writeAt }) })
 
   return { plan, tops }
 }

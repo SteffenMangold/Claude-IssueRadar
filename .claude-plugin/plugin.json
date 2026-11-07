@@ -73,6 +73,12 @@
       "title": "Issues in the prompt",
       "description": "Offer the open issues after # in the prompt box (terminal), and attach an open issue a prompt mentions (#123) to that prompt as context for Claude: title, recap, and the excerpt, text and latest comments the pane already holds. Never reads GitHub on Enter.",
       "default": true
+    },
+    "writes": {
+      "type": "boolean",
+      "title": "GitHub writes",
+      "description": "Show the buttons that comment, label, assign, close, link a session's branch and file new issues on GitHub; each write runs only after you confirm the exact gh command in the pane.",
+      "default": true
     }
   }
 }

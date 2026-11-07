@@ -7,7 +7,7 @@
 // mark would get the whole tree refused.
 import type { Elements, RenderElement, RenderSurface, Space } from 'claude-code'
 
-import type { Boards, ClosedCache, ClosedRow, DoneMapping, Facets, Filter, FilterGroup, FilterSort, ForkState, Glimpse, Inbox, InboxRow, IssueDetails, IssueRef, IssueRow, Mapping, Mark, Options, PhaseRecord, PrRecord, PreviousAttempt, Reactions, Recap, RepoSettings, RepoState, SeenRecord, Section, SessionLive, SessionPr, SidebarChoice, StartChoice, StartFacts, StartForm, StartRoute, Triage } from '../types'
+import type { Boards, ClosedCache, ClosedRow, DoneMapping, DraftSource, Facets, Filter, FilterGroup, FilterSort, ForkState, Glimpse, Inbox, InboxRow, IssueDetails, IssueDraft, IssueRef, IssueRow, Mapping, Mark, Options, PendingWrite, PhaseRecord, PrRecord, PreviousAttempt, Reactions, Recap, RepoLabels, RepoSettings, RepoState, RowEditor, SeenRecord, Section, SessionLive, SessionPr, SidebarChoice, StartChoice, StartFacts, StartForm, StartRoute, Todo, Triage, WriteOutcome } from '../types'
 import { BOARD_STATUS_CHARS, boardItemFor, boardOptions } from './boards'
 import { CLOSED_LOADING_MS, closedCountLabel, sinceDate } from './closed'
 import { ANY, GROUPS, SORTS, VIEWS, cutText, isBuiltInView, isDefaultFilter, matchesUrl, sanitizeQuery } from './filter'
@@ -22,6 +22,7 @@ import { clean, cleanLine } from './text'
 import { isOwnSession, rowBadge } from './tracking'
 import type { Badge, BadgeKind } from './tracking'
 import { labelSays } from './triage'
+import { OUTCOME_MS, canPush, canTriage, closeoutComment, closeoutOf, displayCommand } from './writes'
 
 export { rowKeyOf }
 
@@ -71,6 +72,18 @@ export type ViewState = {
   forkState: ForkState
   /** E13: whether issue sessions file themselves in the sidebar (asked once, installation-wide). */
   sidebar: SidebarChoice
+  /** Batch 7 (F0): the pane's one confirmation card and the outcome lines by target. */
+  pendingWrite: PendingWrite | null
+  writeOutcomes: Record<string, WriteOutcome>
+  /** What a press prepares (`link:<rowKey>`, `labels:<repoKey>`). */
+  busy: Record<string, boolean>
+  /** E19: the inline editor, the repositories' labels and the signed-in account per host. */
+  editor: RowEditor | null
+  repoLabels: Record<string, RepoLabels>
+  viewer: Record<string, string>
+  /** E16: the new issue's form and the TODO lines it offers. */
+  draft: IssueDraft | null
+  todos: Todo[]
   /** This session's ids (engine, and desktop once known): a mapping naming one is this very session. */
   ownIds: string[]
   /** This session's engine id: the pane that started a session may open it. */
@@ -154,6 +167,29 @@ export type ViewActions = {
   toggleBeside: () => void
   /** E13: the owner's answer to the sidebar question, or the ⚙ switch. */
   sidebarChoice: (value: boolean) => void
+  /** Batch 7 (F0): the card's Confirm and Cancel, each for the card it was drawn with. */
+  confirmWrite: (id: string) => void
+  cancelWrite: (id: string) => void
+  /** E19: the write bar, the editor (its typing is a draft, Enter or Prüfen reviews), the close-out. */
+  openEditor: (rowKey: string, kind: RowEditor['kind']) => void
+  closeEditor: () => void
+  typeEditor: (rowKey: string, field: 'comment' | 'closeComment' | 'duplicateOf', value: string) => void
+  reviewEditor: (rowKey: string, field?: 'comment' | 'closeComment' | 'duplicateOf', value?: string) => void
+  editLabel: (rowKey: string, name: string, isAdd: boolean) => void
+  pickReason: (rowKey: string, value: string) => void
+  assignMe: (rowKey: string) => void
+  closeout: (rowKey: string, comment: string) => void
+  /** E15: ⎇ Branch verknüpfen. */
+  linkBranch: (rowKey: string) => void
+  /** E16: `+`, a source, the fields (typing is a draft), Prüfen, Verwerfen, the target, the labels and the assignment. */
+  newIssue: () => void
+  draftFrom: (source: DraftSource, todo?: Todo) => void
+  typeDraft: (id: string, field: 'title' | 'body', value: string) => void
+  reviewDraft: (typed?: { id: string; value: string }) => void
+  discardDraft: () => void
+  draftRepo: (repoKey: string) => void
+  draftLabel: (name: string, isAdd: boolean) => void
+  draftAssign: () => void
 }
 
 /** Text colors: the theme's own keys, so the pane follows the app's light or dark mode. */
@@ -328,9 +364,14 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const boardFacet = settings.boards === true ? state.filter.board : ''
   // E13: the sidebar question, asked once for the installation, on the desktop, once an issue has a session.
   const isSidebarAsking = state.surface === 'desktop' && state.sidebar === 'unasked' && Object.keys(state.mappings).length > 0
+  // Batch 7: the write controls exist where Input and Select do (X-7 (c): mobile has neither) and while `writes` is on.
+  const canWrite = options.writes && (state.surface === 'desktop' || state.surface === 'terminal') && Input !== undefined && Select !== undefined
+  const cardRow = state.pendingWrite !== null && !state.pendingWrite.target.startsWith('create:') ? state.pendingWrite.target : undefined
+  const writeAt = options.writes ? (state.editor?.rowKey ?? cardRow) : undefined
   // The rows drawn, in order, within the row budget, and where each sits: the one rule a look (E5) and the cards (E4)
-  // read too, so they always agree with the drawing (the question above the sections counts, R6-INT-4).
-  const { plan, tops } = paneLayout({ ...state, isSidebarAsking })
+  // read too, so they always agree with the drawing (the question above the sections counts, R6-INT-4; so do the new
+  // issue's form and a row's editor or card).
+  const { plan, tops } = paneLayout({ ...state, isSidebarAsking, isDraftOpen: options.writes && state.draft !== null, ...(writeAt === undefined ? {} : { writeAt }) })
   const planOf = new Map(plan.sections.map(drawn => [drawn.section.key, drawn]))
   /** E14-5: a section listed for another filter than the current one is drawn as loading until its own list comes. */
   const isStale = (section: Section) => planOf.get(section.key)?.isStale ?? false
@@ -419,6 +460,230 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
 
   const hairline = () => (isRich ? <Box height={0.07} backgroundColor={tint(HUE.gray, 0.3)} /> : null)
 
+  // Batch 7: the write path ---------------------------------------------------------
+
+  /** `owner/name` of a repository key. */
+  const repoOfKeyView = (key: string): string => key.split('/').slice(1).join('/')
+  /** The section of the checkout: E15 links branches to it. */
+  const checkoutInfo = state.sections.find(section => section.isCheckout)?.info ?? null
+  const loginOf = (section: Section): string | undefined => (section.info === null ? undefined : state.viewer[section.info.host])
+  const isSameName = (a: string, b: string | undefined): boolean => b !== undefined && a.toLowerCase() === b.toLowerCase()
+  /** E19: who may close: TRIAGE or more, or the issue's author (an unknown role counts as allowed). */
+  const mayClose = (section: Section, item: IssueRow): boolean => canTriage(section.info) || isSameName(item.author, loginOf(section))
+  /** An Input's seed: drawn with it only when there is one (a Cancel of the card, a close-out, a draft). */
+  const seed = (text: string | undefined): { value?: string } => (text === undefined ? {} : { value: clean(text) })
+  /** The repositories a new issue may go to: those that list (no filter, not archived). */
+  const draftTargets = state.sections.filter(section => section.info !== null && section.state.kind === 'ok' && section.query === undefined && !section.info.isArchived)
+  const canDraft = canWrite && draftTargets.length > 0
+
+  /** F0's outcome line under its row (or its section, for a new issue), for two minutes. */
+  const outcomeLine = (target: string) => {
+    const outcome = state.writeOutcomes[target]
+    if (outcome === undefined || state.now - outcome.at >= OUTCOME_MS) return null
+
+    return (
+      <Box key={`outcome:${target}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} paddingX={step('sm', 1)}>
+        <Box flexShrink={1} minWidth={0}>
+          <Text size="caption" color={outcome.ok ? INK.success : INK.error} wrap="wrap">
+            {`${outcome.ok ? '✓' : '✗'} ${clean(outcome.text)}`}
+          </Text>
+        </Box>
+        {outcome.url !== undefined && outcome.url.startsWith('https://') && <Link href={clean(outcome.url)} label={S.github} />}
+      </Box>
+    )
+  }
+
+  /**
+   * F0's card: the summary, the exact command, the text it sends in full, its notes and warnings (a public repository,
+   * what looks like a secret), Confirm and Cancel, both for this card's id. Confirm says when it runs.
+   */
+  const confirmCard = (card: PendingWrite) => {
+    const isRunning = card.phase === 'running'
+    const stdin = card.stdin === undefined ? null : clean(card.stdin)
+
+    return (
+      <Box
+        key="write-card"
+        flexDirection="column"
+        rowGap={step('xs', 0)}
+        paddingX={step('sm', 1)}
+        paddingY={step('xs', 0)}
+        borderStyle="round"
+        borderColor={isRich ? tint(HUE.amber, 0.55) : INK.warning}
+        backgroundColor={wash(HUE.amber, 0.07)}
+      >
+        <Text size="footnote" weight="semibold" wrap="wrap">
+          {clean(card.summary)}
+        </Text>
+        <Code source={displayCommand(card.argv)} language="bash" />
+        {stdin !== null && note(S.writeStdin(card.stdin?.length ?? 0), INK.secondary)}
+        {stdin !== null && stdin !== '' && (
+          <Box key="write-stdin" flexDirection="column">
+            <Text size="caption" wrap="wrap">
+              {stdin}
+            </Text>
+          </Box>
+        )}
+        {card.notes.map(text => note(clean(text), INK.secondary))}
+        {card.warnings.map(text => note(clean(text), INK.warning))}
+        {card.isPublic && note(S.writePublic(clean(repoOfKeyView(card.repoKey))), INK.warning)}
+        {card.secrets.length > 0 && note(S.writeSecret(card.secrets.join(', ')), INK.error)}
+        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
+          <Button
+            key="confirm-write"
+            variant="primary"
+            dimColor={isRunning}
+            label={isRunning ? S.writeRunning : card.secrets.length > 0 ? S.writeConfirmAnyway : S.writeConfirm}
+            onPress={() => {
+              if (!isRunning) actions.confirmWrite(card.id)
+            }}
+          />
+          {!isRunning && <Button key="cancel-write" plain label={S.writeCancel} onPress={() => actions.cancelWrite(card.id)} />}
+        </Box>
+      </Box>
+    )
+  }
+
+  /** E19's write bar, last in the opened row: comment always; labels, assignment and close by role (close also for the author). */
+  const writeBar = (section: Section, item: IssueRow) => {
+    const key = rowKeyOf(section.key, item.number)
+    const login = loginOf(section)
+    const isAssigned = login !== undefined && item.assignees.some(name => isSameName(name, login))
+    const mayTriage = canTriage(section.info)
+
+    return (
+      <Box key={`write-bar:${key}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
+        <Button key={`act-comment:${key}`} plain label={S.actComment} onPress={() => actions.openEditor(key, 'comment')} />
+        {mayTriage && <Button key={`act-labels:${key}`} plain label={S.actLabels} onPress={() => actions.openEditor(key, 'labels')} />}
+        {mayTriage && <Button key={`act-assign:${key}`} plain label={isAssigned ? S.actUnassign : S.actAssign} onPress={() => actions.assignMe(key)} />}
+        {mayClose(section, item) && <Button key={`act-close:${key}`} plain label={S.actClose} onPress={() => actions.openEditor(key, 'close')} />}
+      </Box>
+    )
+  }
+
+  /** E19's editor under its row: a comment, the labels, or the close with its reason; no field draws a value but its seed. */
+  const editorBlock = (section: Section, item: IssueRow, open: RowEditor) => {
+    const key = rowKeyOf(section.key, item.number)
+    const parts: RenderElement[] = []
+    if (open.kind === 'comment' && Input !== undefined) {
+      parts.push(
+        <Input
+          key={`cmt:${key}`}
+          rows={isRich ? 4 : 3}
+          placeholder={S.commentHint}
+          submitLabel={S.review}
+          {...seed(open.prefill)}
+          onInput={value => actions.typeEditor(key, 'comment', value)}
+          onSubmit={value => actions.reviewEditor(key, 'comment', value)}
+        />,
+      )
+      parts.push(note(S.newLineHint, INK.muted))
+    }
+    if (open.kind === 'labels') {
+      const names = [...item.labels.map(label => label.name).filter(name => !open.remove.includes(name)), ...open.add]
+      const known = state.repoLabels[section.key]
+      parts.push(
+        <Box key={`lbl-chips:${key}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} rowGap={step('xs', 0)}>
+          {names.map(name => (
+            <Button key={`lbl-x:${key}:${name}`} plain label={`${pillText(clean(name))} ✕`} onPress={() => actions.editLabel(key, name, false)} />
+          ))}
+        </Box>,
+      )
+      if (state.busy[`labels:${section.key}`] === true) parts.push(note(S.labelsLoading, INK.muted))
+      else if (known?.error !== undefined) parts.push(note(S.labelsFailed(clean(known.error)), INK.warning))
+      const offered = (known?.labels ?? []).map(label => clean(label.name)).filter((name, index, all) => name !== '' && !names.includes(name) && all.indexOf(name) === index)
+      if (Select !== undefined && offered.length > 0) {
+        parts.push(
+          <Select
+            key={`lbl-add:${key}`}
+            options={[{ value: '', label: S.labelAdd }, ...offered.map(name => ({ value: name, label: cutText(name, 40) }))]}
+            value=""
+            onSelect={value => {
+              if (value !== '') actions.editLabel(key, value, true)
+            }}
+          />,
+        )
+      }
+    }
+    if (open.kind === 'close') {
+      if (Select !== undefined) {
+        parts.push(
+          <Select
+            key={`close-reason:${key}`}
+            label={S.closeReason}
+            options={[
+              { value: 'completed', label: S.reasonCompleted },
+              { value: 'not planned', label: S.reasonNotPlanned },
+              { value: 'duplicate', label: S.reasonDuplicate },
+            ]}
+            value={open.reason}
+            onSelect={value => actions.pickReason(key, value)}
+          />,
+        )
+      }
+      if (open.reason === 'duplicate' && Input !== undefined) {
+        parts.push(
+          <Input
+            key={`close-dup:${key}`}
+            placeholder={S.duplicateHint}
+            submitLabel={S.review}
+            {...seed(open.duplicateOf)}
+            onInput={value => actions.typeEditor(key, 'duplicateOf', value)}
+            onSubmit={value => actions.reviewEditor(key, 'duplicateOf', value)}
+          />,
+        )
+      }
+      if (Input !== undefined) {
+        parts.push(
+          <Input
+            key={`close-cmt:${key}`}
+            rows={2}
+            placeholder={S.closeCommentHint}
+            submitLabel={S.review}
+            {...seed(open.prefill)}
+            onInput={value => actions.typeEditor(key, 'closeComment', value)}
+            onSubmit={value => actions.reviewEditor(key, 'closeComment', value)}
+          />,
+        )
+      }
+    }
+    if (open.message !== undefined) parts.push(note(clean(open.message), INK.warning))
+
+    return (
+      <Box
+        key={`editor:${key}`}
+        flexDirection="column"
+        rowGap={step('xs', 0)}
+        paddingX={step('sm', 1)}
+        paddingY={step('xs', 0)}
+        borderStyle="round"
+        borderColor={isRich ? tint(HUE.blue, 0.4) : INK.accent}
+        backgroundColor={wash(HUE.blue, 0.04)}
+      >
+        {parts}
+        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
+          <Button key={`editor-review:${key}`} label={S.review} variant="primary" onPress={() => actions.reviewEditor(key)} />
+          <Button key={`editor-cancel:${key}`} plain label={S.writeCancel} onPress={actions.closeEditor} />
+        </Box>
+      </Box>
+    )
+  }
+
+  /** Beneath a row's actions line: the write bar (opened row), the editor, the card, the outcome line. */
+  const writeTail = (section: Section, item: IssueRow): RenderElement[] => {
+    if (!options.writes) return []
+    const key = rowKeyOf(section.key, item.number)
+    const card = state.pendingWrite !== null && state.pendingWrite.target === key ? state.pendingWrite : null
+    const parts: RenderElement[] = []
+    if (canWrite && state.opened === key && section.info !== null) parts.push(writeBar(section, item))
+    if (canWrite && card === null && state.editor !== null && state.editor.rowKey === key) parts.push(editorBlock(section, item, state.editor))
+    if (card !== null) parts.push(confirmCard(card))
+    const line = outcomeLine(key)
+    if (line !== null) parts.push(line)
+
+    return parts
+  }
+
   // Title bar ------------------------------------------------------------
   const titleBar = (
     <Box flexDirection="row" alignItems="center" paddingX={step('xs', 0)} paddingY={step('xs', 0)}>
@@ -438,6 +703,8 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       <Box flexDirection="row" alignItems="center" columnGap={step('xs', 1)}>
         {tool('refresh', state.isRefreshing ? '…' : '↻', S.refresh, actions.refresh)}
         {tool('filter', '⌕', S.filter, actions.toggleFilter)}
+        {/* E16: a new issue, while writes are on and a repository lists (plan 4.6). */}
+        {canDraft && tool('new-issue', '+', S.newIssue, actions.newIssue)}
         {tool('settings', '⚙', S.settings, actions.toggleSettings)}
         {tool('close', '✕', S.close, actions.close)}
       </Box>
@@ -717,6 +984,133 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     </Box>
   ) : null
 
+  /**
+   * E16's form above the sections: the target, the sources (this chat with its size, the selection, a TODO, blank) and
+   * what they send; then the fields (seeded with the draft, the typing a draft of the module's), the labels and the
+   * assignment where the role allows them, what the draft cost; Prüfen opens the card in place of the fields.
+   */
+  const draftForm = (() => {
+    const open = state.draft
+    if (open === null || !canWrite) return null
+    const target = draftTargets.find(section => section.key === open.repoKey)
+    const info = target?.info ?? null
+    const mayTriage = canTriage(info)
+    const card = state.pendingWrite !== null && state.pendingWrite.target === `create:${open.repoKey}` ? state.pendingWrite : null
+    const consented = options.recaps && settings.consent[open.repoKey] === true
+    const parts: RenderElement[] = []
+    if (draftTargets.length > 1 && open.phase !== 'drafting' && card === null) {
+      parts.push(picker('draft-repo', S.draftTarget, draftTargets.map(section => ({ value: section.key, label: labelOf(section) })), open.repoKey, value => actions.draftRepo(value)))
+    } else {
+      parts.push(
+        <Text size="caption" color={INK.secondary} wrap="truncate-end">
+          {`${S.draftTarget}: ${target === undefined ? clean(repoOfKeyView(open.repoKey)) : labelOf(target)}`}
+        </Text>,
+      )
+    }
+    if (open.phase === 'choose') {
+      const size = open.contextTokens === null ? '' : fmtK(open.contextTokens)
+      parts.push(
+        <Box key="draft-sources" flexDirection="column" rowGap={step('xs', 0)}>
+          <Button key="draft-src-chat" plain label={`${S.draftFromChat(size)}${open.isCacheCold === true ? ` · ${S.draftCacheCold}` : ''}`} onPress={() => actions.draftFrom('conversation')} />
+          {open.selection !== null && <Button key="draft-src-selection" plain label={S.draftFromSelection} onPress={() => actions.draftFrom('selection')} />}
+          <Button key="draft-src-todo" plain label={S.draftFromTodo} onPress={() => actions.draftFrom('todo')} />
+          <Button key="draft-src-blank" plain label={S.draftBlank} onPress={() => actions.draftFrom('blank')} />
+        </Box>,
+      )
+      parts.push(note(S.draftSendsChat, INK.muted))
+      if (!consented) parts.push(note(S.draftNoTitles, INK.muted))
+      if (state.todos.length > 0 && Select !== undefined) {
+        parts.push(
+          <Select
+            key="draft-todo"
+            options={[{ value: '', label: S.todoPick }, ...state.todos.map((todo, index) => ({ value: String(index), label: cut(cleanLine(`${todo.path}:${todo.line} ${todo.text}`), 60) }))]}
+            value=""
+            onSelect={value => {
+              const todo = state.todos[Number(value)]
+              if (value !== '' && todo !== undefined) actions.draftFrom('todo', todo)
+            }}
+          />,
+        )
+        parts.push(note(S.draftTodoNote(clean(options.recapModel)), INK.muted))
+      }
+    }
+    if (open.phase === 'drafting') parts.push(note(S.drafting, INK.muted))
+    if (open.phase === 'edit' && card !== null) parts.push(confirmCard(card))
+    if (open.phase === 'edit' && card === null && Input !== undefined) {
+      parts.push(<Input key="draft-title" label={S.draftTitleHint} value={clean(open.title)} submitLabel={S.formNoteKeep} onInput={value => actions.typeDraft(open.id, 'title', value)} onSubmit={value => actions.typeDraft(open.id, 'title', value)} />)
+      parts.push(
+        <Input
+          key="draft-body"
+          rows={isRich ? 6 : 4}
+          placeholder={S.draftBodyHint}
+          value={clean(open.body)}
+          submitLabel={S.review}
+          onInput={value => actions.typeDraft(open.id, 'body', value)}
+          onSubmit={value => actions.reviewDraft({ id: open.id, value })}
+        />,
+      )
+      parts.push(note(S.newLineHint, INK.muted))
+      if (mayTriage) {
+        const offered = (state.repoLabels[open.repoKey]?.labels ?? []).map(label => clean(label.name)).filter((name, index, all) => name !== '' && !open.labels.includes(name) && all.indexOf(name) === index)
+        parts.push(
+          <Box key="draft-labels" flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} rowGap={step('xs', 0)}>
+            {open.labels.map(name => (
+              <Button key={`draft-label-x:${name}`} plain label={`${pillText(clean(name))} ✕`} onPress={() => actions.draftLabel(name, false)} />
+            ))}
+            {Select !== undefined && offered.length > 0 && (
+              <Select
+                key="draft-label-add"
+                options={[{ value: '', label: S.labelAdd }, ...offered.map(name => ({ value: name, label: cutText(name, 40) }))]}
+                value=""
+                onSelect={value => {
+                  if (value !== '') actions.draftLabel(value, true)
+                }}
+              />
+            )}
+          </Box>,
+        )
+        parts.push(<Button key="draft-assign" plain label={S.draftAssign(open.assignMe)} onPress={actions.draftAssign} />)
+      }
+      const usage = open.usage
+      if (open.via === 'fork' && usage !== null) {
+        const total = usage.input_tokens + usage.output_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+        parts.push(note(S.draftCost(fmtK(total), fmtK(usage.cache_read_input_tokens), clean(open.model)), INK.muted))
+      } else if (open.via === 'messages') parts.push(note(S.draftFromMessages, INK.muted))
+      else if (open.via === 'todo' && open.todo !== null) parts.push(note(S.todoSource(clean(`${open.todo.path}:${open.todo.line}`)), INK.muted))
+    }
+    if (open.message !== undefined) parts.push(note(clean(open.message), INK.warning))
+    const canRedo = open.source !== null && open.source !== 'blank'
+    const redo = () => actions.draftFrom(open.source ?? 'blank', open.todo ?? undefined)
+
+    return (
+      <Box
+        key="draft-form"
+        flexDirection="column"
+        rowGap={step('xs', 0)}
+        marginX={step('sm', 0)}
+        marginY={step('xs', 0)}
+        paddingX={step('md', 1)}
+        paddingY={step('sm', 0)}
+        borderStyle="round"
+        borderColor={isRich ? tint(HUE.blue, 0.45) : INK.accent}
+        backgroundColor={wash(HUE.blue, 0.06)}
+      >
+        <Text size="footnote" weight="semibold">
+          {S.newIssue}
+        </Text>
+        {parts}
+        {card === null && (
+          <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
+            {open.phase === 'edit' && <Button key="draft-review" label={S.review} variant="primary" onPress={() => actions.reviewDraft()} />}
+            {(open.phase === 'edit' || open.phase === 'failed') && canRedo && <Button key="draft-redo" plain label={S.draftRedo} onPress={redo} />}
+            {open.phase === 'failed' && <Button key="draft-src-blank" plain label={S.draftBlank} onPress={() => actions.draftFrom('blank')} />}
+            <Button key="draft-discard" plain label={S.draftDiscard} onPress={actions.discardDraft} />
+          </Box>
+        )}
+      </Box>
+    )
+  })()
+
   // States ---------------------------------------------------------------
   const stateBlock = (section: Section) => {
     const { kind } = section.state
@@ -974,7 +1368,9 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const statusStrip = (section: Section, item: IssueRow, details: IssueDetails | undefined) => {
     const { key, session, sectionRepo, links, total } = prsOf(section, item, details)
     const live = links.filter(pr => pr.state !== 'CLOSED')
-    if (live.length === 0) return null
+    // E19: a merged pull request on a still open issue offers the close-out after the chips (never closes on its own).
+    const closeout = canWrite && section.info !== null && mayClose(section, item) ? closeoutOf(links, item, section.info.defaultBranch, state.now) : null
+    if (live.length === 0 && closeout === null) return null
     const drawn = live.slice(0, PR_CHIPS)
     const more = Math.max(0, total - drawn.length)
 
@@ -996,6 +1392,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             +{more}
           </Text>
         )}
+        {closeout !== null && <Button key={`closeout:${key}`} plain label={S.closeoutAction} onPress={() => actions.closeout(key, closeoutComment(sectionRepo, closeout))} />}
       </Box>
     )
   }
@@ -1278,6 +1675,23 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     const link = live !== undefined && live.sessionId === mapping.sessionId && live.link !== null && live.link.startsWith('https://') && mapping.startedFrom !== state.myId ? live.link : null
     const facts = [agoOf(badge?.since ?? mapping.startedAt), ...(mapping.detached ? [] : [S.sessionLinked])].join(' · ')
     const isAsking = state.freshAsk === key && (badge?.kind === 'archived' || badge?.kind === 'gone')
+    // E15: the session's branch, linked on GitHub by the pane that started it, on the desktop, once the branch is known
+    // (the app named it, or the slug of an own worktree finds it) and while GitHub does not have it yet (E15-1).
+    const isBranchKnown = (live !== undefined && live.sessionId === mapping.sessionId && live.branch !== null && live.branch !== '') || (mapping.branch !== undefined && (mapping.place ?? 'worktree') === 'worktree')
+    const offerLink =
+      options.writes &&
+      state.surface === 'desktop' &&
+      mapping.startedFrom === state.myId &&
+      !isOwnSession(mapping, state.ownIds) &&
+      mapping.linkedBranch === undefined &&
+      mapping.branchOnRemote !== true &&
+      badge?.kind !== 'gone' &&
+      badge?.kind !== 'archived' &&
+      checkoutInfo !== null &&
+      section.info !== null &&
+      section.info.host === checkoutInfo.host &&
+      canPush(checkoutInfo) &&
+      isBranchKnown
 
     return (
       <Box key={`session-row:${key}`} flexDirection="column" rowGap={step('xs', 0)}>
@@ -1293,6 +1707,12 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             </Text>
           </Box>
           {link !== null && <Link href={clean(link)} label={S.sessionLink} />}
+          {mapping.linkedBranch !== undefined && (
+            <Box key={`linked:${key}`} flexShrink={0}>
+              {pill(S.linkedMark, INK.success, HUE.green, true)}
+            </Box>
+          )}
+          {offerLink && <Button key={`act-link:${key}`} plain label={state.busy[`link:${key}`] === true ? '…' : S.actLink} onPress={() => actions.linkBranch(key)} />}
           {badge?.kind === 'archived' && !isAsking && <Button key={`fresh:${key}`} plain dimColor label={S.startAfresh} onPress={() => actions.askFresh(key)} />}
         </Box>
         {isAsking && (
@@ -1502,6 +1922,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           )}
         </Box>
         {form !== null && formBlock(section, item, form)}
+        {writeTail(section, item)}
       </Box>
     )
   }
@@ -1721,10 +2142,13 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         )}
       </Box>
     )
+    // E16: a new issue's outcome under its repository's header.
+    const created = options.writes ? outcomeLine(`create:${section.key}`) : null
     if (isCollapsed) {
       return (
         <Box key={`sec:${section.key}`} flexDirection="column">
           {header}
+          {created}
         </Box>
       )
     }
@@ -1733,6 +2157,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     return (
       <Box key={`sec:${section.key}`} flexDirection="column" rowGap={step('xs', 0)}>
         {header}
+        {created}
         {isLoading ? <Box paddingX={step('sm', 1)}>{note(S.loading(label), INK.muted)}</Box> : stateBlock(section)}
         {consentBlock(section)}
         {listed.length > 0 && shown.length === 0 && <Box paddingX={step('sm', 1)}>{note(S.emptyFiltered(label), INK.muted)}</Box>}
@@ -1884,6 +2309,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       {filterPanel}
       {settingsPanel}
       {sidebarAsk}
+      {draftForm}
       <Box flexDirection="column" flexGrow={1} paddingY={step('sm', 0)} rowGap={step('sm', 0)}>
         {state.sections.length === 0 ? (
           <Box paddingX={step('sm', 1)}>

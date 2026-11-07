@@ -40,6 +40,9 @@ export type ShownPr = {
   checks: PrChecks | null
   /** The pull request the app binds to this issue's session. */
   fromSession: boolean
+  /** E19-2: when it merged and into which branch, where GraphQL said. */
+  mergedAt?: string
+  base?: string
 }
 
 export function asReview(value: unknown): PrReview | null {
@@ -72,7 +75,11 @@ export function parsePrConnection(value: unknown): PrLinks {
     const head = nodesOf(node['commits'])[0]
     const commit = isRecord(head) ? head['commit'] : undefined
     const rollup = isRecord(commit) ? commit['statusCheckRollup'] : undefined
-    links.push({ number, url, repo, state: state as PrState, isDraft: node['isDraft'] === true, review: asReview(node['reviewDecision']), checks: isRecord(rollup) ? asChecks(rollup['state']) : null })
+    const link: PrLink = { number, url, repo, state: state as PrState, isDraft: node['isDraft'] === true, review: asReview(node['reviewDecision']), checks: isRecord(rollup) ? asChecks(rollup['state']) : null }
+    // E19-2: a merged one's time and base branch, so the close-out waits while GitHub closes the issue itself.
+    if (link.state === 'MERGED' && typeof node['mergedAt'] === 'string') link.mergedAt = node['mergedAt']
+    if (link.state === 'MERGED' && typeof node['baseRefName'] === 'string') link.base = node['baseRefName']
+    links.push(link)
   }
   const counted = countOf(isRecord(value) ? value['totalCount'] : undefined) ?? 0
 
@@ -123,7 +130,11 @@ function asLink(value: unknown): PrLink | null {
   const state = asString(value['state']).toUpperCase()
   if (!Number.isInteger(number) || number <= 0 || !STATES.includes(state)) return null
 
-  return { number, url: asString(value['url']), repo: asString(value['repo']), state: state as PrState, isDraft: value['isDraft'] === true, review: asReview(value['review']), checks: asChecks(value['checks']) }
+  const link: PrLink = { number, url: asString(value['url']), repo: asString(value['repo']), state: state as PrState, isDraft: value['isDraft'] === true, review: asReview(value['review']), checks: asChecks(value['checks']) }
+  if (typeof value['mergedAt'] === 'string') link.mergedAt = value['mergedAt']
+  if (typeof value['base'] === 'string') link.base = value['base']
+
+  return link
 }
 
 /** A stored record as the mod can use it, every link checked (the drawing trusts it); anything else is none. */

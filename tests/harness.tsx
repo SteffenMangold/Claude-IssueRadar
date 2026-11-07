@@ -3,7 +3,7 @@
 // plugin (the first registration of an event answers it); `project` records
 // what the plugin asked of them, so tests assert on keys and argv, not on
 // incidental text.
-import type { PromptAutocompleteSuggestion, PromptSubmitInput, RegisteredToolSpec, RenderSurface, UiOpenResult } from 'claude-code'
+import type { ModelForkResult, ProcessRunInit, PromptAutocompleteSuggestion, PromptSubmitInput, RegisteredToolSpec, RenderSurface, UiOpenResult } from 'claude-code'
 import { mock } from 'claude-code/testing'
 import type { MockClock, TestBody } from 'claude-code/testing'
 
@@ -179,7 +179,7 @@ export type Setup = {
   /** The text the model answers a `$.model.complete` with, per request; the default is V1's plain German recap. */
   model?: (request: { prompt: string; system: string }) => string
   /** The main conversation's messages `$.session.messages()` answers until `setMessages` changes them; none by default. */
-  messages?: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>
+  messages?: ReadonlyArray<Message>
   /**
    * Answers a git call by its argv (without the leading `git`); undefined, or no `git`, answers as a plain checkout
    * on main (`git rev-parse`: the branch, the git dir and the common dir alike; `git status`: clean).
@@ -189,7 +189,16 @@ export type Setup = {
   sessionModel?: string
   /** The context window's input tokens `$.session.usage()` reports; absent by default (before the first response). */
   contextTokens?: number
+  /** What `$.model.fork` answers its prompt with (batch 7, E16); the default has nothing to fork. */
+  fork?: (prompt: string) => ModelForkResult
+  /** The owner's selection `$.ui.selection()` answers; none by default. */
+  selection?: string
+  /** What `$.fs.read` answers for a path (undefined: a file that is not there); the default answers the manifest for any path. */
+  files?: (path: string) => string | undefined
 }
+
+/** One row of the main conversation, as `$.session.messages()` answers it; its tool calls are none unless given. */
+export type Message = { role: 'user' | 'assistant'; text: string; toolUses?: ReadonlyArray<{ tool: string; input: Record<string, unknown> }> }
 
 /** `git rev-parse --abbrev-ref HEAD --path-format=absolute --git-dir --git-common-dir` in a plain checkout on `branch`. */
 export function plainCheckout(branch = 'main'): Ran {
@@ -215,6 +224,12 @@ export type Project = {
   filled: string[]
   /** Every `$.process.run` argv, in order. */
   argv: string[][]
+  /** Every `$.process.run` with what it was given (folder, variables, standard input), in order (batch 7's writes). */
+  runs: Array<{ argv: string[]; init: ProcessRunInit | undefined }>
+  /** The prompt of every `$.model.fork`, in order (E16). */
+  forks: string[]
+  /** The model every `$.model.complete` named, in order. */
+  models: string[]
   /** Every toast's text, in order. */
   toasts: string[]
   /** Every typed `$.tool.call` input that reached beneath the plugin. */
@@ -245,7 +260,7 @@ export type Project = {
   /** Every `$.ui.status` text, in order (undefined: the line was cleared). */
   statuses: Array<string | undefined>
   /** Sets what `$.session.messages()` answers (the main conversation's rows). */
-  setMessages: (messages: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>) => void
+  setMessages: (messages: ReadonlyArray<Message>) => void
 }
 
 /**
@@ -262,6 +277,9 @@ export function project(on: On, setup: Setup = {}): Project {
   const closed: string[] = []
   const filled: string[] = []
   const argv: string[][] = []
+  const runs: Array<{ argv: string[]; init: ProcessRunInit | undefined }> = []
+  const forks: string[] = []
+  const models: string[] = []
   const toasts: string[] = []
   const toolCalls: Record<string, unknown>[] = []
   const checks: Array<{ tool: string; input: unknown }> = []
@@ -342,14 +360,25 @@ export function project(on: On, setup: Setup = {}): Project {
   // The engine's own turn handling beneath the plugin (E12): a test raises turns with $.turn.start / $.turn.complete.
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
-  on('session.messages', () => ({ value: messages.map(message => ({ role: message.role, text: message.text, toolUses: [] })) }))
+  on('session.messages', () => ({ value: messages.map(message => ({ role: message.role, text: message.text, toolUses: (message.toolUses ?? []).map((use, index) => ({ tool_use_id: `t${index}`, tool: use.tool, input: use.input })) })) }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('session.root', () => ({ value: 'D:\\proj' }))
   on('session.id', () => ({ value: sessionId }))
   on('session.repo', () => ({ value: { root: 'D:\\proj', remote: setup.remote ?? 'https://github.com/acme/widgets', internal: false, name: null } }))
   on('session.surfaces', () => ({ value: setup.surfaces ?? ['desktop'] }))
-  on('fs.read', () => ({ value: '{ "name": "issue-radar", "version": "9.9.9" }' }))
+  on('fs.read', (_, e) => {
+    if (setup.files === undefined) return { value: '{ "name": "issue-radar", "version": "9.9.9" }' }
+    const text = setup.files(e.path)
+
+    return text === undefined ? { deny: `no such file: ${e.path}` } : { value: text }
+  })
+  on('model.fork', (_, e) => {
+    forks.push(e.prompt)
+
+    return { value: setup.fork === undefined ? { isAnswered: false, reason: 'nothing-to-fork' } : setup.fork(e.prompt) }
+  })
+  on('ui.selection', () => ({ value: setup.selection === undefined ? undefined : { text: setup.selection } }))
   on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
   on('prompt.submit', (_, e) => {
     submitted.push(e)
@@ -377,6 +406,7 @@ export function project(on: On, setup: Setup = {}): Project {
   on('process.run', async (_, e) => {
     const call = [...e.argv]
     argv.push(call)
+    runs.push({ argv: call, init: e.init })
     if (call[0] === 'git') {
       const own = setup.git?.(call.slice(1))
       if (own !== undefined) return own
@@ -393,6 +423,7 @@ export function project(on: On, setup: Setup = {}): Project {
     return ran('')
   })
   on('model.complete', (_, e) => {
+    models.push(e.model)
     prompts.push(e.prompt)
     systems.push(e.system ?? '')
     const text = setup.model === undefined ? PLAIN_RECAP : setup.model({ prompt: e.prompt, system: e.system ?? '' })
@@ -433,6 +464,9 @@ export function project(on: On, setup: Setup = {}): Project {
     titles,
     filled,
     argv,
+    runs,
+    forks,
+    models,
     toasts,
     toolCalls,
     checks,
