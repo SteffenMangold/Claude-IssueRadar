@@ -249,13 +249,15 @@ need; in a linked worktree `git rev-parse --git-dir` differs from `--git-common-
   throws naming its event [d.ts]. A UI test mounts the pane on a surface it names (`terminal`,
   `desktop`, `mobile`) and acts by key [d.ts].
 - **Time**: a test fails once it outlasts 5,000 ms, wall clock, unless `test(name,
-  { timeoutMs }, body)` gives it more [d.ts]; Issue Radar keeps the default. The kit compiles
+  { timeoutMs }, body)` gives it more [d.ts]. Issue Radar's harness exports a `test` that
+  gives each test 20 s (a test's own options still win), and every test file uses it. The kit compiles
   the plugin's hooks graph again for every test (0.3–0.6 s alone, up to 1.4 s for a file's
   first tests) and runs several files at once (eight on the owner's machine), so that load
   counts against each test's limit. The full suite, 402 tests in 11 files, took 104.5 s on
   2026-11-07 and 99 to 144 s in the three runs before; under load, or with two runs at once,
-  tests of any file time out at random [measured]. Run the gates one at a time, and rerun a
-  lone timeout alone before calling it a failure.
+  tests of any file timed out at random under the default [measured]. With 20 s per test,
+  three full runs in a row on 2026-11-07 passed 402/402 each, the slowest test at 4.3, 5.2
+  and 6.1 s. Still run the gates one at a time.
 - What a test can raise and answer [kit]: every op the plugin calls is a test event (`ui.log`,
   `ui.status`, `session.messages`, `session.model`, `session.usage`, `session.turns`,
   `tool.register`, `model.fork`, `ui.selection`, `process.run` with its `init`); the plugin's

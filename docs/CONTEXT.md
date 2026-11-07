@@ -91,8 +91,9 @@ on the Claude Code function-hook API: the manifest (`.claude-plugin/plugin.json`
   as the default way to share.
 - **The tested builds are named.** The README states the engine and CLI builds the mod was
   tested on; `claude plugin test` needs a CLI at least as new as the engine the desktop app
-  hosts (see [`PLATFORM.md`](PLATFORM.md)). The kit fails any test that runs longer than
-  5,000 ms wall clock, so a lone timeout on a busy machine is rerun alone before it counts.
+  hosts (see [`PLATFORM.md`](PLATFORM.md)). The kit fails a test that runs longer than
+  5,000 ms wall clock unless the test asks for more; the harness gives each test 20 s,
+  because the kit's per-test compile under a loaded machine eats most of the 5 s.
 
 ## Mental model
 
