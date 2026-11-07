@@ -6,7 +6,7 @@
     {
       "name": "issue-radar",
       "source": "./",
-      "description": "Sidebar with the open GitHub issues of the current repository, AI recaps, and a button that starts a dedicated session per issue (summary, interview, proposal, then code)."
+      "description": "Sidebar with the open GitHub issues of the current repository, AI recaps, and a button that starts a dedicated session per issue (summary, interview, proposal, then code). With GitHub writes on (the default), it also comments, labels, assigns, closes, files issues and links branches, each only after you confirm the exact gh command."
     }
   ]
 }

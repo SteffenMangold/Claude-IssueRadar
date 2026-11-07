@@ -1,7 +1,7 @@
 {
   "name": "issue-radar",
-  "version": "0.1.1",
-  "description": "Sidebar that lists the open GitHub issues of the current repository, each with a short AI recap and a link, and starts a dedicated Claude session for an issue with one click: summary, interview, proposal, then code.",
+  "version": "0.2.0",
+  "description": "Sidebar that lists the open GitHub issues of the current repository, each with a short AI recap and a link, and starts a dedicated Claude session for an issue with one click: summary, interview, proposal, then code. With GitHub writes on (the default), it also comments, labels, assigns, closes, files issues and links branches, each only after you confirm the exact gh command in the pane.",
   "author": { "name": "Steffen Mangold" },
   "repository": "https://github.com/SteffenMangold/Claude-IssueRadar",
   "license": "Apache-2.0",
@@ -23,7 +23,7 @@
     "maxIssues": {
       "type": "number",
       "title": "Issue cap",
-      "description": "How many open issues are listed per repository, the most recently updated first.",
+      "description": "How many open issues are listed per repository, the most recently updated first. Values above 100 cost store space: the store keeps up to three lists' worth of issue data per repository and holds 4 MiB in all.",
       "default": 30
     },
     "recaps": {
@@ -35,7 +35,7 @@
     "recapModel": {
       "type": "string",
       "title": "Recap model",
-      "description": "Model alias for the recaps: haiku (default) or sonnet.",
+      "description": "Model alias for the recaps and their triage, and for drafting a new issue from a TODO or, when this chat cannot be forked, from its latest messages (with the selection, for a draft from it): haiku (default) or sonnet.",
       "default": "haiku"
     },
     "language": {
@@ -43,6 +43,42 @@
       "title": "Language",
       "description": "Language of the pane's labels and of the recaps: de or en.",
       "default": "de"
+    },
+    "closedDays": {
+      "type": "number",
+      "title": "Recently closed (days)",
+      "description": "How many days back the collapsed Recently closed part of each repository reaches (0 to 90); 0 hides it. Fetched only while expanded and the pane is shown.",
+      "default": 7
+    },
+    "assignedToMe": {
+      "type": "boolean",
+      "title": "Assigned to me (all repositories)",
+      "description": "Adds a collapsed section listing the open issues assigned to you in any repository, from GitHub search; searched only while the pane is shown, every 15 minutes at most unless you press the refresh button.",
+      "default": false
+    },
+    "hoverCards": {
+      "type": "boolean",
+      "title": "Hover cards",
+      "description": "Show an issue's author, reactions, excerpt, latest comments, pull requests, relations and triage in a card while the pointer rests on its number (desktop).",
+      "default": true
+    },
+    "arrivalToasts": {
+      "type": "boolean",
+      "title": "Arrival toasts",
+      "description": "Show one toast per refresh when new issues arrive while the Issues pane is shown; the marks for new and updated issues stay either way.",
+      "default": true
+    },
+    "issueMentions": {
+      "type": "boolean",
+      "title": "Issues in the prompt",
+      "description": "Offer the open issues after # in the prompt box (terminal), and attach an open issue a prompt mentions (#123) to that prompt as context for Claude: title, recap, and the excerpt, text and latest comments the pane already holds. Never reads GitHub on Enter.",
+      "default": true
+    },
+    "writes": {
+      "type": "boolean",
+      "title": "GitHub writes",
+      "description": "Show the buttons that comment, label, assign, close, link a session's branch and file new issues on GitHub; each write runs only after you confirm the exact gh command in the pane.",
+      "default": true
     }
   }
 }
