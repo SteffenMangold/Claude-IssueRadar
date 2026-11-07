@@ -77,8 +77,13 @@ export type Verdict = { decision: 'allow' | 'ask' | 'deny'; reason?: string; rul
  * Whether the owner's permission settings let the tool read (C-E6-1): the serving hook answers in core's place, so the
  * permission prompt beneath never runs, and the hook asks the verdict itself. An allow reads; a deny refuses; an ask
  * reads only when it is the mode's plain ask (the tool reads, so a mode that asks before writes has nothing to ask),
- * never an ask a rule, a hook, a setting, another plugin or the organization's ceiling made: that ask is the owner's,
- * and no card can put it to them here.
+ * never an ask a rule, a setting, another plugin or the organization's ceiling made: that ask is the owner's, and no
+ * card can put it to them here.
+ *
+ * What a query cannot see (B4-BEH-2): `$.tool.check` runs no classic hook and no classifier, so a user's or project's
+ * PreToolUse hook (and auto mode's classifier) never decides this tool's calls; `hook` is never set on a query in
+ * 2.1.317 and is read only should a later engine set it. Managed-settings hooks still come first (their deny runs
+ * before every tool.call hook), and permission rules decide through the query.
  */
 export function mayRead(verdict: Verdict): boolean {
   if (verdict.decision === 'allow') return true

@@ -5,7 +5,7 @@
 // the attached record and its resets). Asserted on keys, argv and the texts
 // the model reads, never on the pane's incidental words.
 import type { PromptSubmitInput } from 'claude-code'
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 import { renderBrief } from '../hooks/brief'
 import { MENTION_LIMITS, TOOL_LIMITS, neutralizeTags, quoteData, quoteLine, renderIssueText } from '../hooks/context'
@@ -15,7 +15,7 @@ import { briefIssueKey, findMentions, isRecentlyAttached, keyOfRemote, matchesRe
 import type { KnownIssue } from '../hooks/mentions'
 import type { IssueDetails, IssueRow, RepoInfo } from '../types'
 import type { CheckVerdict, Engine, Ran } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, SECTION, command, count, issueView, project, ran, started } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, count, issueView, project, ran, started } from './harness'
 
 const ROWS = JSON.parse(ISSUES) as Array<Record<string, unknown>>
 const SETTINGS = 'settings:github.com/acme/widgets'
@@ -231,7 +231,8 @@ test("the serving hook asks the permission settings itself: a deny or the owner'
   expect(checks.at(-1)).toEqual({ tool: ISSUE_TOOL, input: { number: 42 } })
   verdict = { decision: 'ask', rule: 'mcp__issue-radar__issue' }
   expect((await callTool($, { number: 42 })).deny).toContain('permission settings')
-  verdict = { decision: 'ask', hook: 'PreToolUse' }
+  // Another plugin's ask is the owner's too. (A query runs no classic hook, so a PreToolUse hook never decides here; B4-BEH-2.)
+  verdict = { decision: 'ask', plugin: 'other' }
   expect((await callTool($, { number: 42 })).deny).toContain('permission settings')
   expect(argv).toHaveLength(0)
 
@@ -302,11 +303,13 @@ test('an issue session with nothing cached names the failure', async ($, on) => 
 })
 
 test("Phase 1 of a brief names the tool where the pane registered it, and the spike says it is", async ($, on) => {
-  const { mcp } = project(on)
+  const { mcp, store } = project(on)
   await started($, on)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
 
   await ui.press({ key: `work:${ROW_42}` })
+  // The mapping carries the checkout's key as this pane resolved it, for the issue session (R4-INT-2).
+  expect(store.get(`session:${ROW_42}`)).toMatchObject({ checkoutKey: SECTION })
   const prompt = String(mcp.find(call => call.tool === 'start_session')?.args['prompt'])
   expect(prompt).toContain(`where the tool \`${ISSUE_TOOL}\` is available`)
   expect(prompt).toContain('comments 20')
@@ -529,26 +532,199 @@ test('at most three issues a prompt; the others are named in the transcript line
 })
 
 test('a compaction, a /clear and a resume let the next mention attach again (C-E2-2)', async ($, on) => {
-  const { submitted } = project(on)
+  const { submitted, setTurns } = project(on)
   on('session.compact', (_, e) => ({ messages: e.messages }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   await started($, on)
+  // Each prompt sent enters the transcript: the next one sees one user turn more, as the engine counts them.
+  let turn = 0
+  const entered = (): void => {
+    turn += 1
+    setTurns(turn)
+  }
 
   await send($, '#42')
+  entered()
   await send($, '#42')
   expect(submitted.at(-1)?.context).toBeUndefined()
+  entered()
   await $.session.compact({ trigger: 'manual', messages: MESSAGES })
   await send($, '#42')
   expect(contextOf(submitted)).toHaveLength(1)
+  entered()
   // A compaction of a subagent's loop, or one computed ahead of time, leaves the record.
   await $.session.compact({ trigger: 'auto', agentId: 'agent-1', messages: MESSAGES })
   await $.session.compact({ trigger: 'precompute', messages: MESSAGES })
   await send($, '#42')
   expect(submitted.at(-1)?.context).toBeUndefined()
+  entered()
 
   await $.session.end({ reason: 'clear', sessionId: 'local_pane', resume: { id: 'local_pane' } })
   await send($, '#42')
   expect(contextOf(submitted)).toHaveLength(1)
+  entered()
+  await send($, '#42')
+  expect(submitted.at(-1)?.context).toBeUndefined()
+  entered()
+  // B4-BEH-3: a resume resets it as well (two turns after the last block, which would still count).
+  await $.session.end({ reason: 'resume', sessionId: 'local_pane', resume: { id: 'local_pane' } })
+  await send($, '#42')
+  expect(contextOf(submitted)).toHaveLength(1)
+})
+
+test('the attached record belongs to its conversation: under another session id the issue attaches again (C-E2-2, B4-BEH-3)', async ($, on) => {
+  const { submitted, setTurns, setSessionId } = project(on)
+  await started($, on)
+  setSessionId('conversation-a')
+
+  await send($, '#42')
+  expect(contextOf(submitted)).toHaveLength(1)
+  setTurns(1)
+  await send($, '#42')
+  expect(submitted.at(-1)?.context).toBeUndefined()
+  // A /clear or a resume whose session.end the record missed: the conversation goes on under another id, same count.
+  setSessionId('conversation-b')
+  await send($, '#42')
+  expect(contextOf(submitted)).toHaveLength(1)
+})
+
+test('a prompt whose block never entered (queued, then put back by an interrupt) carries it again at the same turn count (R4-RT-2)', async ($, on) => {
+  const { submitted, setTurns, logs } = project(on)
+  await started($, on)
+  setTurns(3)
+
+  // Typed during turn 3: queued, so the hook records it before the prompt is in the transcript.
+  await send($, 'fix #42', { turnId: 'turn-3' })
+  expect(contextOf(submitted)).toHaveLength(1)
+  // Esc puts the text back into the box without its block; sent again before any turn counted it.
+  await send($, 'fix #42')
+  expect(contextOf(submitted)).toHaveLength(1)
+  expect(logs.filter(line => line === 'Issue-Radar: #42 als Kontext angehängt')).toHaveLength(2)
+  // Once it entered, the turns after it carry the issue.
+  setTurns(4)
+  await send($, 'und #42?')
+  expect(submitted.at(-1)?.context).toBeUndefined()
+})
+
+test('under a view the open issues it hides are still mentioned, offered and read through the pane (R4-INT-1, R4-RT-1, B4-BEH-1)', async ($, on) => {
+  const mine = JSON.stringify([{ ...(ROWS[1] ?? {}), state: 'OPEN' }])
+  const isMine = (args: readonly string[]) => args[0] === 'issue' && args[1] === 'list' && args.some(arg => arg.startsWith('--search=') && arg.includes('assignee:@me'))
+  const { submitted, argv, logs } = project(on, { gh: args => (isMine(args) ? ran(mine) : toolView(args)), autocomplete: () => [] })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'filter' })
+  await ui.select({ key: 'filter-view', value: 'mine' })
+  await clock.advance(1_000)
+  expect(await ui.find({ key: `row-title:${ROW_7}` })).toBeDefined()
+  expect(await ui.find({ key: `row-title:${ROW_42}` })).toBeUndefined()
+
+  // #42 is open and in the store's default list: the filter hides it from the pane, not from the prompt.
+  await send($, 'Bitte auch #42 ansehen')
+  const blocks = contextOf(submitted)
+  expect(blocks).toHaveLength(1)
+  expect(blocks[0]).toContain('Issue Radar context for acme/widgets#42')
+  expect(blocks[0]).toContain('> The export throws')
+  expect(logs.some(line => line.startsWith('Issue-Radar: #42 als Kontext angehängt'))).toBe(true)
+  // The typeahead offers the drawn rows first, then the rest of the default list.
+  expect(await typeahead($, '#')).toEqual(['#7 ', '#42 '])
+
+  // The tool finds #42 listed, reads it once and shares the read: a call a minute later answers from the pane.
+  const reads = () => argv.filter(call => call.includes(TOOL_VIEW_FIELDS)).length
+  expect((await callTool($, { number: 42 })).text).toContain('read by Issue Radar from GitHub')
+  expect(reads()).toBe(1)
+  await clock.advance(61_000)
+  expect((await callTool($, { number: 42 })).text).toContain("from the Issues pane's cache")
+  expect(reads()).toBe(1)
+  await ui.unmount()
+})
+
+test('a registered tool the session does not list is named nowhere, and named once it lists (R4-RT-3)', async ($, on) => {
+  // permissions.deny withholds a registered tool from the session's tools (its registration resolves all the same).
+  let isListed = false
+  const { mcp, submitted, setTurns } = project(on, { tools: names => (isListed ? names : []) })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `work:${ROW_42}` })
+  const prompt = String(mcp.find(call => call.tool === 'start_session')?.args['prompt'])
+  expect(prompt).not.toContain(ISSUE_TOOL)
+  expect(prompt).toContain('Phase 1 - Read. Run `gh issue view 42 -R acme/widgets --comments` and read the whole thread.')
+  await send($, 'Schau dir #7 an')
+  expect(contextOf(submitted)[0]).toContain('More: gh issue view 7 -R acme/widgets --comments.')
+  expect(await command($, 'issue-radar', 'spike')).toContain('issue tool: not callable')
+
+  // Listed later (a host that listed it after the 8 s wait): read where it is used.
+  isListed = true
+  setTurns(1)
+  await send($, 'Und #42?')
+  expect(contextOf(submitted)[0]).toContain(`More: the tool ${ISSUE_TOOL} with number 42`)
+  expect(await command($, 'issue-radar', 'spike')).toContain(`issue tool: ${ISSUE_TOOL}`)
+  await ui.unmount()
+})
+
+test('tool calls made at once share one checkout resolution and one read per issue (R4-RT-4)', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const { argv } = project(on, {
+    stored: ISSUE_SESSION,
+    gh: async args => {
+      // gh takes a moment, so the calls overlap as the model's parallel calls do.
+      if (args[0] === 'repo' || (args[0] === 'issue' && args[1] === 'view')) await clock.sleep(500)
+
+      return toolView(args)
+    },
+  })
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(1_000)
+
+  const calls = Promise.all([callTool($, { number: 42 }), callTool($, { number: 7 }), callTool($, { number: 42, comments: 1 })])
+  for (let step = 0; step < 6; step++) await clock.advance(500)
+  const answers = await calls
+  expect(answers.map(answer => answer.isError)).toEqual([false, false, false])
+  expect(answers[2]?.text).toContain('Export fails for empty folders')
+  expect(count(argv, 'repo', 'view')).toBe(1)
+  expect(argv.filter(call => call[2] === 'view' && call[3] === '42')).toHaveLength(1)
+  expect(argv.filter(call => call[2] === 'view' && call[3] === '7')).toHaveLength(1)
+})
+
+test('an issue session in a fork finds the lists under the key its pane resolved, not under its origin (R4-INT-2)', async ($, on) => {
+  const mapping = { ...ISSUE_SESSION[`session:${ROW_42}`], checkoutKey: SECTION }
+  const { submitted, argv } = project(on, {
+    // origin names the fork; gh, and so the pane's lists, resolve upstream acme/widgets.
+    remote: 'https://github.com/steffen/widgets',
+    stored: { [`session:${ROW_42}`]: mapping, [`cache:${SECTION}`]: { fetchedAt: NOW - 60_000, rows: STORED_ROWS, meta: STORED_META } },
+    autocomplete: () => [],
+  })
+  await started($, on)
+
+  expect(await typeahead($, '#')).toEqual(['#42 ', '#7 '])
+  await send($, 'Hängt #7 damit zusammen?')
+  expect(contextOf(submitted)[0]).toContain('Issue Radar context for acme/widgets#7')
+  expect(argv).toHaveLength(0)
+})
+
+test("the tool adopting the checkout's settings during the start refresh leaves the refresh its watch list (R4-INT-3)", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const reports = JSON.stringify([{ ...(ROWS[0] ?? {}), number: 3, title: 'Report totals', url: 'https://github.com/acme/reports/issues/3' }])
+  project(on, {
+    stored: { [SETTINGS]: { watch: ['acme/reports'], consent: {}, collapsed: {} } },
+    // A slow store: the settings read waits two seconds, for every reader alike.
+    storeDelay: key => (key === SETTINGS ? clock.sleep(2_000) : undefined),
+    gh: args => {
+      if (args[0] === 'repo' && args.includes('acme/reports')) return ran(REPORTS)
+      if (args[0] === 'issue' && args[1] === 'list' && args.includes('acme/reports')) return ran(reports)
+
+      return toolView(args)
+    },
+  })
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  // The model calls the tool before the start refresh: it resolves the checkout and adopts its settings first.
+  const calling = callTool($, { number: 42 })
+  await clock.advance(5_000)
+  expect((await calling).isError).toBe(false)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'row-title:github.com/acme/reports#3' })).toBeDefined()
+  await ui.unmount()
 })
 
 test('in an issue session the store’s lists answer the typeahead and the attach, without gh', async ($, on) => {
@@ -609,7 +785,11 @@ test('parseMentionToken, matchesRepo, resolveMentions and suggestIssues', () => 
 
 test('the attached record: recent within the window, again after a change, a /clear or another conversation', () => {
   const record = { turn: 3, updatedAt: '2026-11-05T09:00:00Z', via: 'prompt' as const }
-  expect(isRecentlyAttached(record, '2026-11-05T09:00:00Z', 3, 4)).toBe(true)
+  // A prompt's block counts from the next turn on (it may not have entered yet, R4-RT-2); a tool read or a brief at once.
+  expect(isRecentlyAttached(record, '2026-11-05T09:00:00Z', 3, 4)).toBe(false)
+  expect(isRecentlyAttached({ ...record, via: 'tool' }, '2026-11-05T09:00:00Z', 3, 4)).toBe(true)
+  expect(isRecentlyAttached({ ...record, via: 'brief' }, '2026-11-05T09:00:00Z', 3, 4)).toBe(true)
+  expect(isRecentlyAttached(record, '2026-11-05T09:00:00Z', 4, 4)).toBe(true)
   expect(isRecentlyAttached(record, '2026-11-05T09:00:00Z', 6, 4)).toBe(true)
   expect(isRecentlyAttached(record, '2026-11-05T09:00:00Z', 7, 4)).toBe(false)
   expect(isRecentlyAttached(record, '2026-11-06T09:00:00Z', 4, 4)).toBe(false)

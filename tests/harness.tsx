@@ -127,8 +127,8 @@ export type Engine = Parameters<TestBody>[0]
 export type McpCall = { server: string; tool: string; args: Record<string, unknown> }
 export type McpAnswer = { value: { content: Array<{ type: 'text'; text: string }>; isError: boolean; structuredContent?: unknown } }
 export type CheckDecision = 'allow' | 'ask' | 'deny'
-/** A `$.tool.check` verdict with what stands behind it (a rule, a hook), as the engine answers one. */
-export type CheckVerdict = { decision: CheckDecision; reason?: string; rule?: string; hook?: string }
+/** A `$.tool.check` verdict with what stands behind it (a rule, another plugin's hook), as the engine answers a query (no classic hook runs there, B4-BEH-2). */
+export type CheckVerdict = { decision: CheckDecision; reason?: string; rule?: string; plugin?: string }
 
 /** An answer of the desktop app to `$.mcp.call`: text, optionally an error. */
 export function mcpText(text: string, isError = false): McpAnswer {
@@ -156,8 +156,12 @@ export type Setup = {
   register?: (spec: RegisteredToolSpec) => { tool: string }
   /** The rows the hooks beneath the plugin add to a `#` typeahead (`prompt.autocomplete`); none by default. */
   autocomplete?: () => PromptAutocompleteSuggestion[]
-  /** What `$.session.id()` answers; the default is 'local_pane'. */
+  /** What `$.session.id()` answers until `setSessionId` changes it; the default is 'local_pane'. */
   sessionId?: string
+  /** The `origin` remote `$.session.repo()` names; the default is https://github.com/acme/widgets. */
+  remote?: string
+  /** What `$.tool.list()` answers, given the tool names the plugin registered; the default lists exactly those (R4-RT-3). */
+  tools?: (registered: readonly string[]) => readonly string[]
   /** Whether a placed pane is shown at the start (not behind another tab); the default is true. */
   isShown?: boolean
   /** Which `$.store.set` keys the store refuses, asked at each write (a store past 4 MiB rejects every write); none by default. */
@@ -210,6 +214,8 @@ export type Project = {
   submitted: PromptSubmitInput[]
   /** Sets what `$.session.turns()` answers (the user turns so far; 0 at the start). */
   setTurns: (turns: number) => void
+  /** Sets what `$.session.id()` answers from now on (a /clear or a resume goes on under another id). */
+  setSessionId: (id: string) => void
 }
 
 /**
@@ -235,6 +241,9 @@ export function project(on: On, setup: Setup = {}): Project {
   const registered: RegisteredToolSpec[] = []
   const submitted: PromptSubmitInput[] = []
   let turns = 0
+  let sessionId = setup.sessionId ?? 'local_pane'
+  /** The full names `$.tool.register` answered, in order. */
+  const toolNames: string[] = []
   /** The open panes by id: the title and whether the latest open placed them. */
   const panes = new Map<string, { title: string; isPlaced: boolean }>()
   let isShown = setup.isShown ?? true
@@ -288,8 +297,8 @@ export function project(on: On, setup: Setup = {}): Project {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('session.root', () => ({ value: 'D:\\proj' }))
-  on('session.id', () => ({ value: setup.sessionId ?? 'local_pane' }))
-  on('session.repo', () => ({ value: { root: 'D:\\proj', remote: 'https://github.com/acme/widgets', internal: false, name: null } }))
+  on('session.id', () => ({ value: sessionId }))
+  on('session.repo', () => ({ value: { root: 'D:\\proj', remote: setup.remote ?? 'https://github.com/acme/widgets', internal: false, name: null } }))
   on('session.surfaces', () => ({ value: setup.surfaces ?? ['desktop'] }))
   on('fs.read', () => ({ value: '{ "name": "issue-radar", "version": "9.9.9" }' }))
   on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
@@ -302,9 +311,12 @@ export function project(on: On, setup: Setup = {}): Project {
   on('session.turns', () => ({ value: turns }))
   on('tool.register', (_, e) => {
     registered.push(e)
+    const answer = setup.register === undefined ? { tool: `mcp__issue-radar__${e.name}` } : setup.register(e)
+    toolNames.push(answer.tool)
 
-    return { value: setup.register === undefined ? { tool: `mcp__issue-radar__${e.name}` } : setup.register(e) }
+    return { value: answer }
   })
+  on('tool.list', () => ({ value: (setup.tools === undefined ? toolNames : setup.tools(toolNames)).map(name => ({ name, description: name, mcp: name.startsWith('mcp__') })) }))
   on('prompt.fill', (_, e) => {
     draft = e.mode === 'append' ? draft + e.text : e.text
     filled.push(e.text)
@@ -376,6 +388,9 @@ export function project(on: On, setup: Setup = {}): Project {
     submitted,
     setTurns: value => {
       turns = value
+    },
+    setSessionId: value => {
+      sessionId = value
     },
   }
 }

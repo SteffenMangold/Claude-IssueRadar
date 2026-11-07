@@ -308,6 +308,11 @@ export type Mapping = {
   startedFrom: string
   /** Whether the session was detached to the top level. */
   detached: boolean
+  /**
+   * The key of the checkout's repository as the starting pane resolved it (gh's choice, `upstream` in a fork), so the
+   * issue session reads the project's lists and settings without gh (E2, R4-INT-2). Absent in mappings written before.
+   */
+  checkoutKey?: string
 }
 
 /** Per-repository choices, kept in the store under the checkout's resolved repository. */

@@ -203,10 +203,15 @@ let retitleOff = false
 const redoFailed = new Map<string, { updatedAt: string; language: Language; at: number }>()
 /** E4: the rows whose warm-up read failed, at which update and when: not read again for half an hour (R3-RT-2). */
 const warmFailed = new Map<string, { updatedAt: string; at: number }>()
-/** E6: the issue tool's full name once this session registered it; null before, or where the host adds no tools. */
+/**
+ * E6: the issue tool's full name once this session registered it (or, after a hot reload, found it among the
+ * session's tools); null before, or where the host adds no tools. Registered is not yet callable: issueToolOf decides.
+ */
 let issueToolName: string | null = null
+/** E6: what this module has seen of the registration, before any attempt. */
+const NOT_TRIED = 'not tried yet'
 /** E6: why the tool is not registered, for the spike. */
-let issueToolProblem = 'not tried yet'
+let issueToolProblem = NOT_TRIED
 /**
  * E6: the tool's reads of GitHub by row key, the newest 20, with their 20 comments: they answer again within 60 s, and
  * an unlisted issue or an extended read has nowhere else to live (C-E6-5); never in `$.state` or the store (C-E6-2).
@@ -214,10 +219,16 @@ let issueToolProblem = 'not tried yet'
 const toolReads = new Map<string, { at: number; read: ToolRead }>()
 /** E6: when the tool last resolved the checkout itself (a failure is tried again after a minute, not on every call). */
 let checkoutTriedAt = Number.NEGATIVE_INFINITY
+/** E6: the tool's checkout resolution in flight: calls that overlap share one `gh repo view`, and a refresh waits for it (R4-RT-4). */
+let resolvingCheckout: Promise<void> | null = null
+/** E6: the tool's demand reads in flight by row key: calls that overlap for one issue share one `gh issue view` (R4-RT-4). */
+const toolReading = new Map<string, Promise<Viewed>>()
 /** E2: the origin of the last prompt, for the spike (S16: what the desktop stamps on a typed prompt). */
 let lastPromptOrigin = ''
 
 type Resolved = { spec: string; info: RepoInfo | null; state: RepoState; isCheckout: boolean }
+/** What one `gh issue view` of the tool came back with. */
+type Viewed = Awaited<ReturnType<typeof viewIssueNumber>>
 /**
  * Why a refresh runs: the session's start, the timer, the owner's ↻ (`press`, nothing else), a re-run the mod asks
  * for itself (`manual`: a consent, a watch change, a reset, a command, a state block's retry), or a tool or an attach.
@@ -813,15 +824,20 @@ function forgetOtherRoot(root: string): void {
   if (checkout === null || checkout.root === root) return
   checkout = null
   named.clear()
+  toolReading.clear()
 }
 
-/** The checkout's key decides which settings the session reads: on a change, the stored settings and the key go into the state. */
+/**
+ * The checkout's key decides which settings the session reads: on a change, the stored settings and the key go into the
+ * state. The key is taken only once both are in (R4-INT-3): the refresh and the tool adopt it, and a caller that came
+ * meanwhile reads and writes the same again rather than going on with the settings of before.
+ */
 async function adoptSettingsKey($: EngineInterface, key: string): Promise<void> {
   if (settingsKey === key) return
-  settingsKey = key
   const stored = key === '' ? undefined : await readStore<unknown>($, storeKeyOf('settings:', key))
   await update($, settings, () => readSettings(stored))
   await update($, checkoutKey, () => key)
+  settingsKey = key
 }
 
 async function refresh($: EngineInterface, options: Options, reason: Reason): Promise<void> {
@@ -841,7 +857,9 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     forgetOtherRoot(root)
     // After a hot reload the pane is still up while this module's memory is fresh.
     if (!wantsPane && (await isPaneOpen($))) wantsPane = true
-    // The checkout first: its settings name the other repositories.
+    // The checkout first: its settings name the other repositories. A resolution the tool has under way is waited for,
+    // not repeated (R4-RT-4).
+    if (resolvingCheckout !== null) await resolvingCheckout
     if (checkout === null || checkout.root !== root || checkout.info === null) checkout = { root, ...(await resolveCheckout($, root)) }
     await adoptSettingsKey($, checkout.info === null ? '' : repoKey(checkout.info))
     const chosen = await read($, settings)
@@ -1340,8 +1358,8 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
     const fresh = await freshDetails($, options, found.section, found.row, now)
     if (fresh === null) return
     const input = { issueRepo: found.section.info, codeRepo: checkout?.info ?? null, row: found.row, details: fresh, fetchedAt: new Date(now).toISOString(), triage: await triageFor($, options, rowKey, fresh) }
-    // E6: Phase 1 names the issue tool where this session could register it (the issue session's own is not known here).
-    const prompt = renderBrief(input, { issueTool: issueToolName })
+    // E6: Phase 1 names the issue tool where this session's model can call it (the issue session's own is not known here).
+    const prompt = renderBrief(input, { issueTool: await issueToolOf($) })
     const background = renderBackground(input, checkout?.root ?? (await $.session.root()))
     const title = sessionTitle(found.row)
     const outcome = await startDesktopSession(
@@ -1368,7 +1386,10 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
 
       return
     }
-    const started: Mapping = { sessionId: outcome.sessionId, title, startedAt: now, startedFrom: myId, detached: false }
+    // The checkout's key as this pane resolved it travels along: the issue session finds the project's lists under it
+    // without gh, where its git remote names another (a fork's origin; R4-INT-2).
+    const held = await read($, checkoutKey)
+    const started: Mapping = { sessionId: outcome.sessionId, title, startedAt: now, startedFrom: myId, detached: false, ...(held === '' ? {} : { checkoutKey: held }) }
     await saveMapping($, rowKey, started)
     $.ui.toast(clean(S.sessionStarted(title)))
     const detached = await detachSession($, outcome.sessionId, consent)
@@ -1405,7 +1426,7 @@ async function takeHere($: EngineInterface, options: Options, sectionKey: string
   const fresh = await freshDetails($, options, found.section, found.row, now)
   if (fresh === null) return
   const input = { issueRepo: found.section.info, codeRepo: checkout?.info ?? null, row: found.row, details: fresh, fetchedAt: new Date(now).toISOString(), triage: await triageFor($, options, rowKey, fresh) }
-  if (await fillPrompt($, options, renderBrief(input, { issueTool: issueToolName }))) $.ui.toast(S.briefInPrompt)
+  if (await fillPrompt($, options, renderBrief(input, { issueTool: await issueToolOf($) }))) $.ui.toast(S.briefInPrompt)
 }
 
 /**
@@ -2180,6 +2201,35 @@ async function registerIssueTool($: EngineInterface): Promise<void> {
   $.ui.log(`${PLUGIN}: the issue tool is not registered: ${issueToolProblem}`, { to: 'debug' })
 }
 
+/**
+ * The issue tool's name where the model can call it now, else null (R4-RT-3), read where it is used: the registration
+ * resolves even when a deny rule withholds the tool from the session's tools, or when it is not listed after 8 s; and
+ * a hot reload forgets this module's memory while the engine keeps the registration and this module's hook serves it.
+ * A registration this module saw fail stays failed; a list that cannot be read leaves the registration's word.
+ */
+async function issueToolOf($: EngineInterface): Promise<string | null> {
+  if (issueToolName === null && issueToolProblem !== NOT_TRIED) return null
+  const tools = await $.tool.list().catch(() => null)
+  if (tools === null) return issueToolName
+  if (tools.some(tool => tool.name === ISSUE_TOOL)) {
+    issueToolName = ISSUE_TOOL
+    issueToolProblem = ''
+
+    return ISSUE_TOOL
+  }
+  if (issueToolName !== null) issueToolProblem = "registered, but not among the session's tools: a deny rule withholds it, or the host has not listed it yet"
+
+  return null
+}
+
+/** The spike's line for the tool (S18): its name where the model can call it, else why not. */
+async function issueToolLine($: EngineInterface): Promise<string> {
+  const usable = await issueToolOf($)
+  if (usable !== null) return `issue tool: ${usable}`
+
+  return issueToolName === null ? `issue tool: not registered (${issueToolProblem || '?'})` : `issue tool: not callable (${issueToolProblem})`
+}
+
 /** The checkout as the tool sees it: its repository when known, its key and its settings (the watch list, the consents). */
 type ProjectView = { info: RepoInfo | null; state: RepoState; key: string; settings: RepoSettings }
 
@@ -2193,8 +2243,9 @@ async function ensureProject($: EngineInterface, canFetch: boolean, now: number)
   const root = await $.session.root()
   forgetOtherRoot(root)
   if (canFetch && (checkout === null || (checkout.info === null && now - checkoutTriedAt >= TOOL_RESOLVE_RETRY_MS))) {
-    checkoutTriedAt = now
-    checkout = { root, ...(await resolveCheckout($, root)) }
+    // Calls the model makes at once share one resolution (R4-RT-4).
+    if (resolvingCheckout === null) resolvingCheckout = resolveToolCheckout($, root, now)
+    await resolvingCheckout
   }
   const info = checkout?.info ?? (await read($, sections)).find(section => section.isCheckout)?.info ?? null
   const key = info === null ? await read($, checkoutKey) : repoKey(info)
@@ -2202,6 +2253,31 @@ async function ensureProject($: EngineInterface, canFetch: boolean, now: number)
   const chosen = key === '' ? await read($, settings) : readSettings(await readStore<unknown>($, storeKeyOf('settings:', key)))
 
   return { info, state: checkout?.state ?? { kind: 'error', detail: 'the checkout is not resolved in this session' }, key, settings: chosen }
+}
+
+/** The tool's own resolution of the checkout, one at a time (R4-RT-4): kept for the next refresh, as the refresh keeps its own. */
+async function resolveToolCheckout($: EngineInterface, root: string, now: number): Promise<void> {
+  try {
+    checkoutTriedAt = now
+    checkout = { root, ...(await resolveCheckout($, root)) }
+  } catch (error) {
+    $.ui.log(`${PLUGIN}: the issue tool could not resolve the checkout: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
+  } finally {
+    resolvingCheckout = null
+  }
+}
+
+/** One demand read of an issue (E6); calls that overlap for the same issue share it (R4-RT-4). */
+async function readIssueOnce($: EngineInterface, info: RepoInfo, number: number, rowKey: string, now: number): Promise<Viewed> {
+  const pending = toolReading.get(rowKey)
+  if (pending !== undefined) return pending
+  const reading = viewIssueNumber($, info, number, now)
+  toolReading.set(rowKey, reading)
+  try {
+    return await reading
+  } finally {
+    if (toolReading.get(rowKey) === reading) toolReading.delete(rowKey)
+  }
 }
 
 type ToolTarget = { info: RepoInfo; key: string }
@@ -2243,15 +2319,16 @@ async function resolveToolRepo($: EngineInterface, project: ProjectView, repo: s
 type ToolCopy = { row: IssueRow; details: IssueDetails | undefined; isLoaded: boolean; state: string; stateReason: string; source: 'cache' | 'github'; at: number }
 
 /**
- * What the session holds of one issue: the listed row (the pane's section, or the store's list in a session without
- * it), the pane's details of it (or the store's excerpt), and the tool's own last read.
+ * What the session holds of one issue: the listed row (the pane's section; the store's default list in a session
+ * without it, or where a filter's matches leave it out, R4-INT-1), the pane's details of it (or the store's excerpt),
+ * and the tool's own last read.
  */
 async function toolCopies($: EngineInterface, target: ToolTarget, number: number): Promise<{ listed: IssueRow | undefined; held: ToolCopy | undefined; pane: ToolCopy | undefined }> {
   const rowKey = rowKeyOf(target.key, number)
   const section = (await read($, sections)).find(found => found.key === target.key)
   let listed = section?.rows.find(row => row.number === number)
   let have: IssueDetails | undefined = (await read($, details))[rowKey]
-  if (section === undefined) {
+  if (listed === undefined && (section === undefined || isFilteredList(section))) {
     const cache = await readStore<RepoCache>($, storeKeyOf('cache:', target.key))
     listed = (Array.isArray(cache?.rows) ? cache.rows : []).find(row => isRowLike(row) && row.number === number)
     const seeded = seededDetails(cache?.meta?.[String(number)])
@@ -2280,12 +2357,16 @@ function keepToolRead(rowKey: string, at: number, found: ToolRead): void {
 /**
  * A tool read of an issue the pane lists goes into the session's details as the pane keeps them (C-E6-2: three
  * comments of 600 characters; the recap prompt and the opened row read them), so the pane benefits; never older than
- * what it holds, never a closed issue (the refresh and Work on it deal with closures), never the store.
+ * what it holds, never a closed issue (the refresh and Work on it deal with closures), never the store. Under a filter
+ * (E14) an open issue of the default list counts as listed too (R4-INT-1); the next refresh drops it while it is hidden.
  */
 async function shareToolRead($: EngineInterface, rowKey: string, found: ToolRead): Promise<void> {
   if (found.details.state !== 'OPEN') return
   const sectionKey = rowKey.slice(0, rowKey.lastIndexOf('#'))
-  const isListed = (await read($, sections)).some(section => section.key === sectionKey && section.rows.some(row => row.number === found.row.number))
+  const section = (await read($, sections)).find(candidate => candidate.key === sectionKey)
+  if (section === undefined) return
+  const isNumber = (row: unknown) => isRowLike(row) && row.number === found.row.number
+  const isListed = section.rows.some(isNumber) || (isFilteredList(section) && (await defaultListOf($, section, sectionKey)).some(isNumber))
   if (!isListed) return
   const compact = compactDetails(found.details)
   await update($, details, current => {
@@ -2296,11 +2377,15 @@ async function shareToolRead($: EngineInterface, rowKey: string, found: ToolRead
   })
 }
 
-/** The recap and triage a tool answer may carry: the pane's, or the store's in a session without the section; only where the pane would use them. */
+/**
+ * The recap and triage a tool answer may carry: the pane's, or the store's in a session without the section or where a
+ * filter hides the row (the refresh keeps only the shown rows' recaps); only where the pane would use them.
+ */
 async function toolRecap($: EngineInterface, options: Options, chosen: RepoSettings, sectionKey: string, row: IssueRow): Promise<Recap | undefined> {
   const rowKey = rowKeyOf(sectionKey, row.number)
   let recap = (await read($, recaps))[rowKey]
-  if (recap === undefined && !(await read($, sections)).some(section => section.key === sectionKey)) {
+  const section = (await read($, sections)).find(found => found.key === sectionKey)
+  if (recap === undefined && (section === undefined || isFilteredList(section))) {
     const stored = await readStore<Record<string, unknown>>($, storeKeyOf('recaps:', sectionKey))
     recap = typeof stored === 'object' && stored !== null ? asRecap(stored[String(row.number)]) : undefined
   }
@@ -2361,7 +2446,7 @@ async function answerIssueTool($: EngineInterface, options: Options, input: Reco
       answer = fallback
       note = said('GitHub was rate-limiting or unreachable a moment ago')
     } else {
-      const viewed = await viewIssueNumber($, target.info, n, now)
+      const viewed = await readIssueOnce($, target.info, n, rowKey, now)
       if ('state' in viewed) {
         if (viewed.isMissing) return toolError(`#${n} does not exist in ${label}.`)
         backoffFor(target.key, viewed.state, now)
@@ -2422,37 +2507,71 @@ function infoOfKey(key: string): KnownIssue['info'] | null {
 type Known = { issues: KnownIssue[]; settings: RepoSettings; recaps: Record<string, Recap>; seeds: Record<string, IssueDetails> }
 
 /**
+ * Adds a repository's default list as the store keeps it (its rows, their stored recaps and excerpts) to what E2 knows,
+ * except the numbers it knows already: the pane's own rows and recaps come first.
+ */
+function addStoredIssues(known: Known, sectionKey: string, info: KnownIssue['info'] | null, isCheckout: boolean, cache: RepoCache | undefined, stored: unknown): void {
+  const have = new Set(known.issues.filter(issue => issue.sectionKey === sectionKey).map(issue => issue.row.number))
+  const storedRecaps = typeof stored === 'object' && stored !== null ? (stored as Record<string, unknown>) : {}
+  for (const row of (Array.isArray(cache?.rows) ? cache.rows : []).filter(isRowLike)) {
+    const rowInfo = info ?? infoFromIssueUrl(row.url) ?? infoOfKey(sectionKey)
+    if (have.has(row.number) || rowInfo === null) continue
+    have.add(row.number)
+    const rowKey = rowKeyOf(sectionKey, row.number)
+    known.issues.push({ sectionKey, info: rowInfo, isCheckout, row })
+    const recap = asRecap(storedRecaps[String(row.number)])
+    if (recap !== undefined && known.recaps[rowKey] === undefined) known.recaps[rowKey] = recap
+    const seeded = seededDetails(cache?.meta?.[String(row.number)])
+    if (seeded !== undefined && isCurrent(seeded, row)) known.seeds[rowKey] = seeded
+  }
+}
+
+/**
+ * The checkout's key in a session without lists, never a gh call (C-E2-4): the one this session resolved; else the one
+ * the pane that started this issue session resolved, from its mapping (R4-INT-2: in a fork gh, and so the pane's
+ * lists, take `upstream` while `origin` names the fork); else the one the git remote names.
+ */
+async function heldCheckoutKey($: EngineInterface): Promise<string> {
+  const held = await read($, checkoutKey)
+  if (held !== '') return held
+  const id = await $.session.id().catch(() => '')
+  const own = id === '' ? undefined : Object.values(await read($, mappings)).find(mapping => mapping.sessionId === id && typeof mapping.checkoutKey === 'string' && mapping.checkoutKey !== '')
+  if (own?.checkoutKey !== undefined) return own.checkoutKey
+  const remote = (await $.session.repo().catch(() => null))?.remote ?? ''
+
+  return keyOfRemote(remote) ?? ''
+}
+
+/**
  * The open issues the session lists: the pane's sections, else the store's lists of the checkout and the repositories
- * it watches (an issue session, or a pane before its first list). Never gh, never a resolution (C-E2-4): the key is the
- * one the session holds, or the one the git remote names.
+ * it watches (an issue session, or a pane before its first list). A section a filter narrows (E14: a view, a search,
+ * sub-issues) draws only the filter's matches, so its repository's other open issues come from the store's default
+ * list (R4-INT-1; plan section 3 allows the store); an issue the filter hides is mentioned all the same. Never gh,
+ * never a resolution (C-E2-4).
  */
 async function knownIssues($: EngineInterface): Promise<Known> {
-  const listedSections = (await read($, sections)).filter(section => section.info !== null && section.rows.length > 0)
+  const listedSections = (await read($, sections)).filter(section => section.info !== null && (section.rows.length > 0 || isFilteredList(section)))
   if (listedSections.length > 0) {
-    const issues = listedSections.flatMap(section => (section.info === null ? [] : section.rows.map(row => ({ sectionKey: section.key, info: section.info as RepoInfo, isCheckout: section.isCheckout, row }))))
+    const known: Known = { issues: [], settings: await read($, settings), recaps: { ...(await read($, recaps)) }, seeds: {} }
+    for (const section of listedSections) {
+      const info = section.info
+      if (info === null) continue
+      for (const row of section.rows) known.issues.push({ sectionKey: section.key, info, isCheckout: section.isCheckout, row })
+      if (!isFilteredList(section)) continue
+      const cache = await readStore<RepoCache>($, storeKeyOf('cache:', section.key))
+      addStoredIssues(known, section.key, info, section.isCheckout, cache, await readStore<unknown>($, storeKeyOf('recaps:', section.key)))
+    }
 
-    return { issues, settings: await read($, settings), recaps: await read($, recaps), seeds: {} }
+    return known
   }
-  const remote = (await $.session.repo().catch(() => null))?.remote ?? ''
-  const key = (await read($, checkoutKey)) || (keyOfRemote(remote) ?? '')
+  const key = await heldCheckoutKey($)
   const known: Known = { issues: [], settings: DEFAULT_SETTINGS, recaps: {}, seeds: {} }
   if (key === '') return known
   known.settings = readSettings(await readStore<unknown>($, storeKeyOf('settings:', key)))
   for (const sectionKey of new Set([key, ...known.settings.watch.map(specKey)])) {
     const cache = await readStore<RepoCache>($, storeKeyOf('cache:', sectionKey))
-    const rows = (Array.isArray(cache?.rows) ? cache.rows : []).filter(isRowLike)
-    if (rows.length === 0) continue
-    const stored = await readStore<Record<string, unknown>>($, storeKeyOf('recaps:', sectionKey))
-    for (const row of rows) {
-      const info = infoFromIssueUrl(row.url) ?? infoOfKey(sectionKey)
-      if (info === null) continue
-      const rowKey = rowKeyOf(sectionKey, row.number)
-      known.issues.push({ sectionKey, info, isCheckout: sectionKey === key, row })
-      const recap = typeof stored === 'object' && stored !== null ? asRecap(stored[String(row.number)]) : undefined
-      if (recap !== undefined) known.recaps[rowKey] = recap
-      const seeded = seededDetails(cache?.meta?.[String(row.number)])
-      if (seeded !== undefined && isCurrent(seeded, row)) known.seeds[rowKey] = seeded
-    }
+    if (!Array.isArray(cache?.rows) || cache.rows.length === 0) continue
+    addStoredIssues(known, sectionKey, null, sectionKey === key, cache, await readStore<unknown>($, storeKeyOf('recaps:', sectionKey)))
   }
 
   return known
@@ -2525,6 +2644,8 @@ async function planMentions($: EngineInterface, options: Options, e: PromptSubmi
   const entries = record.conversation === conversation ? record.entries : {}
   const due = resolved.filter(issue => !isRecentlyAttached(entries[rowKeyOf(issue.sectionKey, issue.row.number)], issue.row.updatedAt, turn, REATTACH_TURNS))
   if (due.length === 0) return null
+  // The tool is named only where the model can call it now (R4-RT-3).
+  const toolName = await issueToolOf($)
   const plan: MentionPlan = { context: [], attached: [], excerptOnly: [], metaOnly: [], capped: due.slice(MAX_ATTACH).map(mentionRef), records: [], turn }
   for (const issue of due.slice(0, MAX_ATTACH)) {
     const rowKey = rowKeyOf(issue.sectionKey, issue.row.number)
@@ -2547,7 +2668,7 @@ async function planMentions($: EngineInterface, options: Options, e: PromptSubmi
         source: 'cache',
         at: held.details?.fetchedAt ?? 0,
         limits: MENTION_LIMITS,
-        toolName: issueToolName,
+        toolName,
       }),
     )
     plan.attached.push(ref)
@@ -2612,6 +2733,7 @@ async function resetStore($: EngineInterface): Promise<void> {
   redoFailed.clear()
   warmFailed.clear()
   toolReads.clear()
+  toolReading.clear()
   checkoutTriedAt = Number.NEGATIVE_INFINITY
   seenFlush?.cancel()
   seenFlush = undefined
@@ -2685,7 +2807,7 @@ async function runSpike($: EngineInterface, command: string): Promise<string> {
     )
   }
   // S18 (E6): whether this host adds a plugin's tool at run time; S16 (E2, E5): what the desktop stamps on a typed prompt.
-  lines.push(`issue tool: ${issueToolName ?? `not registered (${issueToolProblem || '?'})`}`, `last prompt origin: ${lastPromptOrigin || 'none yet'}`)
+  lines.push(await issueToolLine($), `last prompt origin: ${lastPromptOrigin || 'none yet'}`)
 
   return clean(lines.join('\n'))
 }

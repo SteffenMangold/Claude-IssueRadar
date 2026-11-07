@@ -160,10 +160,14 @@ export function briefIssueKey(text: string): string | null {
 
 /**
  * Whether the conversation carries the issue as it stands: attached within the last `within` user turns and not
- * changed since. A turn count that went back (a /clear the record missed) or failed (`turnsNow` below 0) says no.
+ * changed since. A turn count that went back (a /clear the record missed) or failed (`turnsNow` below 0) says no. A
+ * prompt's block counts only once that prompt entered the transcript, so from a later turn count on (R4-RT-2): a prompt
+ * typed during a turn is recorded when it is queued, and an interrupt can put its text back into the box without the
+ * block; sent again at the same count, it carries the block again. A tool read or a brief is in the transcript at once.
  */
 export function isRecentlyAttached(record: Attached | undefined, rowUpdatedAt: string, turnsNow: number, within: number): boolean {
   if (record === undefined || turnsNow < 0 || turnsNow < record.turn || turnsNow - record.turn >= within) return false
+  if (record.via === 'prompt' && turnsNow === record.turn) return false
 
   return record.updatedAt === null || record.updatedAt >= rowUpdatedAt
 }
