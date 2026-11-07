@@ -17,8 +17,9 @@ test('the pane lists the open issues with their excerpt and actions, on desktop 
     expect(await ui.find({ key: `row-title:${ROW_7}` })).toBeDefined()
     expect(await ui.find({ key: `work:${ROW_42}` })).toBeDefined()
     expect(await ui.find({ key: `here:${ROW_42}` })).toBeDefined()
-    // Before the consent the row shows an excerpt of the body, never a recap.
-    expect(await ui.find({ type: 'Text', text: /export throws on a folder without files/ })).toBeDefined()
+    // Before the consent the row shows an excerpt of the body, never a recap. Found by the recap line's key: a hidden
+    // hover card holds the same words (E4-5, B3-BEH-5).
+    expect((await ui.find({ key: `recap:${ROW_42}` }))?.text).toMatch(/export throws on a folder without files/)
     expect(await ui.find({ key: `consent-on:${SECTION}` })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /issue-radar v9\.9\.9/ })).toBeDefined()
     if (surface === 'terminal') expect(await ui.findAll({ type: 'Svg' })).toHaveLength(0)
@@ -52,7 +53,8 @@ test('one consent per repository switches the recaps on, and switching them off 
   await ui.press({ key: 'settings' })
   await ui.press({ key: `consent:${SECTION}` })
   expect(store.get(`recaps:${SECTION}`)).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /export throws on a folder without files/ })).toBeDefined()
+  // The excerpt is back on the recap line itself, not only in a hidden hover card (E4-5, B3-BEH-5).
+  expect((await ui.find({ key: `recap:${ROW_42}` }))?.text).toMatch(/export throws on a folder without files/)
   await ui.unmount()
 })
 

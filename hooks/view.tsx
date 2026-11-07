@@ -14,7 +14,7 @@ import { ANY, GROUPS, SORTS, VIEWS, cutText, isBuiltInView, isDefaultFilter, mat
 import { REACTIONS, excerptOf } from './github'
 import type { Strings } from './i18n'
 import { INBOX_CAP } from './inbox'
-import { cardRowsOf, paneLayout, rowKeyOf, unreadCount, visibleMark } from './marks'
+import { cardRowsOf, isFilteredList, paneLayout, rowKeyOf, unreadCount, visibleMark } from './marks'
 import { linksOf, prCardLine, prChip, prLine, prRefOf } from './prs'
 import type { PrTone, ShownPr } from './prs'
 import { clean, cleanLine } from './text'
@@ -277,8 +277,9 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const canHover = state.surface === 'desktop'
   const cardKeys = new Set(canHover && options.hoverCards ? cardRowsOf(tops, state.scrollOffset, state.rows).map(found => found.key) : [])
   let textSoFar = 0
-  // E5: every row's mark, and how many rows show one.
-  const markOfRow = (section: Section, item: IssueRow): Mark | null => visibleMark(item, state.seenBase[section.key], state.glimpsed[rowKeyOf(section.key, item.number)], state.now)
+  // E5: every row's mark, and how many rows show one. A filtered list (E14) leaves an older issue its baseline does not
+  // hold unmarked (B3-BEH-2), as unreadCount does.
+  const markOfRow = (section: Section, item: IssueRow): Mark | null => visibleMark(item, state.seenBase[section.key], state.glimpsed[rowKeyOf(section.key, item.number)], state.now, isFilteredList(section))
   const unread = unreadCount(plan, state.seenBase, state.glimpsed, state.now)
   /** One line of words for a failed state, as the state blocks word it. */
   const stateText = (failed: RepoState): string => {

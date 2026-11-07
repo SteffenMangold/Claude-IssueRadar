@@ -14,7 +14,7 @@ import { dropRelations, firstLine, isRepoSpec, listIssues, metaOf, repoKey, repo
 import { MAPPED_MAX, PROBE_MAX, PROBE_PAUSE_MS, fetchBoards, fetchPrLinks } from './graph'
 import { asLanguage, strings } from './i18n'
 import { INBOX_CAP, asInboxCache, failedInbox, inboxFromRecord, inboxPeriod, isInboxDue, searchAssigned } from './inbox'
-import { ARRIVAL_TOAST_MS, LOOK_THROTTLE_MS, SEEN_KEEP_FACTOR, arrivalText, arrivalsOf, cardRowsOf, markOf, nextFade, paneLayout, readSeen, rowKeyOf, rowsInView, seenRecordOf, unreadCount, withRow } from './marks'
+import { ARRIVAL_TOAST_MS, LOOK_THROTTLE_MS, MARK_HOLD_MS, SEEN_KEEP_FACTOR, arrivalText, arrivalsOf, cardRowsOf, foldFaded, isFilteredList, markOf, nextFade, paneLayout, readSeen, rowKeyOf, rowsInView, seenRecordOf, unreadCount, withRow } from './marks'
 import type { PaneLike, RowTop } from './marks'
 import { asRecord, isPrsDue, mergeLinks, recordOf } from './prs'
 import { RECAP_VERSION, asRecap, isBetterRecap, isRecapCurrent, isRecapFor, isRecapUsable, recapIssue } from './recap'
@@ -31,8 +31,12 @@ const DETAILS_CONCURRENCY = 2
 const STORE_PREFIXES = ['cache:', 'recaps:', 'session:', 'settings:', 'debug:', 'prs:', 'inbox:', 'closed:', 'seen:'] as const
 /** E9: how many recaps of an older version (or language) a refresh redoes at most, the rows drawn first (C-E9-2). */
 const BACKFILL_PER_REFRESH = 5
+/** E9: how long a row whose recap redo failed waits before the backfill (or its opened row) asks again (B3-BEH-4). */
+const REDO_RETRY_MS = 60 * 60_000
 /** E4: how many rows' details (their comments) a refresh reads for the hover cards at most, while the pane is shown. */
 const CARD_WARM_PER_REFRESH = 2
+/** E4: how long a row whose warm-up read failed waits before it is read again, unless the issue changes (R3-RT-2). */
+const WARM_RETRY_MS = 30 * 60_000
 /** E5: a scroll counts as a look once the window rests this long, so a wheel's ticks make one look at where it stopped. */
 const SCROLL_LOOK_MS = 400
 /** E5-c: a comment of the owner's this close to an issue's last update made that update: no news to them. */
@@ -157,6 +161,8 @@ let scrollLook: Timer | undefined
 let viewport = { offset: 0, bodyRows: 24, columns: PANE_COLUMNS }
 /** E5: the rows looks covered that wait for their repository's next seen-record write (at most one per 15 s each). */
 const pendingSeen = new Map<string, Map<number, IssueRow>>()
+/** E5: the repositories whose pending rows a look in a filtered list (E14) covered: their write leaves `newest` (R3-INT-1). */
+const pendingFiltered = new Set<string>()
 /** E5: when this session last wrote each repository's seen record for a look. */
 const seenWrittenAt = new Map<string, number>()
 let seenFlush: Timer | undefined
@@ -164,6 +170,13 @@ let seenFlush: Timer | undefined
 let seenChain: Promise<void> = Promise.resolve()
 /** E5-5: a retitle that unplaced the pane stops retitling for the session. */
 let retitleOff = false
+/**
+ * E9: the rows whose recap redo (the backfill's, or an opened row's) failed, at which update and in which language, and
+ * when: their working recap stays, and nothing asks again for an hour (B3-BEH-4); a reload or the next session retries.
+ */
+const redoFailed = new Map<string, { updatedAt: string; language: Language; at: number }>()
+/** E4: the rows whose warm-up read failed, at which update and when: not read again for half an hour (R3-RT-2). */
+const warmFailed = new Map<string, { updatedAt: string; at: number }>()
 
 type Resolved = { spec: string; info: RepoInfo | null; state: RepoState; isCheckout: boolean }
 /**
@@ -396,7 +409,7 @@ async function paneTitle($: EngineInterface, options: Options): Promise<string> 
   if ((await read($, isIssueSession)) || !(await isDesktopOnly($))) return S.title
   const base = await read($, seenBase)
   // No row marked against its baseline: no count, and no need to lay the pane out.
-  const isMarked = (await read($, sections)).some(section => base[section.key] !== undefined && section.rows.some(row => markOf(row, base[section.key]) !== null))
+  const isMarked = (await read($, sections)).some(section => base[section.key] !== undefined && section.rows.some(row => markOf(row, base[section.key], isFilteredList(section)) !== null))
   if (!isMarked) return S.title
   const { plan } = paneLayout(await paneState($, options))
 
@@ -947,11 +960,10 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     await update($, recaps, current => Object.fromEntries(Object.entries(current).filter(([rowKey]) => live.has(rowKey))))
     await update($, opened, current => (current === '' || live.has(current) ? current : ''))
     // E5: each repository's baseline, before its rows are drawn, so a row is drawn with its mark from the start; the
-    // glimpses of rows no longer listed go (written only when one does: every write redraws the pane).
+    // glimpses whose hold has passed go into the baselines (R3-INT-3: a glimpse of a row no longer listed is kept, so
+    // a row that leaves the list and comes back keeps its fade; written only when one faded, every write redraws).
     await initBaselines($, options, nextSections, now)
-    if (Object.keys(await read($, glimpsed)).some(rowKey => !live.has(rowKey))) {
-      await update($, glimpsed, current => Object.fromEntries(Object.entries(current).filter(([rowKey]) => live.has(rowKey))))
-    }
+    await foldGlimpses($, now)
     // E22: an issue that left a complete default list probably just closed; its repository's closed list is read again
     // once it is 30 s old (E22-2: a capped list loses issues whenever another one is updated, so it says nothing).
     for (const section of nextSections) {
@@ -972,7 +984,7 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     const inboxLog = await refreshInbox($, options, reason, now, isShown)
     if (isShown) await refreshBoards($, nextSections, reason, now, false)
     // E5: what arrived since this session's last list, once the pull-request read named the signed-in account.
-    await announceArrivals($, options, nextSections)
+    await announceArrivals($, options, nextSections, previous)
     // The last refresh's outcome, for the spike notes and a look at the store file.
     await writeStore($, 'debug:last', {
       at: now,
@@ -1045,7 +1057,7 @@ async function hydrate($: EngineInterface, options: Options, current: readonly S
       const needsDetails = !isCurrent(known[rowKey], row)
       const needsRecap = consented && !isRecapFor(recap, row)
       if (needsDetails || needsRecap) tasks.push({ section, row, isBackfill: false })
-      else if (consented && mayBackfill && !isRecapCurrent(recap, row, options.language)) backfill.push({ section, row, isBackfill: true })
+      else if (consented && mayBackfill && !isRecapCurrent(recap, row, options.language) && !isRedoHeld(rowKey, row, options.language, now)) backfill.push({ section, row, isBackfill: true })
     }
   }
   if (backfill.length > 0) {
@@ -1112,10 +1124,19 @@ async function hydrate($: EngineInterface, options: Options, current: readonly S
   }
 }
 
+/** E9: whether a redo of this row's recap failed lately, at the issue's current update and in this language (B3-BEH-4). */
+function isRedoHeld(rowKey: string, row: IssueRow, language: Language, now: number): boolean {
+  const failed = redoFailed.get(rowKey)
+
+  return failed !== undefined && failed.updatedAt === row.updatedAt && failed.language === language && now - failed.at < REDO_RETRY_MS
+}
+
 /**
  * One issue's details when they are older than the row (or only seeded), and its recap where the repository consented:
  * always when the recap is older than the issue, and with `mayRedo` (a backfill task, an opened row) also when it was
- * asked before E9's triage or in the other language.
+ * asked before E9's triage or in the other language. A redo that fails keeps the working recap it was to replace, in
+ * the state and so in the store (V1 never touched an unchanged issue's recap), and holds that row's redo for an hour
+ * (B3-BEH-4, R3-RT-1, R3-INT-2); a recap older than the issue is replaced by the failure, as in V1.
  */
 async function hydrateOne($: EngineInterface, options: Options, section: Section, row: IssueRow, now: number, mayRedo: boolean): Promise<IssueDetails | undefined> {
   if (section.info === null) return undefined
@@ -1135,12 +1156,16 @@ async function hydrateOne($: EngineInterface, options: Options, section: Section
   }
   const consented = options.recaps && chosen.consent[section.key] === true
   const recap = (await read($, recaps))[rowKey]
-  if (consented && have !== undefined && (!isRecapFor(recap, row) || (mayRedo && !isRecapCurrent(recap, row, options.language)))) {
+  const isRedo = isRecapFor(recap, row)
+  if (consented && have !== undefined && (!isRedo || (mayRedo && !isRecapCurrent(recap, row, options.language) && !isRedoHeld(rowKey, row, options.language, now)))) {
     const made = await recapIssue($, row, have, options.language, options.recapModel, now)
-    await update($, recaps, current => ({ ...current, [rowKey]: made }))
+    // A failed redo of a working recap keeps that recap: the failure is only remembered, so it is not asked again soon.
+    const keepsOld = isRedo && recap?.error === undefined && made.error !== undefined
+    if (keepsOld) redoFailed.set(rowKey, { updatedAt: row.updatedAt, language: options.language, at: now })
+    else await update($, recaps, current => ({ ...current, [rowKey]: made }))
     const spent = made.usage.input_tokens + made.usage.output_tokens + made.usage.cache_read_input_tokens + made.usage.cache_creation_input_tokens
     if (spent > 0) await update($, tokens, current => current + spent)
-    if (made.error !== undefined) $.ui.log(`${PLUGIN}: recap of #${row.number} failed: ${made.error}`, { to: 'debug' })
+    if (made.error !== undefined) $.ui.log(`${PLUGIN}: recap of #${row.number} failed: ${made.error}${keepsOld ? ' (the earlier recap stays)' : ''}`, { to: 'debug' })
   }
 
   return have
@@ -1775,12 +1800,14 @@ function viewerFor(records: Readonly<Record<string, PrRecord>>, section: Section
 }
 
 /**
- * E5's arrivals: the issues of a default list never listed by this session before and created after the newest the
- * owner had seen, on a repository this session listed before (never on its first list). The owner's own, by the login
- * E3's read named, are acknowledged instead: what they filed is no news (E5-c). The others make the refresh's one
- * arrival toast (ranked below a failure and a proposal), while arrival toasts are on and the pane is shown (D X-1).
+ * E5's arrivals: the issues of a list never listed by this session before and created after the newest the owner had
+ * seen, on a repository this session listed before (never on its first list). A filtered list (E14) counts too, from
+ * its query's second list on (B3-BEH-3): its rows join the listed numbers, so an issue that arrives while a filter is on
+ * would otherwise never be announced, not even once the filter is cleared. The owner's own, by the login E3's read
+ * named, are acknowledged instead: what they filed is no news (E5-c). The others make the refresh's one arrival toast
+ * (ranked below a failure and a proposal), while arrival toasts are on and the pane is shown (D X-1).
  */
-async function announceArrivals($: EngineInterface, options: Options, current: readonly Section[]): Promise<void> {
+async function announceArrivals($: EngineInterface, options: Options, current: readonly Section[], previous: readonly Section[]): Promise<void> {
   const base = await read($, seenBase)
   const had = await read($, listed)
   const records = await read($, prs)
@@ -1791,12 +1818,13 @@ async function announceArrivals($: EngineInterface, options: Options, current: r
   for (const section of current) {
     if (section.info === null || section.state.kind !== 'ok') continue
     const known = had[section.key]
-    if (section.query === undefined) {
-      const viewer = viewerFor(records, section)?.toLowerCase()
-      for (const row of arrivalsOf(section.rows, base[section.key], known)) {
-        if (viewer !== undefined && row.author.toLowerCase() === viewer) own.push(rowKeyOf(section.key, row.number))
-        else arrived.push({ section, row })
-      }
+    const viewer = viewerFor(records, section)?.toLowerCase()
+    // A filter's first list of its query announces nothing, as a repository's first list does: what it brings was
+    // there before (a capped default list just did not show it); only its later lists can bring arrivals.
+    const isFirstOfQuery = section.query !== undefined && previous.find(found => found.key === section.key)?.query !== section.query
+    for (const row of isFirstOfQuery ? [] : arrivalsOf(section.rows, base[section.key], known)) {
+      if (viewer !== undefined && row.author.toLowerCase() === viewer) own.push(rowKeyOf(section.key, row.number))
+      else arrived.push({ section, row })
     }
     if (known !== undefined && section.rows.every(row => known[String(row.number)] === true)) continue
     isChanged = true
@@ -1854,27 +1882,56 @@ async function writeAcknowledged($: EngineInterface, key: string, base: SeenReco
   await writeStore($, key, withRow(stored, row, now))
 }
 
-/** E5: the title bar's pill: every row of every section counts as seen, at once and for the next visit. */
+/**
+ * E5: the title bar's pill: every row it counts is seen, at once and for the next visit: the rows each section shows,
+ * collapsed ones included, the board facet's hidden rows not (R3-INT-4: they were never on screen nor counted). The
+ * baseline takes each row as an acknowledgement does (`newest` unchanged, nothing else of the stored record copied in).
+ */
 async function markAllSeen($: EngineInterface, options: Options): Promise<void> {
   const now = await $.clock.now()
   const base = await read($, seenBase)
-  const records: Record<string, SeenRecord> = {}
-  for (const section of await read($, sections)) {
+  const { plan } = paneLayout(await paneState($, options))
+  const seen: Array<{ sectionKey: string; rows: IssueRow[] }> = []
+  for (const drawn of plan.sections) {
+    const { section, shown } = drawn
     const had = base[section.key]
-    if (section.info === null || had === undefined) continue
-    records[section.key] = await serialSeen(() => writeAllSeen($, options, section, had, now))
+    if (section.info === null || had === undefined || shown.length === 0) continue
+    await serialSeen(() => writeAllSeen($, options, section, shown, had, now))
+    seen.push({ sectionKey: section.key, rows: shown })
   }
-  await update($, seenBase, current => ({ ...current, ...records }))
-  await update($, glimpsed, () => ({}))
+  if (seen.length > 0) {
+    await update($, seenBase, current => {
+      const next = { ...current }
+      for (const { sectionKey, rows } of seen) {
+        const had = next[sectionKey]
+        if (had !== undefined) next[sectionKey] = rows.reduce((record, row) => withRow(record, row, record.at), had)
+      }
+
+      return next
+    })
+    const keys = new Set(seen.flatMap(({ sectionKey, rows }) => rows.map(row => rowKeyOf(sectionKey, row.number))))
+    if (Object.keys(await read($, glimpsed)).some(rowKey => keys.has(rowKey))) {
+      await update($, glimpsed, current => Object.fromEntries(Object.entries(current).filter(([rowKey]) => !keys.has(rowKey))))
+    }
+  }
   await syncTitle($, options)
 }
 
-async function writeAllSeen($: EngineInterface, options: Options, section: Section, base: SeenRecord, now: number): Promise<SeenRecord> {
-  const key = storeKeyOf('seen:', section.key)
-  const record = seenRecordOf(section.rows, section.rows, readSeen(await readStore<unknown>($, key)) ?? base, now, SEEN_KEEP_FACTOR * options.maxIssues)
-  await writeStore($, key, record)
+/**
+ * The rows a seen record is kept for (B3-BEH-1) and whose unseen newer issues `newest` never passes: the section's own
+ * list, or for a filtered one (E14) the repository's default list as the store keeps it (R3-INT-1).
+ */
+async function defaultListOf($: EngineInterface, section: Section | undefined, sectionKey: string): Promise<readonly IssueRow[]> {
+  if (section !== undefined && !isFilteredList(section)) return section.rows
+  const cache = await readStore<RepoCache>($, storeKeyOf('cache:', sectionKey))
 
-  return record
+  return Array.isArray(cache?.rows) ? cache.rows : []
+}
+
+async function writeAllSeen($: EngineInterface, options: Options, section: Section, shown: readonly IssueRow[], base: SeenRecord, now: number): Promise<void> {
+  const key = storeKeyOf('seen:', section.key)
+  const rows = await defaultListOf($, section, section.key)
+  await writeStore($, key, seenRecordOf(shown, rows, readSeen(await readStore<unknown>($, key)) ?? base, now, SEEN_KEEP_FACTOR * options.maxIssues, isFilteredList(section)))
 }
 
 /**
@@ -1889,18 +1946,22 @@ async function noteLook($: EngineInterface, options: Options): Promise<void> {
   // No baseline yet (before the first list, or in an issue session): nothing is marked and nothing is recorded.
   if (Object.keys(base).length === 0 || (await read($, isIssueSession))) return
   const now = await $.clock.now()
-  const { tops } = paneLayout(await paneState($, options))
+  const pane = await paneState($, options)
+  const { tops } = paneLayout(pane)
   const covered: RowTop[] = rowsInView(tops, viewport.offset, viewport.bodyRows).filter(found => base[found.sectionKey] !== undefined)
   if (covered.length === 0) return
+  const filtered = new Set(pane.sections.filter(isFilteredList).map(section => section.key))
   // A glimpse for each covered row that carries a mark not glimpsed at this update yet; written only when there is one.
   const had = await read($, glimpsed)
-  const fresh = covered.filter(found => markOf(found.row, base[found.sectionKey]) !== null && had[found.key]?.updatedAt !== found.row.updatedAt)
+  const fresh = covered.filter(found => markOf(found.row, base[found.sectionKey], filtered.has(found.sectionKey)) !== null && had[found.key]?.updatedAt !== found.row.updatedAt)
   const glimpses =
     fresh.length === 0
       ? had
       : await update($, glimpsed, current => {
           const next = { ...current }
-          for (const found of fresh) if (next[found.key]?.updatedAt !== found.row.updatedAt) next[found.key] = { at: now, updatedAt: found.row.updatedAt }
+          for (const found of fresh) {
+            if (next[found.key]?.updatedAt !== found.row.updatedAt) next[found.key] = { at: now, updatedAt: found.row.updatedAt, ...(found.row.stateReason === 'REOPENED' ? { reopened: true as const } : {}) }
+          }
 
           return next
         })
@@ -1908,6 +1969,8 @@ async function noteLook($: EngineInterface, options: Options): Promise<void> {
     const rows = pendingSeen.get(found.sectionKey) ?? new Map<number, IssueRow>()
     rows.set(found.row.number, found.row)
     pendingSeen.set(found.sectionKey, rows)
+    // A filtered look's write leaves `newest` (R3-INT-1), even when the filter is gone by the time it is written.
+    if (filtered.has(found.sectionKey)) pendingFiltered.add(found.sectionKey)
   }
   await flushSeen($, options, now)
   armFade($, options, glimpses, now)
@@ -1923,9 +1986,10 @@ async function flushSeen($: EngineInterface, options: Options, now: number): Pro
       continue
     }
     pendingSeen.delete(sectionKey)
+    const wasFiltered = pendingFiltered.delete(sectionKey)
     seenWrittenAt.set(sectionKey, now)
     const covered = [...rows.values()]
-    await serialSeen(() => writeLook($, options, sectionKey, covered, now))
+    await serialSeen(() => writeLook($, options, sectionKey, covered, wasFiltered, now))
   }
   if (wait === null || seenFlush !== undefined) return
   seenFlush = $.clock.after(wait, () => {
@@ -1938,12 +2002,18 @@ async function flushLater($: EngineInterface, options: Options): Promise<void> {
   await flushSeen($, options, await $.clock.now())
 }
 
-async function writeLook($: EngineInterface, options: Options, sectionKey: string, covered: readonly IssueRow[], now: number): Promise<void> {
+/**
+ * Writes one repository's record for the rows looks covered. Its `newest` never passes an unseen issue of the default
+ * list, and in a filtered list (E14) it stays: such a list says nothing of the issues between its rows (R3-INT-1).
+ */
+async function writeLook($: EngineInterface, options: Options, sectionKey: string, covered: readonly IssueRow[], wasFiltered: boolean, now: number): Promise<void> {
   const key = storeKeyOf('seen:', sectionKey)
   const previous = readSeen(await readStore<unknown>($, key)) ?? (await read($, seenBase))[sectionKey]
   if (previous === undefined) return
-  const rows = (await read($, sections)).find(section => section.key === sectionKey)?.rows ?? covered
-  await writeStore($, key, seenRecordOf(covered, rows, previous, now, SEEN_KEEP_FACTOR * options.maxIssues))
+  const section = (await read($, sections)).find(found => found.key === sectionKey)
+  const rows = await defaultListOf($, section, sectionKey)
+  const isFiltered = wasFiltered || section === undefined || isFilteredList(section)
+  await writeStore($, key, seenRecordOf(covered, rows, previous, now, SEEN_KEEP_FACTOR * options.maxIssues, isFiltered))
 }
 
 /** Wakes when the next mark fades, to redraw and retitle; armed after every refresh and look, so a reload recovers. */
@@ -1959,9 +2029,22 @@ function armFade($: EngineInterface, options: Options, glimpses: Readonly<Record
 }
 
 async function fadeTick($: EngineInterface, options: Options): Promise<void> {
+  await foldGlimpses($, await $.clock.now())
   $.ui.invalidate('ui.render')
   await syncTitle($, options)
   armFade($, options, await read($, glimpsed), await $.clock.now())
+}
+
+/**
+ * E5: the glimpses whose hold has passed go into the session's baselines (R3-INT-3), so a faded mark stays gone when
+ * its row leaves the list (a filter, a capped list's churn) and comes back; the others stay, listed or not. Written
+ * only when a glimpse faded (every write redraws the pane).
+ */
+async function foldGlimpses($: EngineInterface, now: number): Promise<void> {
+  const had = await read($, glimpsed)
+  if (foldFaded({}, had, now) === null) return
+  await update($, seenBase, current => foldFaded(current, had, now)?.base ?? current)
+  await update($, glimpsed, current => Object.fromEntries(Object.entries(current).filter(([, glimpse]) => now - glimpse.at < MARK_HOLD_MS)))
 }
 
 /**
@@ -1978,7 +2061,7 @@ async function acknowledgeOwnComments($: EngineInterface, options: Options, curr
     const record = base[section.key]
     if (viewer === undefined || record === undefined) continue
     for (const row of section.rows) {
-      const mark = markOf(row, record)
+      const mark = markOf(row, record, isFilteredList(section))
       if (mark === null || mark === 'new') continue
       const rowKey = rowKeyOf(section.key, row.number)
       const have = known[rowKey]
@@ -1996,6 +2079,9 @@ async function acknowledgeOwnComments($: EngineInterface, options: Options, curr
  * E4's warm-up: a card shows only what the session holds (no hook runs on hover), so the comments of up to two rows
  * near the pane's window whose details were only seeded from the store are read per refresh, while the pane is shown
  * on the desktop (D X-1) and the cards are on. The comments stay in the session's state; the recap is not touched.
+ * It reads only repositories whose list is ok and that no back-off holds (R3-RT-2: a failed list keeps its rows drawn);
+ * a rate limit or a lost network it meets backs the repository off, its list too, and ends the warm-up; a row whose
+ * read failed waits half an hour unless its issue changes.
  */
 async function warmCards($: EngineInterface, options: Options, now: number): Promise<void> {
   if (!options.hoverCards) return
@@ -2006,21 +2092,28 @@ async function warmCards($: EngineInterface, options: Options, now: number): Pro
   if (!surfaces.some(surface => surface === 'desktop')) return
   const pane = await paneState($, options)
   const { tops } = paneLayout(pane)
+  const isReadable = (sectionKey: string) => pane.sections.some(section => section.key === sectionKey && section.state.kind === 'ok') && now >= (backoffUntil.get(sectionKey) ?? 0)
   const due = cardRowsOf(tops, viewport.offset, viewport.bodyRows)
     .filter(found => {
       const have = pane.details[found.key]
+      const failed = warmFailed.get(found.key)
+      const isHeld = failed !== undefined && failed.updatedAt === found.row.updatedAt && now - failed.at < WARM_RETRY_MS
 
-      return have !== undefined && have.fetchedAt === 0 && have.commentCount > 0
+      return have !== undefined && have.fetchedAt === 0 && have.commentCount > 0 && !isHeld && isReadable(found.sectionKey)
     })
     .slice(0, CARD_WARM_PER_REFRESH)
   for (const found of due) {
     const info = pane.sections.find(section => section.key === found.sectionKey)?.info
-    if (info === null || info === undefined) continue
+    if (info === null || info === undefined || now < (backoffUntil.get(found.sectionKey) ?? 0)) continue
     const viewed = await viewIssue($, info, found.row, now)
     if ('state' in viewed) {
       $.ui.log(`${PLUGIN}: card details of #${found.row.number} failed: ${viewed.state.kind} ${viewed.state.detail ?? ''}`, { to: 'debug' })
+      warmFailed.set(found.key, { updatedAt: found.row.updatedAt, at: now })
+      backoffFor(found.sectionKey, viewed.state, now)
+      if (viewed.state.kind === 'rate-limited' || viewed.state.kind === 'offline') return
       continue
     }
+    warmFailed.delete(found.key)
     const fetched = viewed.details
     await update($, details, current => (current[found.key] !== undefined && current[found.key]?.fetchedAt !== 0 ? current : { ...current, [found.key]: fetched }))
   }
@@ -2045,7 +2138,10 @@ async function resetStore($: EngineInterface): Promise<void> {
   closedTriedAt.clear()
   closedNudge.clear()
   pendingSeen.clear()
+  pendingFiltered.clear()
   seenWrittenAt.clear()
+  redoFailed.clear()
+  warmFailed.clear()
   seenFlush?.cancel()
   seenFlush = undefined
   fade?.cancel()

@@ -19,6 +19,7 @@ import {
   arrivalsOf,
   cardRowsOf,
   drawnRowsOf,
+  foldFaded,
   markOf,
   nextFade,
   readSeen,
@@ -444,10 +445,68 @@ test('seenRecordOf keeps the most recently updated issues, takes the newest upda
   // The older update seen now does not lower what was seen; #3, newer than the last visit and not covered, stays new.
   expect(record).toEqual({ v: 1, at: NOW, newest: '2026-11-01T00:00:00Z', rows: { '1': '2026-11-02T00:00:00Z', '2': '2026-10-01T00:00:00Z', '4': '2026-11-05T00:00:00Z' }, reopened: { '4': true } })
   expect(seenRecordOf([...covered, unseen], [...covered, unseen], previous, NOW, 10).newest).toBe('2026-11-05T00:00:00Z')
-  // Bounded by size, the most recently updated kept (E5-3): not pruned to the list.
+  // Bounded by size, the listed ones and then the most recently updated kept (E5-3): not pruned to the list.
   expect(Object.keys(seenRecordOf(covered, covered, previous, NOW, 2).rows).sort()).toEqual(['1', '4'])
+  expect(Object.keys(seenRecordOf([], [row(2)], previous, NOW, 2).rows).sort()).toEqual(['1', '2'])
   // A first run takes the whole list.
   expect(seenRecordOf([], [unseen], null, NOW, 10)).toEqual({ v: 1, at: NOW, newest: '2026-11-04T00:00:00Z', rows: { '3': '2026-11-04T00:00:00Z' } })
+})
+
+test('seenRecordOf never drops a listed or covered issue for newer ones that closed since, and a filtered look leaves newest (B3-BEH-1, R3-INT-1)', () => {
+  // The last visit saw #42 and the old #7, and three issues since closed, all updated after #7.
+  const previous: SeenRecord = {
+    v: 1,
+    at: 1,
+    newest: '2026-11-03T10:00:00Z',
+    rows: { '42': '2026-11-05T09:00:00Z', '7': '2026-01-01T00:00:00Z', '100': '2026-11-04T00:00:00Z', '101': '2026-11-03T00:00:00Z', '102': '2026-11-02T00:00:00Z' },
+    reopened: { '7': true, '102': true },
+  }
+  const list = [row(42, { createdAt: '2026-11-03T10:00:00Z', updatedAt: '2026-11-05T09:00:00Z' }), row(7, { createdAt: '2025-10-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' })]
+  const record = seenRecordOf(list.slice(0, 1), list, previous, NOW, 4)
+  expect(Object.keys(record.rows).sort()).toEqual(['100', '101', '42', '7'])
+  expect(record.reopened).toEqual({ '7': true })
+  // Unchanged, so unmarked against it.
+  expect(markOf(list[1] ?? row(0), record)).toBeNull()
+
+  // A look in a filtered list: its covered old issue is kept beside the default list's, and newest stays, though a
+  // covered issue is newer.
+  const old = row(3, { createdAt: '2025-01-01T00:00:00Z', updatedAt: '2025-02-01T00:00:00Z' })
+  const fresh = row(60, { createdAt: '2026-11-05T12:00:00Z', updatedAt: '2026-11-05T12:00:00Z' })
+  const filtered = seenRecordOf([old, fresh], list, previous, NOW, 4, true)
+  expect(Object.keys(filtered.rows).sort()).toEqual(['3', '42', '60', '7'])
+  expect(filtered.newest).toBe('2026-11-03T10:00:00Z')
+  expect(seenRecordOf([old, fresh], list, previous, NOW, 4).newest).toBe('2026-11-05T12:00:00Z')
+})
+
+test('markOf in a filtered list: an older issue the record does not hold is unmarked; a new one and a change to a held one are not (B3-BEH-2)', () => {
+  const base: SeenRecord = { v: 1, at: 1, newest: '2026-11-02T00:00:00Z', rows: { '1': '2026-11-01T00:00:00Z' } }
+  const old = row(2, { createdAt: '2025-01-01T00:00:00Z', updatedAt: '2025-02-01T00:00:00Z' })
+  expect(markOf(old, base)).toBe('updated')
+  expect(markOf(old, base, true)).toBeNull()
+  expect(markOf({ ...old, stateReason: 'REOPENED' }, base, true)).toBeNull()
+  expect(markOf(row(3, { createdAt: '2026-11-03T00:00:00Z', updatedAt: '2026-11-03T00:00:00Z' }), base, true)).toBe('new')
+  expect(markOf(row(1, { updatedAt: '2026-11-04T00:00:00Z' }), base, true)).toBe('updated')
+  expect(visibleMark(old, base, undefined, NOW, true)).toBeNull()
+  // The pill counts by the same rule.
+  const filteredSection = section([old], SECTION, { query: 'label:bug' })
+  expect(unreadCount(drawnRowsOf(drawn([filteredSection], { filterKey: undefined })), { [SECTION]: base }, {}, NOW)).toBe(0)
+  expect(unreadCount(drawnRowsOf(drawn([section([old])])), { [SECTION]: base }, {}, NOW)).toBe(1)
+})
+
+test('foldFaded takes the glimpses whose hold passed into the baselines and keeps the others, listed or not (R3-INT-3)', () => {
+  const base: Record<string, SeenRecord> = { [SECTION]: { v: 1, at: 1, newest: '2026-11-01T00:00:00Z', rows: { '7': '2026-10-20T00:00:00Z' } } }
+  const glimpsed = {
+    [`${SECTION}#42`]: { at: NOW, updatedAt: '2026-11-05T09:00:00Z', reopened: true as const },
+    [`${SECTION}#7`]: { at: NOW, updatedAt: '2026-11-01T09:00:00Z' },
+    [`${SECTION}#9`]: { at: NOW + 60_000, updatedAt: '2026-11-06T00:00:00Z' },
+    'gone/repo#1': { at: NOW, updatedAt: '2026-11-01T00:00:00Z' },
+  }
+  expect(foldFaded(base, glimpsed, NOW + MARK_HOLD_MS - 1)).toBeNull()
+  const folded = foldFaded(base, glimpsed, NOW + MARK_HOLD_MS)
+  expect(folded?.base[SECTION]).toEqual({ v: 1, at: 1, newest: '2026-11-01T00:00:00Z', rows: { '7': '2026-11-01T09:00:00Z', '42': '2026-11-05T09:00:00Z' }, reopened: { '42': true } })
+  expect(Object.keys(folded?.glimpsed ?? {})).toEqual([`${SECTION}#9`])
+  // A glimpse of an update older than the baseline holds lowers nothing.
+  expect(foldFaded(base, { [`${SECTION}#7`]: { at: NOW, updatedAt: '2026-10-01T00:00:00Z' } }, NOW + MARK_HOLD_MS)?.base[SECTION]?.rows['7']).toBe('2026-10-20T00:00:00Z')
 })
 
 test('withRow acknowledges one row and leaves newest; readSeen checks every field', () => {
@@ -937,4 +996,327 @@ test('more than 100 rows read their pull-request states in more than one request
   // The 111th row has its chip too.
   expect((await ui.find({ key: `prs:${SECTION}#890` }))?.text).toBe(`${DE.prRef('#57')} · ${DE.prOpen}`)
   await ui.unmount()
+})
+
+// Batch 3 review fixes -----------------------------------------------------------
+
+/** The search a filtered list asked gh for, or null for the default list. */
+function searchOf(args: readonly string[]): string | null {
+  return args.find(arg => arg.startsWith('--search='))?.slice('--search='.length) ?? null
+}
+
+/** A filtered list's answer: gh's search names each row's state, and the pane keeps the open ones. */
+function searched(rows: ReadonlyArray<Record<string, unknown>>): Ran {
+  return ran(JSON.stringify(rows.map(found => ({ ...found, state: 'OPEN' }))))
+}
+
+/** Every issue of the default list seen as it stands. */
+const ALL_SEEN: SeenRecord = { v: 1, at: 1, newest: '2026-11-03T10:00:00Z', rows: { '42': '2026-11-05T09:00:00Z', '7': '2026-11-01T09:00:00Z' } }
+
+test('a look keeps every listed issue in the bounded record, however many newer ones closed since (B3-BEH-1)', { options: { maxIssues: 2, recaps: false } }, async ($, on) => {
+  // Seen at the last visit: #42 and #7 as they stand, and three issues that closed since, all updated after #7 (the
+  // record keeps 2 x 2 issues).
+  const closedSince = { '100': '2026-11-04T00:00:00Z', '101': '2026-11-03T00:00:00Z', '102': '2026-11-02T00:00:00Z' }
+  const { store } = project(on, { stored: { [SEEN]: { ...ALL_SEEN, rows: { ...ALL_SEEN.rows, ...closedSince } } } })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect(Object.keys(seenOf(store).rows).sort()).toEqual(['100', '101', '42', '7'])
+  expect(await ui.find({ key: `mark:${ROW_7}` })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the unread pill clears an unchanged issue that a bounded record had lost, for good (B3-BEH-1)', { options: { maxIssues: 2, recaps: false } }, async ($, on) => {
+  // The record as a look of the batch-3 build left it: #7 cut for issues that closed since.
+  const lost: SeenRecord = { ...ALL_SEEN, rows: { '42': '2026-11-05T09:00:00Z', '100': '2026-11-04T00:00:00Z', '101': '2026-11-03T00:00:00Z', '102': '2026-11-02T00:00:00Z' } }
+  const { store } = project(on, { stored: { [SEEN]: lost } })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: `mark:${ROW_7}` }))?.text).toBe(DE.marks.updated)
+  await ui.press({ key: 'seen-all' })
+  expect(await ui.find({ key: `mark:${ROW_7}` })).toBeUndefined()
+  expect(await ui.find({ key: 'seen-all' })).toBeUndefined()
+  expect(seenOf(store).rows['7']).toBe('2026-11-01T09:00:00Z')
+  expect(Object.keys(seenOf(store).rows)).toHaveLength(4)
+  await ui.unmount()
+})
+
+test('a filter that brings an old, untouched issue the record does not hold draws no mark, no pill and no count (B3-BEH-2, R3-INT-1)', { options: { recaps: false } }, async ($, on) => {
+  const old = listed(4, '2025-02-01T00:00:00Z', { createdAt: '2025-01-01T00:00:00Z', title: 'Old untouched bug' })
+  const { titles } = project(on, { stored: { [SEEN]: ALL_SEEN }, gh: args => (isList(args) && searchOf(args) !== null ? searched([old]) : undefined) })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'filter' })
+  await ui.input({ key: 'filter-search:0', text: 'label:bug' })
+  await clock.advance(1_000)
+  expect(await ui.find({ key: `row-title:${SECTION}#4` })).toBeDefined()
+  expect(await ui.find({ key: `mark:${SECTION}#4` })).toBeUndefined()
+  expect(await ui.find({ key: 'seen-all' })).toBeUndefined()
+  // Collapsed, the section counts no marked row either; the title never carried a count.
+  await ui.press({ key: `section:${SECTION}` })
+  expect(await ui.find({ key: `marks:${SECTION}` })).toBeUndefined()
+  expect(titles.every(title => title === 'Issues')).toBe(true)
+  await ui.unmount()
+})
+
+test('a look in a filtered list records its rows but leaves newest below an unseen issue of the default list (R3-INT-1)', { options: { recaps: false } }, async ($, on) => {
+  // #42 (created 2026-11-03) is new and unseen; the filter lists only #60, created after it.
+  const later = listed(60, '2026-11-05T12:00:00Z')
+  const { store } = project(on, {
+    stored: { [SEEN]: { v: 1, at: 1, newest: '2026-10-15T00:00:00Z', rows: { '7': '2026-11-01T09:00:00Z' } } },
+    gh: args => (isList(args) ? (searchOf(args) !== null ? searched([later]) : ran(JSON.stringify([...ROWS, later]))) : undefined),
+  })
+  const clock = await started($, on)
+  // A window of two rows (the title bar): opening the filter covers no row of the default list.
+  const small = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, scroll: { offset: 0, bodyRows: 2 } } })
+  await small.press({ key: 'filter' })
+  await small.input({ key: 'filter-search:0', text: 'label:bug' })
+  await clock.advance(20_000)
+  expect(seenOf(store).at).toBe(1)
+  await small.unmount()
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect(seenOf(store).rows['60']).toBe('2026-11-05T12:00:00Z')
+  expect(seenOf(store).newest).toBe('2026-10-15T00:00:00Z')
+  await ui.unmount()
+})
+
+test('a faded mark stays gone when its row leaves the list and comes back with a filter round trip; a later change is an update (R3-INT-3)', { options: { recaps: false } }, async ($, on) => {
+  let updated42 = '2026-11-05T09:00:00Z'
+  const { titles } = project(on, {
+    stored: { [SEEN]: LAST_VISIT },
+    gh: args => {
+      if (isList(args)) return searchOf(args) !== null ? searched(ROWS.filter(found => found['number'] === 7)) : ran(JSON.stringify(ROWS.map(found => (found['number'] === 42 ? { ...found, updatedAt: updated42 } : found))))
+
+      return viewAt(args, updated42)
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  await clock.advance(MARK_HOLD_MS + 2_000)
+  expect(await ui.find({ key: `mark:${ROW_42}` })).toBeUndefined()
+  expect(titles.at(-1)).toBe('Issues')
+
+  // A filter that does not list #42, then cleared: #42 is listed again, as seen.
+  await ui.press({ key: 'filter' })
+  await ui.input({ key: 'filter-search:0', text: 'label:bug' })
+  await clock.advance(2_000)
+  expect(await ui.find({ key: `row-title:${ROW_7}` })).toBeDefined()
+  expect(await ui.find({ key: `row-title:${ROW_42}` })).toBeUndefined()
+  await ui.press({ key: 'filter-clear' })
+  await clock.advance(2_000)
+  expect(await ui.find({ key: `row-title:${ROW_42}` })).toBeDefined()
+  expect(await ui.find({ key: `mark:${ROW_42}` })).toBeUndefined()
+  expect(await ui.find({ key: `mark:${ROW_7}` })).toBeUndefined()
+  expect(await ui.find({ key: 'seen-all' })).toBeUndefined()
+  expect(titles.at(-1)).toBe('Issues')
+
+  // The faded `neu` row was seen: when it changes, it is an update, not new again.
+  updated42 = '2026-11-06T12:30:00Z'
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect((await ui.find({ key: `mark:${ROW_42}` }))?.text).toBe(DE.marks.updated)
+  await ui.unmount()
+})
+
+test('a glimpse outlives its row leaving the capped list: the mark fades when it comes back (R3-INT-3)', { options: { recaps: false } }, async ($, on) => {
+  let rows: Array<Record<string, unknown>> = ROWS
+  project(on, { stored: { [SEEN]: LAST_VISIT }, gh: args => (isList(args) ? ran(JSON.stringify(rows)) : undefined) })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  // #7 drops out of the list for one refresh, then comes back unchanged.
+  rows = ROWS.filter(found => found['number'] !== 7)
+  await tick(clock)
+  expect(await ui.find({ key: `row-title:${ROW_7}` })).toBeUndefined()
+  rows = ROWS
+  await tick(clock)
+  expect((await ui.find({ key: `mark:${ROW_7}` }))?.text).toBe(DE.marks.updated)
+  await clock.advance(MARK_HOLD_MS)
+  expect(await ui.find({ key: `mark:${ROW_7}` })).toBeUndefined()
+  expect(await ui.find({ key: 'seen-all' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the unread pill acknowledges what it counts: a marked row the board facet hides stays marked (R3-INT-4)', { options: { recaps: false } }, async ($, on) => {
+  const onBoard = (status: string) => ({ project: { number: 3, title: 'Roadmap', closed: false, owner: { login: 'acme' } }, status: { name: status } })
+  const boardsAnswer = graphAnswer({ repository: { i42: { projectItems: { nodes: [onBoard('In Progress')] } }, i7: { projectItems: { nodes: [onBoard('Todo')] } } }, rateLimit: LIMIT })
+  project(on, {
+    stored: { [SEEN]: LAST_VISIT, [SETTINGS]: { watch: [], consent: {}, collapsed: {}, boards: true } },
+    gh: args => (args[0] === 'api' && op(args) === 'IssueRadarBoards' ? boardsAnswer : undefined),
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'filter' })
+  await ui.select({ key: 'filter-board', value: 'acme/3:In Progress' })
+  expect(await ui.find({ key: `row-title:${ROW_7}` })).toBeUndefined()
+  expect((await ui.find({ key: 'seen-all' }))?.props['label']).toBe(DE.unread(1))
+  await ui.press({ key: 'seen-all' })
+  expect(await ui.find({ key: `mark:${ROW_42}` })).toBeUndefined()
+  await ui.select({ key: 'filter-board', value: '*' })
+  expect((await ui.find({ key: `mark:${ROW_7}` }))?.text).toBe(DE.marks.updated)
+  expect((await ui.find({ key: 'seen-all' }))?.props['label']).toBe(DE.unread(1))
+  await ui.unmount()
+})
+
+test('an issue that arrives while a filter is on is announced; what a filter first lists is not (B3-BEH-3)', { options: { recaps: false } }, async ($, on) => {
+  // #49 is new since the last visit but was never in the default list; #50 is filed while the filter is on.
+  const earlier = listed(49, '2026-11-06T11:00:00Z', { title: 'Older bug' })
+  const filed = listed(50, '2026-11-06T12:01:00Z', { title: 'Crash on save' })
+  let hasFiled = false
+  const { toasts } = project(on, {
+    stored: { [SEEN]: ALL_SEEN },
+    gh: args => {
+      if (!isList(args)) return undefined
+      const fresh = hasFiled ? [filed] : []
+
+      return searchOf(args) !== null ? searched([...fresh, earlier, ...ROWS.filter(found => found['number'] === 42)]) : ran(JSON.stringify([...fresh, ...ROWS]))
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'filter' })
+  await ui.input({ key: 'filter-search:0', text: 'label:bug' })
+  await clock.advance(1_000)
+  expect((await ui.find({ key: `mark:${SECTION}#49` }))?.text).toBe(DE.marks.new)
+  expect(toasts).toEqual([])
+
+  hasFiled = true
+  await tick(clock)
+  expect(toasts).toEqual([DE.arrivedOne('#50', 'Crash on save')])
+  expect((await ui.find({ key: `mark:${SECTION}#50` }))?.text).toBe(DE.marks.new)
+  // Cleared, the default list announces it no second time.
+  await ui.press({ key: 'filter-clear' })
+  await clock.advance(1_000)
+  await tick(clock)
+  expect(toasts).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('a redo whose model call fails keeps the working recap, drawn and stored, and is not asked again soon (B3-BEH-4, R3-RT-1, R3-INT-2)', async ($, on) => {
+  let isDown = true
+  const { store, prompts, setShown } = project(on, {
+    model: request => {
+      if (isDown) throw new Error('model unavailable')
+
+      return triageModel(request)
+    },
+    stored: {
+      ...CONSENT,
+      [`recaps:${SECTION}`]: {
+        '42': { updatedAt: '2026-11-05T09:00:00Z', text: 'Alter Recap 42', model: 'haiku', at: 1, usage: USAGE },
+        '7': { updatedAt: '2026-11-01T09:00:00Z', text: 'Alter Recap 7', model: 'haiku', at: 1, usage: USAGE },
+      },
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await tick(clock)
+  // The backfill asked for both and failed: the V1 recaps stay, on screen and on disk.
+  expect(prompts).toHaveLength(2)
+  expect((await ui.find({ key: `recap:${ROW_42}` }))?.text).toBe('Alter Recap 42')
+  expect((store.get(`recaps:${SECTION}`) as Record<string, Recap>)['42']).toMatchObject({ text: 'Alter Recap 42' })
+  expect((store.get(`recaps:${SECTION}`) as Record<string, Recap>)['7']).toMatchObject({ text: 'Alter Recap 7' })
+  expect(await ui.find({ key: `triage:${ROW_42}:size` })).toBeUndefined()
+
+  // The model answers again: the failed rows wait out their hour, then gain their triage.
+  isDown = false
+  await tick(clock)
+  expect(prompts).toHaveLength(2)
+  // An hour on (hidden meanwhile, so the timer lists nothing), the next refresh asks again.
+  setShown(false)
+  await clock.advance(60 * 60_000)
+  setShown(true)
+  await tick(clock)
+  expect(prompts).toHaveLength(4)
+  expect((await ui.find({ key: `triage:${ROW_42}:size` }))?.text).toBe(DE.size('S'))
+  await ui.unmount()
+})
+
+/** Six seeded rows with comments to warm (the first never is), and gh's rate-limit answer. */
+const WARM_AT = '2026-11-02T00:00:00Z'
+const WARM_ROWS = [101, 102, 103, 104, 105, 106]
+const WARM_META = { [`cache:${SECTION}`]: { fetchedAt: NOW - 3_600_000, rows: [], meta: Object.fromEntries(WARM_ROWS.map(number => [String(number), { updatedAt: WARM_AT, commentCount: 3, excerpt: 'x', linkedPrs: [] }])) } }
+const RATE_LIMITED = ran('', 1, 'gh: API rate limit exceeded for user ID 1.')
+
+test('the card warm-up reads nothing from a repository whose list is rate-limited (R3-RT-2)', async ($, on) => {
+  let isListLimited = false
+  const { argv } = project(on, {
+    stored: WARM_META,
+    gh: args => (isList(args) ? (isListLimited ? RATE_LIMITED : ran(JSON.stringify(WARM_ROWS.map(number => listed(number, WARM_AT))))) : viewAt(args, WARM_AT)),
+  })
+  const clock = await started($, on)
+  expect(count(argv, 'issue', 'view')).toBe(2)
+  // The list is limited and backs off; its rows stay drawn under the state, and none is read for a card.
+  isListLimited = true
+  await tick(clock, 2)
+  expect(count(argv, 'issue', 'list')).toBe(2)
+  expect(count(argv, 'issue', 'view')).toBe(2)
+})
+
+test('a rate limit the warm-up meets stops it and backs the repository off, its list too (R3-RT-2)', async ($, on) => {
+  let areViewsLimited = false
+  const { argv } = project(on, {
+    stored: WARM_META,
+    gh: args => {
+      if (isList(args)) return ran(JSON.stringify(WARM_ROWS.map(number => listed(number, WARM_AT))))
+      if (args[0] === 'issue' && args[1] === 'view' && areViewsLimited) return RATE_LIMITED
+
+      return viewAt(args, WARM_AT)
+    },
+  })
+  const clock = await started($, on)
+  expect(count(argv, 'issue', 'view')).toBe(2)
+  areViewsLimited = true
+  await tick(clock)
+  expect(count(argv, 'issue', 'view')).toBe(3)
+  const lists = count(argv, 'issue', 'list')
+  await tick(clock)
+  expect(count(argv, 'issue', 'view')).toBe(3)
+  expect(count(argv, 'issue', 'list')).toBe(lists)
+})
+
+test('the card warm-up reads nothing from a repository whose list failed, even with no back-off (R3-RT-2)', async ($, on) => {
+  const numbers = [101, 102, 103, 104, 105, 106]
+  const at = '2026-11-02T00:00:00Z'
+  const meta = Object.fromEntries(numbers.map(number => [String(number), { updatedAt: at, commentCount: 3, excerpt: 'x', linkedPrs: [] }]))
+  let isListFailing = false
+  const { argv } = project(on, {
+    stored: { [`cache:${SECTION}`]: { fetchedAt: NOW - 3_600_000, rows: [], meta } },
+    gh: args => (isList(args) ? (isListFailing ? ran('', 1, 'HTTP 502: Bad Gateway (https://api.github.com/graphql)') : ran(JSON.stringify(numbers.map(number => listed(number, at))))) : viewAt(args, at)),
+  })
+  const clock = await started($, on)
+  expect(count(argv, 'issue', 'view')).toBe(2)
+  // The list fails unclassified (no back-off): its last rows stay drawn under the error, and none is read for a card.
+  isListFailing = true
+  await tick(clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: `row-title:${SECTION}#104` })).toBeDefined()
+  expect(count(argv, 'issue', 'view')).toBe(2)
+  await ui.unmount()
+})
+
+test('a row whose warm-up read failed is not read again on the next refresh (R3-RT-2)', async ($, on) => {
+  const numbers = [101, 102, 103, 104, 105, 106]
+  const at = '2026-11-02T00:00:00Z'
+  const meta = Object.fromEntries(numbers.map(number => [String(number), { updatedAt: at, commentCount: 3, excerpt: 'x', linkedPrs: [] }]))
+  const { argv } = project(on, {
+    stored: { [`cache:${SECTION}`]: { fetchedAt: NOW - 3_600_000, rows: [], meta } },
+    gh: args => {
+      if (isList(args)) return ran(JSON.stringify(numbers.map(number => listed(number, at))))
+      if (args[0] === 'issue' && args[1] === 'view' && args[2] === '102') return ran('', 1, 'HTTP 502: Bad Gateway (https://api.github.com/graphql)')
+
+      return viewAt(args, at)
+    },
+  })
+  const clock = await started($, on)
+  await tick(clock, 2)
+  const viewsOf = (number: string) => argv.filter(call => call[1] === 'issue' && call[2] === 'view' && call[3] === number).length
+  expect(viewsOf('102')).toBe(1)
+  // The others were warmed meanwhile.
+  expect(viewsOf('103') + viewsOf('104') + viewsOf('105') + viewsOf('106')).toBe(4)
 })

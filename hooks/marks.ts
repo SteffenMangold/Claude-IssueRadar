@@ -225,24 +225,34 @@ export function readSeen(stored: unknown): SeenRecord | null {
   return record
 }
 
-/** `record` bounded to the `keep` most recently updated issues (E5-3: a capped list's churn never drops what is seen). */
-function bounded(rows: Record<string, string>, reopened: Record<string, true>, keep: number): Pick<SeenRecord, 'rows' | 'reopened'> {
-  const kept = Object.entries(rows)
+/**
+ * `record` bounded to `keep` issues (E5-3: by size, not by the capped list, whose churn would drop what is seen): every
+ * issue in `held` stays, whatever its update time (B3-BEH-1: issues that closed since, seen at newer updates, must never
+ * push out an unchanged open one the list still shows), and the most recently updated others fill what is left.
+ */
+function bounded(rows: Record<string, string>, reopened: Record<string, true>, keep: number, held: ReadonlySet<string>): Pick<SeenRecord, 'rows' | 'reopened'> {
+  const entries = Object.entries(rows)
+  const pinned = entries.filter(([key]) => held.has(key))
+  const others = entries
+    .filter(([key]) => !held.has(key))
     .sort((a, b) => (a[1] < b[1] ? 1 : a[1] > b[1] ? -1 : 0))
-    .slice(0, Math.max(1, keep))
-  const flags = Object.fromEntries(Object.keys(reopened).filter(number => kept.some(([key]) => key === number)).map(number => [number, true as const]))
+    .slice(0, Math.max(0, Math.max(1, keep) - pinned.length))
+  const kept = new Map([...pinned, ...others])
+  const flags = Object.fromEntries(Object.keys(reopened).filter(number => kept.has(number)).map(number => [number, true as const]))
 
   return Object.keys(flags).length > 0 ? { rows: Object.fromEntries(kept), reopened: flags } : { rows: Object.fromEntries(kept) }
 }
 
 /**
- * A repository's seen record after a look covered `covered` of its `listed` rows: each covered row at the newest update
- * time seen of it (ISO times compare as text), the reopened ones noted, `newest` advanced to the covered rows' newest
- * creation, but never past an issue the list holds that is newer than the last visit and was not covered (it stays new
- * for the next visit), bounded to `keep` issues by update time. With no previous record (a first run) every listed row
- * counts as covered.
+ * A repository's seen record after a look covered `covered` of its `listed` rows (the default list's: a filtered view
+ * passes the repository's stored default list): each covered row at the newest update time seen of it (ISO times
+ * compare as text), the reopened ones noted, `newest` advanced to the covered rows' newest creation, but never past an
+ * issue the list holds that is newer than the last visit and was not covered (it stays new for the next visit), bounded
+ * to `keep` issues by update time, the listed and covered ones always kept (B3-BEH-1). A look in a filtered list
+ * (`isFiltered`) leaves `newest` as it was: its rows say nothing of the issues between them (R3-INT-1). With no previous
+ * record (a first run) every listed row counts as covered.
  */
-export function seenRecordOf(covered: readonly IssueRow[], listed: readonly IssueRow[], previous: SeenRecord | null, now: number, keep: number): SeenRecord {
+export function seenRecordOf(covered: readonly IssueRow[], listed: readonly IssueRow[], previous: SeenRecord | null, now: number, keep: number, isFiltered = false): SeenRecord {
   const rows: Record<string, string> = { ...(previous?.rows ?? {}) }
   const reopened: Record<string, true> = { ...(previous?.reopened ?? {}) }
   const seen = previous === null ? listed : covered
@@ -256,9 +266,10 @@ export function seenRecordOf(covered: readonly IssueRow[], listed: readonly Issu
   const unseen = listed.filter(row => rows[String(row.number)] === undefined && row.createdAt > base).map(row => row.createdAt)
   const ceiling = unseen.length === 0 ? null : unseen.reduce((low, time) => (time < low ? time : low))
   let newest = base
-  for (const row of seen) if (row.createdAt > newest && (ceiling === null || row.createdAt < ceiling)) newest = row.createdAt
+  if (!isFiltered || previous === null) for (const row of seen) if (row.createdAt > newest && (ceiling === null || row.createdAt < ceiling)) newest = row.createdAt
+  const held = new Set([...listed, ...seen].map(row => String(row.number)))
 
-  return { v: 1, at: now, newest, ...bounded(rows, reopened, keep) }
+  return { v: 1, at: now, newest, ...bounded(rows, reopened, keep, held) }
 }
 
 /** `record` with one row acknowledged (opened, worked on, taken here): `newest` stays, so an unseen older issue stays new. */
@@ -275,22 +286,31 @@ export function withRow(record: SeenRecord, row: IssueRow, now: number): SeenRec
  * Why a row is marked against the session's baseline, or null. `new`: the owner never saw it and it was created after
  * the newest they saw. `reopened`: changed since, GitHub calls it reopened, and the owner never saw it reopened (the
  * reason stays on the issue for as long as it is open, so a later change of an issue seen reopened is `updated`, E5-2).
- * `updated`: any other change since, or an older issue the record does not hold. No baseline: no marks (a first run).
+ * `updated`: any other change since, or an older issue the record does not hold (one that came back into the capped
+ * default list). No baseline: no marks (a first run). In a filtered list (`isFiltered`, E14) an older issue the record
+ * does not hold is unmarked: such a list is no capped window of the open issues, and the record keeps only the most
+ * recently updated ones, so it brings old, untouched issues the owner may well have seen (B3-BEH-2, R3-INT-1).
  */
-export function markOf(row: IssueRow, base: SeenRecord | undefined): Mark | null {
+export function markOf(row: IssueRow, base: SeenRecord | undefined, isFiltered = false): Mark | null {
   if (base === undefined) return null
   const key = String(row.number)
   const seen = base.rows[key]
   if (seen !== undefined && row.updatedAt <= seen) return null
   if (seen === undefined && row.createdAt > base.newest) return 'new'
+  if (seen === undefined && isFiltered) return null
   if (row.stateReason === 'REOPENED' && base.reopened?.[key] !== true) return 'reopened'
 
   return 'updated'
 }
 
+/** Whether a section is a filtered list (E14), whose rows `markOf` reads as such. */
+export function isFilteredList(section: Pick<Section, 'query'>): boolean {
+  return section.query !== undefined
+}
+
 /** The mark a row shows: none once a look saw it at this update time ten minutes ago or longer. */
-export function visibleMark(row: IssueRow, base: SeenRecord | undefined, glimpse: Glimpse | undefined, now: number): Mark | null {
-  const mark = markOf(row, base)
+export function visibleMark(row: IssueRow, base: SeenRecord | undefined, glimpse: Glimpse | undefined, now: number, isFiltered = false): Mark | null {
+  const mark = markOf(row, base, isFiltered)
   if (mark === null) return null
 
   return glimpse !== undefined && glimpse.updatedAt === row.updatedAt && now - glimpse.at >= MARK_HOLD_MS ? null : mark
@@ -300,10 +320,37 @@ export function visibleMark(row: IssueRow, base: SeenRecord | undefined, glimpse
 export function unreadCount(plan: DrawnPlan, base: Readonly<Record<string, SeenRecord>>, glimpsed: Readonly<Record<string, Glimpse>>, now: number): number {
   let count = 0
   for (const drawn of plan.sections) {
-    for (const row of drawn.shown) if (visibleMark(row, base[drawn.section.key], glimpsed[rowKeyOf(drawn.section.key, row.number)], now) !== null) count += 1
+    const isFiltered = isFilteredList(drawn.section)
+    for (const row of drawn.shown) if (visibleMark(row, base[drawn.section.key], glimpsed[rowKeyOf(drawn.section.key, row.number)], now, isFiltered) !== null) count += 1
   }
 
   return count
+}
+
+/**
+ * The glimpses whose hold has passed, taken into the session's baselines (R3-INT-3): each such row counts as seen at
+ * the update the look saw (`newest` unchanged, as an acknowledgement leaves it), so its mark stays gone when the row
+ * leaves the list and comes back (a filter, a capped list's churn); the glimpses still held are kept, listed or not.
+ * Null when no glimpse has faded.
+ */
+export function foldFaded(base: Readonly<Record<string, SeenRecord>>, glimpsed: Readonly<Record<string, Glimpse>>, now: number): { base: Record<string, SeenRecord>; glimpsed: Record<string, Glimpse> } | null {
+  const faded = Object.entries(glimpsed).filter(([, glimpse]) => now - glimpse.at >= MARK_HOLD_MS)
+  if (faded.length === 0) return null
+  const next: Record<string, SeenRecord> = { ...base }
+  for (const [rowKey, glimpse] of faded) {
+    const hash = rowKey.lastIndexOf('#')
+    const sectionKey = rowKey.slice(0, hash)
+    const number = rowKey.slice(hash + 1)
+    const record = next[sectionKey]
+    if (record === undefined) continue
+    const had = record.rows[number]
+    const rows = had === undefined || glimpse.updatedAt > had ? { ...record.rows, [number]: glimpse.updatedAt } : record.rows
+    const reopened = glimpse.reopened === true ? { ...(record.reopened ?? {}), [number]: true as const } : record.reopened
+    next[sectionKey] = { ...record, rows, ...(reopened === undefined ? {} : { reopened }) }
+  }
+  const kept = Object.fromEntries(Object.entries(glimpsed).filter(([, glimpse]) => now - glimpse.at < MARK_HOLD_MS))
+
+  return { base: next, glimpsed: kept }
 }
 
 /**

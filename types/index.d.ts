@@ -268,8 +268,11 @@ export type SeenRecord = {
   reopened?: Record<string, true>
 }
 
-/** E5: a marked row seen in a look; its mark fades ten minutes later unless the issue changes again. */
-export type Glimpse = { at: number; updatedAt: string }
+/**
+ * E5: a marked row seen in a look; its mark fades ten minutes later unless the issue changes again. Once faded, the
+ * session's baseline takes it (`reopened`: GitHub called the issue reopened when the look saw it).
+ */
+export type Glimpse = { at: number; updatedAt: string; reopened?: true }
 
 /** E5: why a row is marked. */
 export type Mark = 'new' | 'updated' | 'reopened'
