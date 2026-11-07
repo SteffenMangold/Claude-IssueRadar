@@ -64,13 +64,13 @@ opens it any time.
 ## 🧭 What you see
 
 <p align="center">
-  <img src="docs/images/issues-pane.png" width="360" alt="The Issues pane in the Claude desktop app: one repository section with its open issues, each with label chips, age, comment count, an AI recap and the actions GitHub, Work on it (Bearbeiten) and Take it here (Hier übernehmen)">
+  <img src="docs/images/issues-pane.png" width="480" alt="The Issues pane in the Claude desktop app: two repository sections, one without open issues and with its recently closed fold, one with eight open issues, each with its triage gaps, label chips, age, comment count, an AI recap and the actions GitHub, Work on it (Bearbeiten), Take it here (Hier übernehmen) and the start options (Startoptionen); the start form of one issue is open">
 </p>
-<p align="center"><sub>The screenshot shows the pane of 0.1; the table below describes 0.2.0.</sub></p>
+<p align="center"><sub>The pane of 0.2.0, with the start form (Startoptionen) of one issue open.</sub></p>
 
 | Part | What it does |
 |---|---|
-| **Title bar** | `Issues`, the Radar pill and, while rows are marked, *2 unread* (2 ungelesen; a press marks every row seen) · ↻ refresh · ⌕ filter · + new issue (while GitHub writes are on) · ⚙ settings · ✕ close. The pane's title then reads `Issues (2)`, drawn as a tab label while more than one pane is open |
+| **Title bar** | The radar logo, `Issues`, the Radar pill and, while rows are marked, *2 unread* (2 ungelesen; a press marks every row seen) · ↻ refresh · ⌕ filter · + new issue (while GitHub writes are on) · ⚙ settings · ✕ close. The pane's title then reads `Issues (2)`, drawn as a tab label while more than one pane is open |
 | **Filter** (⌕) | One filter for every section of the pane: a view (Ansicht): *Open* (Offen), *Assigned to me* (Mir zugewiesen), *Unassigned* (Ohne Zuständige), *Last 7 days* (Letzte 7 Tage), *Blocked* (Blockiert), *With sub-issues* (Mit Sub-Issues) or a saved one; a search in GitHub's syntax, label, milestone, sort, grouping, and the board status when that is on. A line under the title bar names the active filter, with ✕ to clear it; a search can be saved as a view (at most 8 per repository) |
 | **Sections** | One per repository: the folder's own first, then the repositories you watch, then, with the setting on, *Assigned to me · all repos* (Mir zugewiesen · alle Repos), collapsed by default. The header folds a section; its pill counts the rows (`30/412` once the open count is known), and a folded section shows `● 2` when two of its rows are marked. A capped list ends with a link to the rest on GitHub (`… +382 more on GitHub ↗`) |
 | **Recently closed** | At the end of each repository section, collapsed: *Recently closed (7 days)* (Kürzlich geschlossen). Expanded, up to ten issues closed in that window, each with how it closed (completed, not planned, duplicate; erledigt, nicht geplant, Duplikat), its closing pull request and, for two weeks, the session that worked on it with *Open session* (Zur Session) |
@@ -85,7 +85,7 @@ opens it any time.
 | **Sidebar question** | On the desktop, once an issue has a session: whether issue sessions may file themselves in the sidebar, *File them* (Ordnen) or *No thanks* (Nein danke); asked once for the installation |
 | **Settings** (⚙) | Further repositories to watch (`owner/repo`), the recap consent per repository, the guidance for every issue session, *Open the new session beside this one* (desktop), the sidebar filing (desktop), the saved views, and the board status (GitHub Projects) with what to do when the `read:project` scope is missing |
 | **Footer** | Time of the last fetch, the open count (*n matches* (n Treffer) under a filter, *x of y listed* (x von y geladen) under a board filter), the recap model, recap tokens spent this session, the version |
-| **States** | A named state with the next command instead of an empty list: no git repository, no remote, a non-GitHub remote, `gh` missing or signed out (with `gh auth login`), token rejected, a scope the token lacks (with `gh auth refresh -s <scope>` and which variable's token needs it), no access, issues disabled, archived, offline, rate-limited, gh's own error line, no open issues, no matches for the filter. A warning above the sections says when the store takes no more writes |
+| **States** | A named state with the next command instead of an empty list: no git repository, no remote, a non-GitHub remote, `gh` missing or signed out (with `gh auth login`), token rejected, a scope the token lacks (with `gh auth refresh -s <scope>` and which variable's token needs it), no access, issues disabled, archived, offline, rate-limited, gh's own error line, no open issues (with *All issues on GitHub* (Alle Issues auf GitHub)), no matches for the filter. A warning above the sections says when the store takes no more writes |
 
 **A row, line by line**
 
@@ -94,7 +94,8 @@ opens it any time.
    visit; *blocked · #12* (blockiert); the board status `▦ In Progress`; the triage guess (*Bug*,
    *Feature*, *Question* (Frage), size `size M` (Umfang M), and *ready* (bereit), *2 gaps*
    (2 Lücken) or *criteria unclear* (Kriterien unklar)); up to four labels; `2/3 sub-issues`;
-   *part of #40* (Teil von #40); then age, comment count and assignees.
+   *part of #40* (Teil von #40); then age, `↑ 14h` (since the last update, when that differs),
+   comment count and assignees.
 3. The recap, or the body's excerpt before you switch recaps on.
 4. For an issue with a session: the session line, with the session's badge, since when, *linked*
    (verknüpft) while it is, *Session ↗* for a session another pane started, and *⎇ Link branch*
@@ -131,7 +132,8 @@ guidance and your note. Everything taken from GitHub is marked as data, not inst
 brief is English and tells the session to answer in the language you write in. Its full text
 is [Appendix A of `docs/CONTEXT.md`](docs/CONTEXT.md#appendix-a-the-brief-020).
 
-**The start form** (▾, Startoptionen) chooses how the session starts:
+**The start form** (▾, Startoptionen), titled *Start for #n* (Start für #n), chooses how the session
+starts:
 
 - **Mode** (Modus). *Understand first* (Erst verstehen) is the five phases above. *Just fix it*
   (Direkt beheben): the session reads, writes a one-paragraph summary and plan, makes the
@@ -146,13 +148,14 @@ is [Appendix A of `docs/CONTEXT.md`](docs/CONTEXT.md#appendix-a-the-brief-020).
   offered only when this session runs in a worktree of its own and you have sent it a message.
   While a turn of this session runs, *Start* refuses a fork with a toast; press it again once
   the turn has ended. The fork reads the whole conversation once more and gets a worktree cut
-  from this session's branch. The form's captions say what each place costs.
+  from this session's branch. The form's captions say what the other two places cost.
 - **Model** and **Effort** (Modell, Aufwand; desktop, not for a fork): *as this session* (wie
   diese Session) or a cheaper choice. A start the app refuses for them is retried once without
   both, and the start's toast says when the new session did not take them.
-- **Open beside** (Daneben öffnen; desktop), preset from the repository's setting.
-- A **note** for this issue (Hinweis für dieses Issue …), kept with Enter and appended to the
-  brief.
+- **Open beside** (Daneben öffnen; desktop), a pill *on* or *off* (an, aus) before the label, preset
+  from the repository's setting.
+- A **note** for this issue (Hinweis für dieses Issue …), kept with Enter or *Keep* (Merken) and
+  appended to the brief.
 - *Start* (Starten; desktop only), *Take it here*, *Cancel*. The terminal draws the mode, the
   note, *Take it here* and *Cancel*: it starts no desktop session.
 
