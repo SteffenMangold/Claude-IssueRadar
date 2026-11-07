@@ -748,6 +748,62 @@ test('the inbox lists my assigned issues across repositories, collapsed until op
   expect(JSON.stringify(stored)).not.toContain('body')
 })
 
+type Drawn = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+
+/** A drawn element's element children (its strings left out). */
+function elementsIn(node: unknown): Drawn[] {
+  const children = (node as Drawn | undefined)?.children ?? []
+
+  return children.filter((child): child is Drawn => typeof child === 'object' && child !== null)
+}
+
+/** The cells a drawn part takes on the terminal: its strings and a Button's or Link's label, one cell a character. */
+function cellsOf(node: unknown): number {
+  if (typeof node === 'string' || typeof node === 'number') return [...String(node)].length
+  if (typeof node !== 'object' || node === null) return 0
+  const element = node as Drawn
+  const label = element.type === 'Button' || element.type === 'Link' ? [...String(element.props?.['label'] ?? '')].length : 0
+
+  return label + (element.children ?? []).reduce((sum: number, child) => sum + cellsOf(child), 0)
+}
+
+test('an inbox row keeps to two lines at 46 columns: only the title and the repository give way (F-CONFORMANCE-4)', ME, async ($, on) => {
+  project(on, { gh: searchWith() })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'section:inbox' })
+  // acme/widgets#7 carries ↓ Zeigen, other/thing#3 the wider + Beobachten.
+  for (const key of [ROW_7, OTHER_ROW_3]) {
+    const row = await ui.find({ key: `inbox-row:${key}` })
+    const inside = 46 - 2 * Number(row?.props['paddingX'] ?? 0)
+    const lines = elementsIn(row)
+    expect(lines).toHaveLength(2)
+    for (const line of lines) {
+      // A line never wraps: one Box at minWidth 0 holds the text that is cut, every other part keeps its width.
+      expect(line.type).toBe('Box')
+      expect(line.props?.['flexDirection']).toBe('row')
+      expect(line.props?.['flexWrap']).toBeUndefined()
+      const parts = elementsIn(line)
+      const giving = parts.filter(part => part.props?.['flexShrink'] !== 0)
+      expect(giving).toHaveLength(1)
+      expect(giving[0]?.props).toMatchObject({ flexShrink: 1, minWidth: 0 })
+      const kept = parts.filter(part => part.props?.['flexShrink'] === 0).reduce((sum, part) => sum + cellsOf(part), 0)
+      const gaps = (parts.length - 1) * Number(line.props?.['columnGap'] ?? 0)
+      expect(inside - kept - gaps).toBeGreaterThanOrEqual(10)
+    }
+    // GitHub ↗ beside the title, the action beside the age and the comments.
+    expect(typesOf(lines[0])).toContain('Link')
+    expect(typesOf(lines[1])).not.toContain('Link')
+    expect(typesOf(lines[1])).toContain('Button')
+  }
+  await ui.unmount()
+})
+
+/** Every element type beneath a drawn element. */
+function typesOf(node: unknown): string[] {
+  return elementsIn(node).flatMap(child => [...(child.type === undefined ? [] : [child.type]), ...typesOf(child)])
+}
+
 test('the search is rare and shared: by age, a minute apart for ↻ only, never for the mod\'s own re-runs (E11-2)', ME, async ($, on) => {
   const { argv } = project(on, { gh: searchWith() })
   const clock = await started($, on)

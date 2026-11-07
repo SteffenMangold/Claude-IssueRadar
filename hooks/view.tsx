@@ -2190,9 +2190,10 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const paneRepos = new Set(state.sections.map(section => section.key))
 
   /**
-   * One assigned issue, two lines (E11-7): the title; the repository (cut in the middle) and number, the age and the
-   * comments, GitHub ↗, and ↓ Zeigen when a section lists the issue, else + Beobachten when the repository is neither
-   * the checkout nor watched. No Work on it: an issue session works in this checkout.
+   * One assigned issue, two lines (E11-7): the title (cut at its end) and GitHub ↗; the repository and number (cut in
+   * the middle), the age and the comments, and ↓ Zeigen when a section lists the issue, else + Beobachten when the
+   * repository is neither the checkout nor watched. No line wraps: at 46 columns the title and the repository give way,
+   * every other part keeps its width (F-CONFORMANCE-4). No Work on it: an issue session works in this checkout.
    */
   const inboxRow = (item: InboxRow) => {
     const [owner = '', name = ''] = item.repo.split('/')
@@ -2204,21 +2205,37 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
 
     return (
       <Box key={`inbox-row:${key}`} flexDirection="column" paddingX={step('sm', 1)} paddingY={step('xs', 0)}>
-        <Text weight="semibold" wrap="truncate-end">
-          {clean(item.title)}
-        </Text>
-        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)}>
+        <Box flexDirection="row" alignItems="center" columnGap={step('xs', 1)}>
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Text weight="semibold" wrap="truncate-end">
+              {clean(item.title)}
+            </Text>
+          </Box>
+          <Box flexShrink={0}>
+            <Link href={clean(item.url)} label={S.github} />
+          </Box>
+        </Box>
+        <Box flexDirection="row" alignItems="center" columnGap={step('xs', 1)}>
           <Box flexShrink={1} minWidth={0}>
             <Text size="caption" color={INK.muted} wrap="truncate-middle">
               {clean(`${item.repo}#${item.number}`)}
             </Text>
           </Box>
-          <Text size="caption" color={INK.muted}>
-            · {shortAgo(item.updatedAt, state.now, S.ago)} · {S.comment(item.commentCount)}
-          </Text>
-          <Link href={clean(item.url)} label={S.github} />
-          {isListed && <Button key={`inbox-show:${key}`} plain label={S.inboxShow} onPress={() => actions.showInSection(key)} />}
-          {isWatchable && <Button key={`inbox-watch:${key}`} plain label={S.inboxWatch} onPress={() => actions.addWatch(spec)} />}
+          <Box flexShrink={0}>
+            <Text size="caption" color={INK.muted}>
+              · {shortAgo(item.updatedAt, state.now, S.ago)} · {S.comment(item.commentCount)}
+            </Text>
+          </Box>
+          {isListed && (
+            <Box flexShrink={0}>
+              <Button key={`inbox-show:${key}`} plain label={S.inboxShow} onPress={() => actions.showInSection(key)} />
+            </Box>
+          )}
+          {isWatchable && (
+            <Box flexShrink={0}>
+              <Button key={`inbox-watch:${key}`} plain label={S.inboxWatch} onPress={() => actions.addWatch(spec)} />
+            </Box>
+          )}
         </Box>
       </Box>
     )
