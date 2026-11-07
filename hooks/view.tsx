@@ -11,7 +11,7 @@ import type { Boards, ClosedCache, ClosedRow, Facets, Filter, FilterGroup, Filte
 import { BOARD_STATUS_CHARS, boardItemFor, boardOptions } from './boards'
 import { CLOSED_LOADING_MS, closedCountLabel, sinceDate } from './closed'
 import { ANY, GROUPS, SORTS, VIEWS, cutText, isBuiltInView, isDefaultFilter, matchesUrl, sanitizeQuery } from './filter'
-import { REACTIONS, excerptOf } from './github'
+import { COMMENTS_KEPT, REACTIONS, excerptOf } from './github'
 import type { Strings } from './i18n'
 import { INBOX_CAP } from './inbox'
 import { cardRowsOf, isFilteredList, paneLayout, rowKeyOf, unreadCount, visibleMark } from './marks'
@@ -1082,7 +1082,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             {S.noComments}
           </Text>
         )}
-        {details.comments.map(comment => {
+        {details.comments.slice(-COMMENTS_KEPT).map(comment => {
           const said = clean(comment.body)
 
           return (

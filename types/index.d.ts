@@ -21,6 +21,25 @@ export type Options = {
   hoverCards: boolean
   /** Whether issues that arrive while the pane is shown raise one toast per refresh (E5); the marks stay either way. */
   arrivalToasts: boolean
+  /** E2: the `#` typeahead in the prompt box, and the context block for the open issues a sent prompt mentions. */
+  issueMentions: boolean
+}
+
+/** E2: an issue this conversation already carries, and since when (the user turn it entered at). */
+export type Attached = {
+  /** `$.session.turns()` when it entered. */
+  turn: number
+  /** The issue's `updatedAt` it entered at; null when not known. */
+  updatedAt: string | null
+  /** A prompt's context block, an E6 tool answer, or a hand-off brief. */
+  via: 'prompt' | 'tool' | 'brief'
+}
+
+/** E2: what this conversation carries, keyed by row key; entries of another conversation (`/clear`, a resume) count for nothing. */
+export type AttachedRecord = {
+  /** `$.session.id()` when the entries were made: a /clear goes on under another id. */
+  conversation: string
+  entries: Record<string, Attached>
 }
 
 /** A GitHub repository as `gh repo view` resolved it. */
@@ -500,6 +519,8 @@ declare module 'claude-code' {
       glimpsed: Shaped<Record<string, Glimpse>>
       /** E5: per repository key, the issue numbers this session has listed; an issue never listed before may be an arrival. */
       listed: Shaped<Record<string, ListedNumbers>>
+      /** E2: the issues this conversation already carries (context blocks, E6 answers, a brief), the newest 100. */
+      attached: Shaped<AttachedRecord>
     }
   }
 }

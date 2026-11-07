@@ -67,6 +67,12 @@
       "title": "Arrival toasts",
       "description": "Show one toast per refresh when new issues arrive while the Issues pane is shown; the marks for new and updated issues stay either way.",
       "default": true
+    },
+    "issueMentions": {
+      "type": "boolean",
+      "title": "Issues in the prompt",
+      "description": "Offer the open issues after # in the prompt box (terminal), and attach an open issue a prompt mentions (#123) to that prompt as context for Claude: title, recap, and the excerpt, text and latest comments the pane already holds. Never reads GitHub on Enter.",
+      "default": true
     }
   }
 }

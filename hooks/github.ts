@@ -10,6 +10,11 @@ export const LIST_FIELDS = 'number,title,url,createdAt,updatedAt,author,labels,a
 /** What a row shows of an issue's relations (E17); gh pages blockers by 50, as the GraphQL row does. */
 export const LIST_RELATIONS = 'parent,subIssuesSummary,blockedBy'
 export const VIEW_FIELDS = 'number,state,body,comments,updatedAt,closedByPullRequestsReferences,url'
+/** E6's read of one issue by number: the row's fields and the details' in one view (all valid on gh 2.96.0). */
+export const TOOL_VIEW_FIELDS = 'number,title,state,stateReason,url,createdAt,updatedAt,author,labels,assignees,milestone,isPinned,body,comments,closedByPullRequestsReferences'
+/** E6: the latest comments a tool read keeps, each cut to this many characters with its line breaks (C-E6-9). */
+export const TOOL_COMMENTS_KEPT = 20
+export const TOOL_COMMENT_CHARS = 1_200
 /** The issue's tree for a brief (E17): its parent, its sub-issues and both directions of blocking. */
 export const TREE_FIELDS = 'parent,subIssues,subIssuesSummary,blockedBy,blocking'
 /** What the parent read asks: its sub-issues are the siblings. */
@@ -91,6 +96,23 @@ export function repoSpec(repo: Pick<RepoInfo, 'host' | 'owner' | 'name'>): strin
 
 export function repoLabel(repo: Pick<RepoInfo, 'host' | 'owner' | 'name'>): string {
   return `${repo.owner}/${repo.name}`
+}
+
+/** Normalizes what the owner (or the model, E6) typed to `owner/name` or `host/owner/name`; null when it is no repository. */
+export function cleanSpec(spec: string): string | null {
+  const plain = spec
+    .trim()
+    .replace(/^https?:\/\/(?:www\.)?/i, '')
+    .replace(/^github\.com\//i, '')
+    .replace(/\.git$/i, '')
+    .replace(/\/+$/g, '')
+
+  return isRepoSpec(plain) ? plain : null
+}
+
+/** A repository spec as a section key: `github.com/owner/name` for `owner/name`, lower case. */
+export function specKey(spec: string): string {
+  return (spec.split('/').length === 2 ? `github.com/${spec}` : spec).toLowerCase()
 }
 
 /** The host of a repository as the owner typed it (`host/owner/name`), else github.com. */
@@ -389,6 +411,11 @@ export function parseGraphRow(node: unknown): IssueRow | null {
   return isRecord(node) ? rowOf(node) : null
 }
 
+/** One issue record of gh's view or list (labels and assignees as lists) as a row; null when it is none. */
+export function parseIssueRow(data: unknown): IssueRow | null {
+  return isRecord(data) ? rowOf(data) : null
+}
+
 /**
  * The open issues of a repository, the most recently updated first, pull requests excluded by gh itself. Asks the
  * relation fields too (E17), unless this repository failed with them before: a list that fails with them for any
@@ -548,6 +575,55 @@ export async function viewIssue($: EngineInterface, info: RepoInfo, row: IssueRo
   if (details === null) return { state: { kind: 'error', detail: 'gh issue view answered no JSON' } }
 
   return { details }
+}
+
+/** E6: one issue as the tool read it: the row, the details with up to 20 comments in their own lines, and GitHub's state. */
+export type ToolRead = { row: IssueRow; details: IssueDetails; stateReason: string }
+
+/**
+ * E6: one issue by number, its row and details in one `gh issue view` (a read the model would otherwise make itself).
+ * Comments keep their line breaks (C-E6-9: code and stack traces read as written), the last 20 at 1,200 characters each;
+ * the body at 6,000. A pull-request number answers too (gh views it; its URL says `/pull/`), a missing one is told
+ * apart from other failures (gh's "Could not resolve to an issue"), which classify() calls a plain error.
+ */
+export async function viewIssueNumber($: EngineInterface, info: RepoInfo, number: number, now: number): Promise<{ read: ToolRead; isPullRequest: boolean } | { state: RepoState; isMissing: boolean }> {
+  const ran = await gh($, ['issue', 'view', String(number), '-R', repoSpec(info), '--json', TOOL_VIEW_FIELDS], { host: info.host, repo: repoLabel(info) })
+  if (!ran.ok) return { state: ran.state, isMissing: ran.state.kind === 'error' && /could not resolve to an issue/i.test(`${ran.stderr ?? ''} ${ran.state.detail ?? ''}`) }
+  const json = parseJson(ran.stdout)
+  const row = parseIssueRow(json)
+  if (!isRecord(json) || row === null) return { state: { kind: 'error', detail: 'gh issue view answered no issue' }, isMissing: false }
+  const body = str(json['body'])
+  const all = Array.isArray(json['comments']) ? (json['comments'] as unknown[]).filter(isRecord) : []
+  const comments: IssueComment[] = all.slice(-TOOL_COMMENTS_KEPT).map(comment => ({
+    author: login(comment['author']),
+    createdAt: str(comment['createdAt']),
+    body: str(comment['body']).replace(/\r\n?/g, '\n').trim().slice(0, TOOL_COMMENT_CHARS),
+  }))
+  const linked = json['closedByPullRequestsReferences']
+  const details: IssueDetails = {
+    updatedAt: row.updatedAt,
+    state: str(json['state'], 'OPEN').toUpperCase(),
+    commentCount: all.length,
+    comments,
+    excerpt: excerptOf(body),
+    body: body.slice(0, BODY_CHARS),
+    linkedPrs: linkedPrsOf(Array.isArray(linked) ? linked : nodesOf(linked)),
+    fetchedAt: now,
+  }
+
+  return { read: { row, details, stateReason: str(json['stateReason']).toUpperCase() }, isPullRequest: /\/pull\/\d+/.test(row.url) }
+}
+
+/**
+ * Details as the session's state keeps them, whatever read them: the last three comments, each collapsed to one line
+ * of 600 characters. E6's extended reads (20 comments of 1,200) go into the shared state only this way (C-E6-2): the
+ * recap prompt and the opened row read that state, and the consent promises three comments.
+ */
+export function compactDetails(details: IssueDetails): IssueDetails {
+  const compact: IssueDetails = { ...details, comments: details.comments.slice(-COMMENTS_KEPT).map(comment => ({ ...comment, body: collapse(comment.body).slice(0, COMMENT_CHARS) })) }
+  delete compact.tree
+
+  return compact
 }
 
 /**

@@ -189,6 +189,11 @@ const DE = {
   cardMilestone: (title: string) => `Meilenstein ${title}`,
   cardComments: (shown: number, total: number) => `Letzte Kommentare (${shown} von ${total})`,
   cardCommentsLater: (n: number) => (n === 1 ? '1 Kommentar · Zeile öffnen zum Lesen' : `${n} Kommentare · Zeile öffnen zum Lesen`),
+  // E2: issues in the prompt (one dim transcript line after the prompt entered; the model never reads it)
+  mentionAttached: (refs: string) => `Issue-Radar: ${refs} als Kontext angehängt`,
+  mentionExcerptOnly: (refs: string) => `nur Auszug, Text und Kommentare nicht geladen: ${refs}`,
+  mentionMetaOnly: (refs: string) => `nur Metadaten (Repo ohne KI-Freigabe): ${refs}`,
+  mentionCapped: (refs: string) => `nicht angehängt (höchstens 3 je Prompt): ${refs}`,
 }
 
 const EN: typeof DE = {
@@ -372,6 +377,11 @@ const EN: typeof DE = {
   cardMilestone: (title: string) => `milestone ${title}`,
   cardComments: (shown: number, total: number) => `Last comments (${shown} of ${total})`,
   cardCommentsLater: (n: number) => (n === 1 ? '1 comment · open the row to read it' : `${n} comments · open the row to read them`),
+  // E2: issues in the prompt
+  mentionAttached: (refs: string) => `Issue Radar: ${refs} attached as context`,
+  mentionExcerptOnly: (refs: string) => `excerpt only, text and comments not loaded: ${refs}`,
+  mentionMetaOnly: (refs: string) => `metadata only (repository without AI consent): ${refs}`,
+  mentionCapped: (refs: string) => `not attached (3 per prompt at most): ${refs}`,
 }
 
 export type Strings = typeof DE

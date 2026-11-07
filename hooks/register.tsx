@@ -3,26 +3,32 @@
 // the pane, the commands, the refresh pipeline, the hand-off. `$.ui.status`
 // has one owner, the issue session's status line (E12); nothing else sets it.
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
+import type { EngineInterface, PluginOptions, PromptAutocompleteSuggestion, PromptSubmitInput, Register, Timer } from 'claude-code'
 
-import type { Boards, ClosedCache, Filter, Glimpse, Inbox, IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, PrRecord, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section, SeenRecord, Triage } from '../types'
+import type { Attached, AttachedRecord, Boards, ClosedCache, Filter, Glimpse, Inbox, IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, PrRecord, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section, SeenRecord, Triage } from '../types'
 import { MARKER, branchName, renderBackground, renderBrief, sessionName, sessionTitle, spikeBrief } from './brief'
 import { asClosedCache, closedRecord, isClosedDue, listClosed, sinceDate } from './closed'
 import type { ClosedReason } from './closed'
+import { MENTION_LIMITS, TOOL_LIMITS, renderIssueText } from './context'
 import { DEFAULT_FILTER, MAX_VIEWS, TYPED_CHARS, asSavedViews, cleanViewName, cutText, effectiveQuery, facetsOf, filterKey, metaBound, retainMeta, sameFacets, sanitizeQuery, viewIdOf } from './filter'
-import { dropRelations, firstLine, isRepoSpec, listIssues, metaOf, repoKey, repoLabel, resetRelations, resolveCheckout, resolveNamed, stateOf, viewIssue, viewParent } from './github'
+import { cleanSpec, compactDetails, dropRelations, firstLine, isRepoSpec, listIssues, metaOf, repoKey, repoLabel, repoSpec, resetRelations, resolveCheckout, resolveNamed, specKey, stateOf, viewIssue, viewIssueNumber, viewParent } from './github'
+import type { ToolRead } from './github'
 import { MAPPED_MAX, PROBE_MAX, PROBE_PAUSE_MS, fetchBoards, fetchPrLinks } from './graph'
 import { asLanguage, strings } from './i18n'
 import { INBOX_CAP, asInboxCache, failedInbox, inboxFromRecord, inboxPeriod, isInboxDue, searchAssigned } from './inbox'
+import { ISSUE_TOOL, ISSUE_TOOL_SPEC, mayRead, parseToolInput, refusalText, stateText, toolArguments, toolError } from './issuetool'
+import type { ToolAsk, Verdict } from './issuetool'
 import { ARRIVAL_TOAST_MS, LOOK_THROTTLE_MS, MARK_HOLD_MS, SEEN_KEEP_FACTOR, arrivalText, arrivalsOf, cardRowsOf, foldFaded, isFilteredList, markOf, nextFade, paneLayout, readSeen, rowKeyOf, rowsInView, seenRecordOf, unreadCount, withRow } from './marks'
 import type { PaneLike, RowTop } from './marks'
+import { briefIssueKey, describeIssue, findMentions, infoFromIssueUrl, isRecentlyAttached, keyOfRemote, mentionRef, parseMentionToken, resolveMentions, suggestIssues, withAttached } from './mentions'
+import type { KnownIssue } from './mentions'
 import { asRecord, isPrsDue, mergeLinks, recordOf } from './prs'
 import { RECAP_VERSION, asRecap, isBetterRecap, isRecapCurrent, isRecapFor, isRecapUsable, recapIssue } from './recap'
 import { commandConsent, detachSession, focusSession, lookUpSession, parseObject, pressConsent, quietDesktop, readPrStatus, routeInUse, startDesktopSession } from './session'
 import { clean } from './text'
 import { probeEngaged, runTiers } from './tiers'
 import { offerToast, takeToast } from './toasts'
-import { renderPane } from './view'
+import { renderPane, shortAgo } from './view'
 
 const PLUGIN = 'issue-radar'
 const PANE = 'issue-radar'
@@ -60,6 +66,25 @@ const DEFAULT_SETTINGS: RepoSettings = { watch: [], consent: {}, collapsed: {} }
 const BRIEF_HEAD = 80
 /** The shortest timer period, whatever the setting says. */
 const MIN_PERIOD_MS = 30_000
+/** E6: how long a tool read of GitHub answers again without a new read (plan section 3: 60 s reuse). */
+const TOOL_FRESH_MS = 60_000
+/** E6: `fresh: true` reads GitHub at most this often per issue; a model looping on it gets the last read (C-E6-5). */
+const TOOL_FRESH_FLOOR_MS = 10_000
+/** E6: how many tool reads the module keeps for that reuse (the newest; a reload forgets them). */
+const TOOL_READS_KEPT = 20
+/** E6: how long the tool waits before it resolves a checkout gh could not resolve again. */
+const TOOL_RESOLVE_RETRY_MS = 60_000
+/** E2: the typeahead's rows at most. */
+const MAX_SUGGESTIONS = 8
+/** E2: the issues one prompt carries at most; the others are named in the transcript line. */
+const MAX_ATTACH = 3
+/** E2: an issue the conversation carries unchanged is not attached again within this many user turns. */
+const REATTACH_TURNS = 4
+/** E2: the entries the attached record keeps. */
+const ATTACHED_KEPT = 100
+/** E2: the prompts a person sent (C-E2-10: the desktop stamps a typed prompt composer, bridge, sdk or unclassified). */
+const PERSON_ORIGINS: ReadonlySet<string> = new Set(['composer', 'bridge', 'sdk', 'unclassified'])
+const NO_ATTACHED: AttachedRecord = { conversation: '', entries: {} }
 
 // Change a tag when the stored value's fields change: an earlier version's
 // value is then read as the initial instead of in the wrong shape.
@@ -93,6 +118,7 @@ const closedErrors = atom({ plugin: 'issue-radar', key: 'closedErrors' } as cons
 const seenBase = atom({ plugin: 'issue-radar', key: 'seenBase' } as const, {}, { shape: 'seenbase-1' })
 const glimpsed = atom({ plugin: 'issue-radar', key: 'glimpsed' } as const, {}, { shape: 'glimpsed-1' })
 const listed = atom({ plugin: 'issue-radar', key: 'listed' } as const, {}, { shape: 'listed-1' })
+const attached = atom({ plugin: 'issue-radar', key: 'attached' } as const, NO_ATTACHED, { shape: 'attached-1' })
 
 // Module state: lost on a hot reload, which is fine, since the next refresh rebuilds it.
 let timer: Timer | undefined
@@ -177,6 +203,19 @@ let retitleOff = false
 const redoFailed = new Map<string, { updatedAt: string; language: Language; at: number }>()
 /** E4: the rows whose warm-up read failed, at which update and when: not read again for half an hour (R3-RT-2). */
 const warmFailed = new Map<string, { updatedAt: string; at: number }>()
+/** E6: the issue tool's full name once this session registered it; null before, or where the host adds no tools. */
+let issueToolName: string | null = null
+/** E6: why the tool is not registered, for the spike. */
+let issueToolProblem = 'not tried yet'
+/**
+ * E6: the tool's reads of GitHub by row key, the newest 20, with their 20 comments: they answer again within 60 s, and
+ * an unlisted issue or an extended read has nowhere else to live (C-E6-5); never in `$.state` or the store (C-E6-2).
+ */
+const toolReads = new Map<string, { at: number; read: ToolRead }>()
+/** E6: when the tool last resolved the checkout itself (a failure is tried again after a minute, not on every call). */
+let checkoutTriedAt = Number.NEGATIVE_INFINITY
+/** E2: the origin of the last prompt, for the spike (S16: what the desktop stamps on a typed prompt). */
+let lastPromptOrigin = ''
 
 type Resolved = { spec: string; info: RepoInfo | null; state: RepoState; isCheckout: boolean }
 /**
@@ -219,6 +258,7 @@ function readOptions(given: PluginOptions): Options {
     assignedToMe: flag('assignedToMe', false),
     hoverCards: flag('hoverCards', true),
     arrivalToasts: flag('arrivalToasts', true),
+    issueMentions: flag('issueMentions', true),
   }
 }
 
@@ -768,6 +808,22 @@ async function readSessionPrs($: EngineInterface, current: readonly Section[]): 
   }
 }
 
+/** A session whose root moved (a `/cd`, a worktree move) forgets the checkout and the watched repositories it resolved (C-E6-7). */
+function forgetOtherRoot(root: string): void {
+  if (checkout === null || checkout.root === root) return
+  checkout = null
+  named.clear()
+}
+
+/** The checkout's key decides which settings the session reads: on a change, the stored settings and the key go into the state. */
+async function adoptSettingsKey($: EngineInterface, key: string): Promise<void> {
+  if (settingsKey === key) return
+  settingsKey = key
+  const stored = key === '' ? undefined : await readStore<unknown>($, storeKeyOf('settings:', key))
+  await update($, settings, () => readSettings(stored))
+  await update($, checkoutKey, () => key)
+}
+
 async function refresh($: EngineInterface, options: Options, reason: Reason): Promise<void> {
   if (isRunning) {
     // The ask is kept with its reason (E7-2, E11-2): a ↻ pressed meanwhile still runs as the owner's press.
@@ -782,21 +838,12 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     const root = await $.session.root()
     // Another pane, or an issue session of this project, may have started or released a session since the last refresh.
     await loadMappings($)
-    if (checkout !== null && checkout.root !== root) {
-      checkout = null
-      named.clear()
-    }
+    forgetOtherRoot(root)
     // After a hot reload the pane is still up while this module's memory is fresh.
     if (!wantsPane && (await isPaneOpen($))) wantsPane = true
     // The checkout first: its settings name the other repositories.
     if (checkout === null || checkout.root !== root || checkout.info === null) checkout = { root, ...(await resolveCheckout($, root)) }
-    const key = checkout.info === null ? '' : repoKey(checkout.info)
-    if (settingsKey !== key) {
-      settingsKey = key
-      const stored = key === '' ? undefined : await readStore<unknown>($, storeKeyOf('settings:', key))
-      await update($, settings, () => readSettings(stored))
-      await update($, checkoutKey, () => key)
-    }
+    await adoptSettingsKey($, checkout.info === null ? '' : repoKey(checkout.info))
     const chosen = await read($, settings)
 
     // Open the pane once the folder turns out to be a GitHub repository.
@@ -1293,7 +1340,8 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
     const fresh = await freshDetails($, options, found.section, found.row, now)
     if (fresh === null) return
     const input = { issueRepo: found.section.info, codeRepo: checkout?.info ?? null, row: found.row, details: fresh, fetchedAt: new Date(now).toISOString(), triage: await triageFor($, options, rowKey, fresh) }
-    const prompt = renderBrief(input)
+    // E6: Phase 1 names the issue tool where this session could register it (the issue session's own is not known here).
+    const prompt = renderBrief(input, { issueTool: issueToolName })
     const background = renderBackground(input, checkout?.root ?? (await $.session.root()))
     const title = sessionTitle(found.row)
     const outcome = await startDesktopSession(
@@ -1357,7 +1405,7 @@ async function takeHere($: EngineInterface, options: Options, sectionKey: string
   const fresh = await freshDetails($, options, found.section, found.row, now)
   if (fresh === null) return
   const input = { issueRepo: found.section.info, codeRepo: checkout?.info ?? null, row: found.row, details: fresh, fetchedAt: new Date(now).toISOString(), triage: await triageFor($, options, rowKey, fresh) }
-  if (await fillPrompt($, options, renderBrief(input))) $.ui.toast(S.briefInPrompt)
+  if (await fillPrompt($, options, renderBrief(input, { issueTool: issueToolName }))) $.ui.toast(S.briefInPrompt)
 }
 
 /**
@@ -1382,18 +1430,6 @@ async function consent($: EngineInterface, options: Options, key: string, value:
   await $.store.delete(storeKeyOf('recaps:', key)).catch(() => undefined)
   const prefix = `${key}#`
   await update($, recaps, current => Object.fromEntries(Object.entries(current).filter(([rowKey]) => !rowKey.startsWith(prefix))))
-}
-
-/** Normalizes what the owner typed to `owner/name` or `host/owner/name`; null when it is no repository. */
-function cleanSpec(spec: string): string | null {
-  const clean = spec
-    .trim()
-    .replace(/^https?:\/\/(?:www\.)?/i, '')
-    .replace(/^github\.com\//i, '')
-    .replace(/\.git$/i, '')
-    .replace(/\/+$/g, '')
-
-  return isRepoSpec(clean) ? clean : null
 }
 
 async function addWatch($: EngineInterface, options: Options, spec: string): Promise<void> {
@@ -2119,6 +2155,439 @@ async function warmCards($: EngineInterface, options: Options, now: number): Pro
   }
 }
 
+// E6: the issue tool ------------------------------------------------------------
+
+/**
+ * Declares the read-only `issue` tool (C-E6-8: once the start is scheduled, and only in a git repository). A host that
+ * adds no tools at run time, `--bare`, `--tools ""` or a deny rule leave it unregistered: the brief and the context
+ * block then name gh alone, and the spike says why.
+ */
+async function registerIssueTool($: EngineInterface): Promise<void> {
+  try {
+    const { tool } = await $.tool.register(ISSUE_TOOL_SPEC)
+    if (tool === ISSUE_TOOL) {
+      issueToolName = tool
+      issueToolProblem = ''
+
+      return
+    }
+    issueToolName = null
+    issueToolProblem = `registered as ${tool}, which no hook of this mod serves`
+  } catch (error) {
+    issueToolName = null
+    issueToolProblem = error instanceof Error ? error.message : String(error)
+  }
+  $.ui.log(`${PLUGIN}: the issue tool is not registered: ${issueToolProblem}`, { to: 'debug' })
+}
+
+/** The checkout as the tool sees it: its repository when known, its key and its settings (the watch list, the consents). */
+type ProjectView = { info: RepoInfo | null; state: RepoState; key: string; settings: RepoSettings }
+
+/**
+ * The checkout's repository and settings outside a refresh (E6): an issue session never refreshes, yet reads its own
+ * issue. With `canFetch` an unknown checkout is resolved here, one `gh repo view` kept for the next refresh (a failure
+ * is tried again after a minute, not on every call); without, only what the session already holds is used. The
+ * settings are read from the store each time: another pane may have changed the watch list.
+ */
+async function ensureProject($: EngineInterface, canFetch: boolean, now: number): Promise<ProjectView> {
+  const root = await $.session.root()
+  forgetOtherRoot(root)
+  if (canFetch && (checkout === null || (checkout.info === null && now - checkoutTriedAt >= TOOL_RESOLVE_RETRY_MS))) {
+    checkoutTriedAt = now
+    checkout = { root, ...(await resolveCheckout($, root)) }
+  }
+  const info = checkout?.info ?? (await read($, sections)).find(section => section.isCheckout)?.info ?? null
+  const key = info === null ? await read($, checkoutKey) : repoKey(info)
+  if (info !== null) await adoptSettingsKey($, key)
+  const chosen = key === '' ? await read($, settings) : readSettings(await readStore<unknown>($, storeKeyOf('settings:', key)))
+
+  return { info, state: checkout?.state ?? { kind: 'error', detail: 'the checkout is not resolved in this session' }, key, settings: chosen }
+}
+
+type ToolTarget = { info: RepoInfo; key: string }
+
+/**
+ * The repository a tool call names: none is the checkout's; any other must be the checkout's under another spelling or
+ * one the checkout's settings watch (resolved once, kept in `named` as the refresh keeps it). Anything else is refused
+ * with the gh command the model can run instead, so the tool never reads a repository the owner did not choose.
+ */
+async function resolveToolRepo($: EngineInterface, project: ProjectView, repo: string | null, number: number, canFetch: boolean): Promise<ToolTarget | { error: string }> {
+  if (repo === null) {
+    if (project.info === null) return { error: `this folder's repository is not known to Issue Radar (${stateText(project.state, 'it')}); read the issue with gh issue view ${number} -R owner/name.` }
+
+    return { info: project.info, key: project.key }
+  }
+  const wanted = specKey(repo)
+  if (project.info !== null && repoKey(project.info) === wanted) return { info: project.info, key: project.key }
+  const listed = (await read($, sections)).find(section => section.info !== null && section.key === wanted)
+  if (listed?.info !== null && listed?.info !== undefined) return { info: listed.info, key: listed.key }
+  const spec = project.settings.watch.find(found => specKey(found) === wanted)
+  if (spec === undefined) {
+    const checkoutSpec = project.info === null ? 'not resolved' : repoSpec(project.info)
+    const watched = project.settings.watch.length === 0 ? 'none' : project.settings.watch.join(', ')
+
+    return {
+      error: `${repo} is not a repository Issue Radar watches for this project (checkout ${checkoutSpec}; watched ${watched}). The owner can add it in the Issues pane's settings; or read it with gh issue view ${number} -R ${repo}.`,
+    }
+  }
+  const known = named.get(spec)
+  if (known !== undefined) return known.info === null ? { error: `${stateText(known.state, spec)}.` } : { info: known.info, key: repoKey(known.info) }
+  if (!canFetch) return { error: `${spec} is not resolved in this session, and Issue Radar reads GitHub only in desktop and terminal sessions.` }
+  const resolved = await resolveNamed($, spec)
+  if (resolved.info !== null || resolved.state.kind === 'no-access' || resolved.state.kind === 'issues-disabled' || resolved.state.kind === 'archived') named.set(spec, resolved)
+
+  return resolved.info === null ? { error: `${stateText(resolved.state, spec)}.` } : { info: resolved.info, key: repoKey(resolved.info) }
+}
+
+/** One copy of an issue the tool may answer from: a read of its own, or what the pane holds. */
+type ToolCopy = { row: IssueRow; details: IssueDetails | undefined; isLoaded: boolean; state: string; stateReason: string; source: 'cache' | 'github'; at: number }
+
+/**
+ * What the session holds of one issue: the listed row (the pane's section, or the store's list in a session without
+ * it), the pane's details of it (or the store's excerpt), and the tool's own last read.
+ */
+async function toolCopies($: EngineInterface, target: ToolTarget, number: number): Promise<{ listed: IssueRow | undefined; held: ToolCopy | undefined; pane: ToolCopy | undefined }> {
+  const rowKey = rowKeyOf(target.key, number)
+  const section = (await read($, sections)).find(found => found.key === target.key)
+  let listed = section?.rows.find(row => row.number === number)
+  let have: IssueDetails | undefined = (await read($, details))[rowKey]
+  if (section === undefined) {
+    const cache = await readStore<RepoCache>($, storeKeyOf('cache:', target.key))
+    listed = (Array.isArray(cache?.rows) ? cache.rows : []).find(row => isRowLike(row) && row.number === number)
+    const seeded = seededDetails(cache?.meta?.[String(number)])
+    if (have === undefined && listed !== undefined && seeded !== undefined && isCurrent(seeded, listed)) have = seeded
+  }
+  const own = toolReads.get(rowKey)
+
+  return {
+    listed,
+    held: own === undefined ? undefined : { row: own.read.row, details: own.read.details, isLoaded: true, state: own.read.details.state, stateReason: own.read.stateReason, source: 'github', at: own.at },
+    pane: listed === undefined ? undefined : { row: listed, details: have, isLoaded: have !== undefined && have.fetchedAt !== 0 && isCurrent(have, listed), state: 'OPEN', stateReason: listed.stateReason ?? '', source: 'cache', at: have?.fetchedAt ?? 0 },
+  }
+}
+
+/** Keeps a tool read for 60 s of reuse, the newest 20. */
+function keepToolRead(rowKey: string, at: number, found: ToolRead): void {
+  toolReads.delete(rowKey)
+  toolReads.set(rowKey, { at, read: found })
+  while (toolReads.size > TOOL_READS_KEPT) {
+    const oldest = toolReads.keys().next().value
+    if (oldest === undefined) break
+    toolReads.delete(oldest)
+  }
+}
+
+/**
+ * A tool read of an issue the pane lists goes into the session's details as the pane keeps them (C-E6-2: three
+ * comments of 600 characters; the recap prompt and the opened row read them), so the pane benefits; never older than
+ * what it holds, never a closed issue (the refresh and Work on it deal with closures), never the store.
+ */
+async function shareToolRead($: EngineInterface, rowKey: string, found: ToolRead): Promise<void> {
+  if (found.details.state !== 'OPEN') return
+  const sectionKey = rowKey.slice(0, rowKey.lastIndexOf('#'))
+  const isListed = (await read($, sections)).some(section => section.key === sectionKey && section.rows.some(row => row.number === found.row.number))
+  if (!isListed) return
+  const compact = compactDetails(found.details)
+  await update($, details, current => {
+    const had = current[rowKey]
+    if (had !== undefined && had.fetchedAt !== 0 && had.updatedAt > compact.updatedAt) return current
+
+    return { ...current, [rowKey]: had?.tree === undefined ? compact : { ...compact, tree: had.tree } }
+  })
+}
+
+/** The recap and triage a tool answer may carry: the pane's, or the store's in a session without the section; only where the pane would use them. */
+async function toolRecap($: EngineInterface, options: Options, chosen: RepoSettings, sectionKey: string, row: IssueRow): Promise<Recap | undefined> {
+  const rowKey = rowKeyOf(sectionKey, row.number)
+  let recap = (await read($, recaps))[rowKey]
+  if (recap === undefined && !(await read($, sections)).some(section => section.key === sectionKey)) {
+    const stored = await readStore<Record<string, unknown>>($, storeKeyOf('recaps:', sectionKey))
+    recap = typeof stored === 'object' && stored !== null ? asRecap(stored[String(row.number)]) : undefined
+  }
+
+  return isRecapUsable(options, chosen, sectionKey, recap, row) ? recap : undefined
+}
+
+type ToolAnswer = { result: string } | { result: string; isError: true } | { deny: string }
+
+/**
+ * The tool's answer (E6). It checks the input, asks the owner's permission settings (C-E6-1), finds the repository
+ * among those the checkout watches, and answers from the copy the session holds while that is current: its own read
+ * within 60 s (10 s for `fresh`), or the pane's details for up to three comments. Otherwise it reads the issue once with
+ * `gh issue view`, only on desktop and terminal and never while the repository is backed off; a failed read backs it
+ * off as a failed list does and answers the copy it holds, saying so. It writes nothing but the session's details of a
+ * listed row (compact) and the attached record; never the store, never GitHub.
+ */
+async function answerIssueTool($: EngineInterface, options: Options, input: Record<string, unknown>, agentId: string | undefined): Promise<ToolAnswer> {
+  const args = toolArguments(input)
+  const ask: ToolAsk | { error: string } = parseToolInput(args)
+  if ('error' in ask) return toolError(ask.error)
+  // C-E6-1: answering in core's place skips the permission check beneath, so the hook asks for the verdict itself.
+  const verdict: Verdict | null = await $.tool.check({ tool: ISSUE_TOOL, input: args }).catch(error => {
+    $.ui.log(`${PLUGIN}: the issue tool's permission check failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
+
+    return null
+  })
+  if (verdict !== null && !mayRead(verdict)) return { deny: refusalText(verdict) }
+  const canFetch = await surfacesAllowPane($)
+  const now = await $.clock.now()
+  const project = await ensureProject($, canFetch, now)
+  const target = await resolveToolRepo($, project, ask.repo, ask.number, canFetch)
+  if ('error' in target) return toolError(target.error)
+  const n = ask.number
+  const label = repoLabel(target.info)
+  const spec = repoSpec(target.info)
+  const rowKey = rowKeyOf(target.key, n)
+  const copies = await toolCopies($, target, n)
+  const isEnough = (have: IssueDetails | undefined) => have !== undefined && have.comments.length >= Math.min(ask.comments, have.commentCount)
+  const isNewEnough = (copy: ToolCopy) => copies.listed === undefined || copy.row.updatedAt >= copies.listed.updatedAt
+  let answer: ToolCopy | undefined
+  let note: string | undefined
+  const held = copies.held
+  if (held !== undefined && isEnough(held.details) && isNewEnough(held) && now - held.at < (ask.fresh ? TOOL_FRESH_FLOOR_MS : TOOL_FRESH_MS)) {
+    answer = held
+    if (ask.fresh) note = `Read from GitHub ${Math.round((now - held.at) / 1_000)} s ago; a fresh read happens at most once per 10 s.`
+  } else if (!ask.fresh && copies.pane !== undefined && copies.pane.isLoaded && isEnough(copies.pane.details)) answer = copies.pane
+  if (answer === undefined) {
+    // What answers when GitHub cannot: the tool's last read, else the pane's details (loaded, else its excerpt).
+    const fallback = held ?? copies.pane
+    const said = (why: string) => `${why}; this is the copy Issue Radar holds${fallback?.isLoaded === true ? '' : ' (no issue text or comments loaded)'}.`
+    if (!canFetch) {
+      if (fallback === undefined) return toolError(`Issue Radar reads GitHub only in desktop and terminal sessions; #${n} is not cached here.`)
+      answer = fallback
+      note = said('GitHub is read only in desktop and terminal sessions')
+    } else if (now < (backoffUntil.get(target.key) ?? 0)) {
+      if (fallback === undefined) return toolError(`GitHub was rate-limiting or unreachable a moment ago, and Issue Radar waits before it reads ${label} again; #${n} is not cached. Try again in a few minutes, or use gh issue view ${n} -R ${spec}.`)
+      answer = fallback
+      note = said('GitHub was rate-limiting or unreachable a moment ago')
+    } else {
+      const viewed = await viewIssueNumber($, target.info, n, now)
+      if ('state' in viewed) {
+        if (viewed.isMissing) return toolError(`#${n} does not exist in ${label}.`)
+        backoffFor(target.key, viewed.state, now)
+        $.ui.log(`${PLUGIN}: the issue tool's read of ${label}#${n} failed: ${viewed.state.kind} ${viewed.state.detail ?? ''}`, { to: 'debug' })
+        if (fallback === undefined) return toolError(`${stateText(viewed.state, label)}; #${n} could not be read.`)
+        answer = fallback
+        note = said(`GitHub could not be read just now (${stateText(viewed.state, label)})`)
+      } else {
+        if (viewed.isPullRequest) return toolError(`#${n} in ${label} is a pull request; this tool reads issues (gh pr view ${n} -R ${spec}).`)
+        keepToolRead(rowKey, now, viewed.read)
+        await shareToolRead($, rowKey, viewed.read)
+        answer = { row: viewed.read.row, details: viewed.read.details, isLoaded: true, state: viewed.read.details.state, stateReason: viewed.read.stateReason, source: 'github', at: now }
+      }
+    }
+  }
+  const recap = await toolRecap($, options, project.settings, target.key, answer.row)
+  const text = renderIssueText({
+    ref: `${label}#${n}`,
+    spec,
+    row: answer.row,
+    state: answer.state,
+    stateReason: answer.stateReason,
+    details: answer.details,
+    isLoaded: answer.isLoaded,
+    recap,
+    isMetadataOnly: false,
+    purpose: 'tool',
+    source: answer.source,
+    at: answer.at,
+    limits: { ...TOOL_LIMITS, comments: ask.comments },
+    toolName: issueToolName,
+    ...(note === undefined ? {} : { note }),
+  })
+  // E2 does not attach what the main conversation just read; a subagent's read is not the conversation's (C-E6-3).
+  if (agentId === undefined && options.issueMentions) await recordAttached($, [{ rowKey, updatedAt: answer.row.updatedAt }], 'tool')
+
+  return { result: text }
+}
+
+// E2: issues in the prompt ------------------------------------------------------
+
+/** A row of the store's list as far as E2 reads it (the store is another session's writing, so it is checked). */
+function isRowLike(value: unknown): value is IssueRow {
+  if (typeof value !== 'object' || value === null) return false
+  const row = value as Record<string, unknown>
+
+  return typeof row['number'] === 'number' && typeof row['title'] === 'string' && typeof row['updatedAt'] === 'string' && typeof row['url'] === 'string' && Array.isArray(row['labels']) && Array.isArray(row['assignees'])
+}
+
+/** `host/owner/name` of a section key as a repository, for a stored row whose URL names none. */
+function infoOfKey(key: string): KnownIssue['info'] | null {
+  const [host, owner, name] = key.split('/')
+
+  return host === undefined || owner === undefined || name === undefined ? null : { host, owner, name }
+}
+
+/** What E2 knows of the project's open issues, with the settings, recaps and stored excerpts that go with them. */
+type Known = { issues: KnownIssue[]; settings: RepoSettings; recaps: Record<string, Recap>; seeds: Record<string, IssueDetails> }
+
+/**
+ * The open issues the session lists: the pane's sections, else the store's lists of the checkout and the repositories
+ * it watches (an issue session, or a pane before its first list). Never gh, never a resolution (C-E2-4): the key is the
+ * one the session holds, or the one the git remote names.
+ */
+async function knownIssues($: EngineInterface): Promise<Known> {
+  const listedSections = (await read($, sections)).filter(section => section.info !== null && section.rows.length > 0)
+  if (listedSections.length > 0) {
+    const issues = listedSections.flatMap(section => (section.info === null ? [] : section.rows.map(row => ({ sectionKey: section.key, info: section.info as RepoInfo, isCheckout: section.isCheckout, row }))))
+
+    return { issues, settings: await read($, settings), recaps: await read($, recaps), seeds: {} }
+  }
+  const remote = (await $.session.repo().catch(() => null))?.remote ?? ''
+  const key = (await read($, checkoutKey)) || (keyOfRemote(remote) ?? '')
+  const known: Known = { issues: [], settings: DEFAULT_SETTINGS, recaps: {}, seeds: {} }
+  if (key === '') return known
+  known.settings = readSettings(await readStore<unknown>($, storeKeyOf('settings:', key)))
+  for (const sectionKey of new Set([key, ...known.settings.watch.map(specKey)])) {
+    const cache = await readStore<RepoCache>($, storeKeyOf('cache:', sectionKey))
+    const rows = (Array.isArray(cache?.rows) ? cache.rows : []).filter(isRowLike)
+    if (rows.length === 0) continue
+    const stored = await readStore<Record<string, unknown>>($, storeKeyOf('recaps:', sectionKey))
+    for (const row of rows) {
+      const info = infoFromIssueUrl(row.url) ?? infoOfKey(sectionKey)
+      if (info === null) continue
+      const rowKey = rowKeyOf(sectionKey, row.number)
+      known.issues.push({ sectionKey, info, isCheckout: sectionKey === key, row })
+      const recap = typeof stored === 'object' && stored !== null ? asRecap(stored[String(row.number)]) : undefined
+      if (recap !== undefined) known.recaps[rowKey] = recap
+      const seeded = seededDetails(cache?.meta?.[String(row.number)])
+      if (seeded !== undefined && isCurrent(seeded, row)) known.seeds[rowKey] = seeded
+    }
+  }
+
+  return known
+}
+
+/**
+ * The typeahead's rows for a `#` token (E2): the known open issues, never a gh or model call, none on vscode or mobile.
+ * Each row's dim line is the recap where the pane may use it, else the repository, two labels and the age.
+ */
+async function issueSuggestions($: EngineInterface, options: Options, token: string): Promise<PromptAutocompleteSuggestion[]> {
+  const asked = parseMentionToken(token)
+  if (asked === null || !(await surfacesAllowPane($))) return []
+  const known = await knownIssues($)
+  if (known.issues.length === 0) return []
+  const now = await $.clock.now()
+  const S = strings(options.language)
+  const describe = (issue: KnownIssue): string => {
+    const recap = known.recaps[rowKeyOf(issue.sectionKey, issue.row.number)]
+    if (isRecapUsable(options, known.settings, issue.sectionKey, recap, issue.row) && recap.text !== '') return recap.text.length > 90 ? `${recap.text.slice(0, 89)}…` : recap.text
+
+    return describeIssue(issue, shortAgo(issue.row.updatedAt, now, S.ago))
+  }
+
+  return suggestIssues(known.issues, asked, describe, MAX_SUGGESTIONS)
+}
+
+/**
+ * What the session holds of a mentioned issue: the pane's details when they are a read as new as the row, the tool's
+ * own read, else the stored excerpt and counts. Nothing is read from GitHub on Enter (plan section 3).
+ */
+async function mentionDetails($: EngineInterface, known: Known, issue: KnownIssue): Promise<{ details: IssueDetails | undefined; isLoaded: boolean }> {
+  const rowKey = rowKeyOf(issue.sectionKey, issue.row.number)
+  const have = (await read($, details))[rowKey]
+  if (have !== undefined && have.fetchedAt !== 0 && isCurrent(have, issue.row)) return { details: have, isLoaded: true }
+  const own = toolReads.get(rowKey)
+  if (own !== undefined && own.read.row.updatedAt >= issue.row.updatedAt) return { details: compactDetails(own.read.details), isLoaded: true }
+
+  return { details: have ?? known.seeds[rowKey], isLoaded: false }
+}
+
+/** What a prompt carries (E2): its context blocks, the references for the transcript line, and the record to keep. */
+type MentionPlan = {
+  context: string[]
+  attached: string[]
+  excerptOnly: string[]
+  metaOnly: string[]
+  capped: string[]
+  records: Array<{ rowKey: string; updatedAt: string | null }>
+  /** The user turn the prompt enters at. */
+  turn: number
+}
+
+/**
+ * The context blocks a person's prompt gets for the open issues it mentions (E2): composer, bridge, sdk or unclassified
+ * origins only, no command, no meta prompt; quoted text and data blocks are not read (C-E2-3). At most three issues,
+ * in mention order, skipping those the conversation carries unchanged from the last four turns. Only what the session
+ * holds goes in, and a repository whose recaps the owner declined gives metadata only (C-E2-8). Null when nothing is
+ * attached (C-E2-5): the prompt then goes on as it came.
+ */
+async function planMentions($: EngineInterface, options: Options, e: PromptSubmitInput): Promise<MentionPlan | null> {
+  if (!PERSON_ORIGINS.has(e.origin.kind) || e.command !== undefined || e.isMeta === true) return null
+  const mentions = findMentions(e.text)
+  if (mentions.length === 0) return null
+  const known = await knownIssues($)
+  const resolved = resolveMentions(mentions, known.issues)
+  if (resolved.length === 0) return null
+  const turn = await $.session.turns().catch(() => -1)
+  const conversation = await $.session.id().catch(() => '')
+  const record = await read($, attached)
+  const entries = record.conversation === conversation ? record.entries : {}
+  const due = resolved.filter(issue => !isRecentlyAttached(entries[rowKeyOf(issue.sectionKey, issue.row.number)], issue.row.updatedAt, turn, REATTACH_TURNS))
+  if (due.length === 0) return null
+  const plan: MentionPlan = { context: [], attached: [], excerptOnly: [], metaOnly: [], capped: due.slice(MAX_ATTACH).map(mentionRef), records: [], turn }
+  for (const issue of due.slice(0, MAX_ATTACH)) {
+    const rowKey = rowKeyOf(issue.sectionKey, issue.row.number)
+    const ref = mentionRef(issue)
+    const isMetadataOnly = known.settings.consent[issue.sectionKey] === false
+    const held = await mentionDetails($, known, issue)
+    const recap = known.recaps[rowKey]
+    plan.context.push(
+      renderIssueText({
+        ref: `${issue.info.owner}/${issue.info.name}#${issue.row.number}`,
+        spec: repoSpec(issue.info),
+        row: issue.row,
+        state: 'OPEN',
+        stateReason: issue.row.stateReason ?? '',
+        details: held.details,
+        isLoaded: held.isLoaded,
+        recap: isRecapUsable(options, known.settings, issue.sectionKey, recap, issue.row) ? recap : undefined,
+        isMetadataOnly,
+        purpose: 'mention',
+        source: 'cache',
+        at: held.details?.fetchedAt ?? 0,
+        limits: MENTION_LIMITS,
+        toolName: issueToolName,
+      }),
+    )
+    plan.attached.push(ref)
+    if (isMetadataOnly) plan.metaOnly.push(ref)
+    else if (!held.isLoaded) plan.excerptOnly.push(ref)
+    plan.records.push({ rowKey, updatedAt: issue.row.updatedAt })
+  }
+
+  return plan
+}
+
+/**
+ * Notes issues as carried by this conversation at `turn` (the session's turn count when not given); nothing when the
+ * count cannot be read. Keyed by the conversation's id, so a /clear or a resume starts afresh (C-E2-2).
+ */
+async function recordAttached($: EngineInterface, entries: ReadonlyArray<{ rowKey: string; updatedAt: string | null }>, via: Attached['via'], turn?: number): Promise<void> {
+  if (entries.length === 0) return
+  const at = turn ?? (await $.session.turns().catch(() => -1))
+  if (at < 0) return
+  const conversation = await $.session.id().catch(() => '')
+  await update($, attached, current => withAttached(current, conversation, entries, at, via, ATTACHED_KEPT))
+}
+
+/** After the prompt entered: the record, and one dim transcript line (never sent to the model) saying what went in. */
+async function noteMentions($: EngineInterface, options: Options, plan: MentionPlan): Promise<void> {
+  await recordAttached($, plan.records, 'prompt', plan.turn)
+  const S = strings(options.language)
+  const parts = [S.mentionAttached(plan.attached.join(', '))]
+  if (plan.excerptOnly.length > 0) parts.push(S.mentionExcerptOnly(plan.excerptOnly.join(', ')))
+  if (plan.metaOnly.length > 0) parts.push(S.mentionMetaOnly(plan.metaOnly.join(', ')))
+  if (plan.capped.length > 0) parts.push(S.mentionCapped(plan.capped.join(', ')))
+  $.ui.log(clean(parts.join('; ')))
+}
+
+/** A hand-off brief carries its issue (C-E2-3): recorded as attached, whatever stands before its marker line. */
+async function recordBrief($: EngineInterface, text: string): Promise<void> {
+  const rowKey = briefIssueKey(text)
+  if (rowKey !== null) await recordAttached($, [{ rowKey, updatedAt: null }], 'brief')
+}
+
 async function resetStore($: EngineInterface): Promise<void> {
   const keys = await $.store.keys().catch(() => [] as string[])
   for (const key of keys) {
@@ -2142,6 +2611,8 @@ async function resetStore($: EngineInterface): Promise<void> {
   seenWrittenAt.clear()
   redoFailed.clear()
   warmFailed.clear()
+  toolReads.clear()
+  checkoutTriedAt = Number.NEGATIVE_INFINITY
   seenFlush?.cancel()
   seenFlush = undefined
   fade?.cancel()
@@ -2170,6 +2641,8 @@ async function resetStore($: EngineInterface): Promise<void> {
   await update($, seenBase, () => ({}))
   await update($, glimpsed, () => ({}))
   await update($, listed, () => ({}))
+  // E2: what the conversation carries is attached again on its next mention.
+  await update($, attached, () => NO_ATTACHED)
 }
 
 /**
@@ -2211,6 +2684,8 @@ async function runSpike($: EngineInterface, command: string): Promise<string> {
         : `get_status ${sessionId} (quiet, via mcp): ${look.kind === 'pr' ? `PR #${look.pr.number} ${look.pr.state || '?'}; ` : 'no pull request; '}${look.raw.slice(0, 200) || '(empty)'}`,
     )
   }
+  // S18 (E6): whether this host adds a plugin's tool at run time; S16 (E2, E5): what the desktop stamps on a typed prompt.
+  lines.push(`issue tool: ${issueToolName ?? `not registered (${issueToolProblem || '?'})`}`, `last prompt origin: ${lastPromptOrigin || 'none yet'}`)
 
   return clean(lines.join('\n'))
 }
@@ -2266,6 +2741,10 @@ export const register: Register = (on, given) => {
       armTimer($, options)
       schedule($, options, 600, 'start')
     }
+    // E6: the issue tool, in issue sessions too (their brief's phase 1 reads with it), once the start is scheduled, and
+    // only in a git repository (C-E6-8); awaited, so it is listed by turn one.
+    if ((await $.session.repo().catch(() => null)) !== null) await registerIssueTool($)
+    else issueToolProblem = 'no git repository here'
 
     return next(e)
   })
@@ -2283,7 +2762,11 @@ export const register: Register = (on, given) => {
 
   // The issue session recognizes its own brief and stays out of the way; a brief this
   // session filled itself (Take it here, or the no-route fallback) is not that case.
+  // E2: a person's prompt that mentions open issues carries them as context, from what
+  // the session holds only (never gh on Enter). A failure lets the prompt through as it
+  // came: the .catch passes it on (next is replay-safe there).
   on('prompt.submit', async ($, e, next) => {
+    lastPromptOrigin = e.origin.kind
     const head = e.text.trimStart().slice(0, BRIEF_HEAD)
     if (e.text.trimStart().startsWith(MARKER) && !ownBriefs.has(head) && !(await read($, isIssueSession))) {
       await update($, isIssueSession, () => true)
@@ -2292,9 +2775,49 @@ export const register: Register = (on, given) => {
     }
     // E5: a prompt the owner sent while the pane is shown is a look at it (the desktop's stamp is S16's question).
     if ((e.origin.kind === 'composer' || e.origin.kind === 'sdk') && !(await read($, isIssueSession)) && (await isPaneShown($))) void noteLook($, options).catch(() => undefined)
+    if (!options.issueMentions) return next(e)
+    // A hand-off brief, wherever its marker stands (a draft before it), carries its own issue and attaches nothing (C-E2-3).
+    const isBrief = e.text.includes(MARKER)
+    if (isBrief) await recordBrief($, e.text)
+    const plan = isBrief ? null : await planMentions($, options, e)
+    const entered = await next(plan === null ? e : { ...e, context: [...(e.context ?? []), ...plan.context] })
+    if (plan !== null && entered.drop === undefined) await noteMentions($, options, plan)
 
-    return next(e)
+    return entered
   }).catch(($, e, next) => next(e))
+
+  // E2: the `#` typeahead, only while the setting is on (the engine raises the event only while a plugin hooks it). The
+  // terminal asks it; the desktop app 4.23118 does not send the ask (C-E2-1), so there the attach at Enter remains.
+  if (options.issueMentions) {
+    // The matcher lets through the tokens holding a `#`; issueSuggestions reads them with MENTION_TOKEN.
+    on('prompt.autocomplete', { token: /#/ }, async ($, e, next) => {
+      const below = await next(e)
+      const mine = await issueSuggestions($, options, e.token)
+
+      return mine.length === 0 ? below : { suggestions: [...below.suggestions, ...mine] }
+    }).catch(($, e, next) => next(e))
+
+    // A compaction of the main conversation drops the blocks it carried: they are attached again on the next mention.
+    on('session.compact', { trigger: /^(?:manual|auto|plugin)$/ }, async ($, e, next) => {
+      const done = await next(e)
+      if (e.agentId === undefined && done.skip === undefined) await update($, attached, () => NO_ATTACHED)
+
+      return done
+    }).catch(($, e, next) => next(e))
+
+    // A /clear or a resume goes on under another conversation (C-E2-2); the record is keyed by its id as well.
+    on('session.end', async ($, e, next) => {
+      if (e.reason === 'clear' || e.reason === 'resume') await update($, attached, () => NO_ATTACHED).catch(() => undefined)
+
+      return next(e)
+    }).catch(($, e, next) => next(e))
+  }
+
+  // E6: the read-only issue tool (ISSUE_TOOL, spelled out so validate names it), answered here in core's place: no next,
+  // so nothing beneath runs and nothing is written.
+  on('tool.call', { tool: 'mcp__issue-radar__issue' }, ($, e) => answerIssueTool($, options, e as unknown as Record<string, unknown>, e.agentId)).catch(() =>
+    toolError('could not answer this call; read the issue with gh issue view.'),
+  )
 
   // E5's looks: a press on the pane's elements, a scroll or focus move of the owner's in it. Each only observes and
   // always passes the event on, and its guard passes it on too (next is replay-safe there), so no press is swallowed.

@@ -3,7 +3,7 @@
 // plugin (the first registration of an event answers it); `project` records
 // what the plugin asked of them, so tests assert on keys and argv, not on
 // incidental text.
-import type { RenderSurface, UiOpenResult } from 'claude-code'
+import type { PromptAutocompleteSuggestion, PromptSubmitInput, RegisteredToolSpec, RenderSurface, UiOpenResult } from 'claude-code'
 import { mock } from 'claude-code/testing'
 import type { MockClock, TestBody } from 'claude-code/testing'
 
@@ -127,6 +127,8 @@ export type Engine = Parameters<TestBody>[0]
 export type McpCall = { server: string; tool: string; args: Record<string, unknown> }
 export type McpAnswer = { value: { content: Array<{ type: 'text'; text: string }>; isError: boolean; structuredContent?: unknown } }
 export type CheckDecision = 'allow' | 'ask' | 'deny'
+/** A `$.tool.check` verdict with what stands behind it (a rule, a hook), as the engine answers one. */
+export type CheckVerdict = { decision: CheckDecision; reason?: string; rule?: string; hook?: string }
 
 /** An answer of the desktop app to `$.mcp.call`: text, optionally an error. */
 export function mcpText(text: string, isError = false): McpAnswer {
@@ -148,8 +150,12 @@ export type Setup = {
   mcp?: (call: McpCall) => McpAnswer | Promise<McpAnswer>
   /** What a typed `$.tool.call` gets beneath the plugin; the default refuses it as an unknown tool. */
   toolCall?: (input: Record<string, unknown>) => Record<string, unknown>
-  /** What a `$.tool.check` query (no tool_use_id) is answered; the default is 'ask'. */
-  check?: (tool: string, input: unknown) => CheckDecision
+  /** What a `$.tool.check` query (no tool_use_id) is answered, a decision or a whole verdict; the default is 'ask'. */
+  check?: (tool: string, input: unknown) => CheckDecision | CheckVerdict
+  /** What `$.tool.register` answers (E6); a throw stands for a host that adds no tools at run time. The default registers `mcp__issue-radar__<name>`. */
+  register?: (spec: RegisteredToolSpec) => { tool: string }
+  /** The rows the hooks beneath the plugin add to a `#` typeahead (`prompt.autocomplete`); none by default. */
+  autocomplete?: () => PromptAutocompleteSuggestion[]
   /** What `$.session.id()` answers; the default is 'local_pane'. */
   sessionId?: string
   /** Whether a placed pane is shown at the start (not behind another tab); the default is true. */
@@ -198,6 +204,12 @@ export type Project = {
   systems: string[]
   /** Shows or hides a placed pane (another tab in front of it), as `$.ui.panes()` reports it. */
   setShown: (isShown: boolean) => void
+  /** Every tool spec the plugin registered (E6), in order. */
+  registered: RegisteredToolSpec[]
+  /** Every prompt that reached beneath the plugin's `prompt.submit` hook, with the context it carried (E2). */
+  submitted: PromptSubmitInput[]
+  /** Sets what `$.session.turns()` answers (the user turns so far; 0 at the start). */
+  setTurns: (turns: number) => void
 }
 
 /**
@@ -220,6 +232,9 @@ export function project(on: On, setup: Setup = {}): Project {
   const logs: string[] = []
   const prompts: string[] = []
   const systems: string[] = []
+  const registered: RegisteredToolSpec[] = []
+  const submitted: PromptSubmitInput[] = []
+  let turns = 0
   /** The open panes by id: the title and whether the latest open placed them. */
   const panes = new Map<string, { title: string; isPlaced: boolean }>()
   let isShown = setup.isShown ?? true
@@ -278,7 +293,18 @@ export function project(on: On, setup: Setup = {}): Project {
   on('session.surfaces', () => ({ value: setup.surfaces ?? ['desktop'] }))
   on('fs.read', () => ({ value: '{ "name": "issue-radar", "version": "9.9.9" }' }))
   on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
-  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('prompt.submit', (_, e) => {
+    submitted.push(e)
+
+    return e.context === undefined ? { text: e.text } : { text: e.text, context: e.context }
+  })
+  on('prompt.autocomplete', () => ({ suggestions: setup.autocomplete?.() ?? [] }))
+  on('session.turns', () => ({ value: turns }))
+  on('tool.register', (_, e) => {
+    registered.push(e)
+
+    return { value: setup.register === undefined ? { tool: `mcp__issue-radar__${e.name}` } : setup.register(e) }
+  })
   on('prompt.fill', (_, e) => {
     draft = e.mode === 'append' ? draft + e.text : e.text
     filled.push(e.text)
@@ -318,8 +344,9 @@ export function project(on: On, setup: Setup = {}): Project {
   on('tool.check', (_, e) => {
     if (e.tool_use_id !== undefined) return { decision: 'allow' }
     checks.push({ tool: e.tool, input: e.input })
+    const verdict = setup.check === undefined ? 'ask' : setup.check(e.tool, e.input)
 
-    return { decision: setup.check === undefined ? 'ask' : setup.check(e.tool, e.input) }
+    return typeof verdict === 'string' ? { decision: verdict } : verdict
   })
   on('tool.call', (_, e) => {
     const input = { ...(e as unknown as Record<string, unknown>) }
@@ -344,6 +371,11 @@ export function project(on: On, setup: Setup = {}): Project {
     systems,
     setShown: value => {
       isShown = value
+    },
+    registered,
+    submitted,
+    setTurns: value => {
+      turns = value
     },
   }
 }

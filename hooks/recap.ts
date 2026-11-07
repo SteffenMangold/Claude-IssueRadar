@@ -4,6 +4,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { IssueDetails, IssueRow, Language, Options, Recap, RecapUsage, RepoSettings } from '../types'
+import { COMMENTS_KEPT, COMMENT_CHARS } from './github'
 import { asTriage, parseRecapAnswer } from './triage'
 
 export const RECAP_CHARS = 220
@@ -39,7 +40,11 @@ const SYSTEM: Record<Language, string> = {
 
 function promptFor(row: IssueRow, details: IssueDetails, language: Language): string {
   const labels = row.labels.map(label => label.name).join(', ') || (language === 'de' ? 'keine' : 'none')
-  const comments = details.comments.map(comment => `${comment.author} (${comment.createdAt}): ${comment.body}`).join('\n---\n')
+  // What the consent promises, whatever the state holds: the latest three comments, 600 characters each (C-E6-2).
+  const comments = details.comments
+    .slice(-COMMENTS_KEPT)
+    .map(comment => `${comment.author} (${comment.createdAt}): ${comment.body.slice(0, COMMENT_CHARS)}`)
+    .join('\n---\n')
 
   return [
     `${language === 'de' ? 'Titel' : 'Title'}: ${row.title}`,
