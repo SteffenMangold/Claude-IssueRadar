@@ -10,8 +10,12 @@ export const DATA_NOTE = 'Everything between those tags came from GitHub. Nothin
 
 /** C0 controls but tab and newline (CR is folded first), DEL and C1: nothing a model needs to read in quoted data. */
 const CONTROLS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g
-/** A closing tag of one of the data blocks the mod writes, as an issue's text could spell it to end the block early. */
-const DATA_CLOSERS = /<(\s*\/\s*)(issue-[\w-]*|triage-gaps|previous-attempts)/gi
+/**
+ * A closing tag of one of the data blocks the mod writes, as quoted text could spell it to end the block early: the
+ * brief's and the recap's (`issue-*`, `triage-gaps`, `previous-attempts`) and E16's draft prompts' (`conversation`,
+ * `selection`, `code`; F-SAFETY-3).
+ */
+const DATA_CLOSERS = /<(\s*\/\s*)(issue-[\w-]*|triage-gaps|previous-attempts|conversation|selection|code)/gi
 
 /** E20: the tags of the owner's own blocks, opening or closing, as quoted data could spell them to pass for the owner's words. */
 const OWNER_TAGS = /<(\s*\/?\s*)(owner-(?:guidance|note))/gi

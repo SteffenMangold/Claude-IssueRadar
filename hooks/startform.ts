@@ -5,6 +5,7 @@
 import type { RenderSurface } from 'claude-code'
 
 import type { ForkState, StartChoice, StartEffort, StartModel } from '../types'
+import { scanSecrets } from './writes'
 
 /** The longest guidance and note a brief carries (about 250 tokens each). */
 export const GUIDANCE_CHARS = 1_000
@@ -88,11 +89,13 @@ export function noteOf(draft: string | undefined, kept: string): string {
 
 /**
  * Whether a text looks like it holds a secret, which the mod refuses to keep or send with a brief: a GitHub token
- * (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and 20+ characters; `github_pat_…`), an API key (`sk-…`), a private key block.
- * A heuristic: the owner is told it cannot prove a paragraph is free of secrets.
+ * (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and 20+ characters; `github_pat_…`), an API key (`sk-…`), a private key block,
+ * and whatever the write card warns of (writes.ts scanSecrets: AWS key ids, Slack tokens, JWTs; F-SAFETY-5), so the
+ * refusal and the card's warning share one heuristic. A local path is no secret here: it is legitimate guidance. A
+ * heuristic: the owner is told it cannot prove a paragraph is free of secrets.
  */
 export function looksSecret(text: string): boolean {
-  return /\bgh[pousr]_[A-Za-z0-9_]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bsk-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(text)
+  return /\bgh[pousr]_[A-Za-z0-9_]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bsk-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(text) || scanSecrets(text).some(kind => kind !== 'userPath')
 }
 
 /** What `git rev-parse --abbrev-ref HEAD --path-format=absolute --git-dir --git-common-dir` says: the branch and whether the folder is a linked worktree. */

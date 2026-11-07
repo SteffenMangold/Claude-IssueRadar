@@ -111,6 +111,7 @@ const DE = {
   paneWaits: (reason: string) => `Issue-Radar wartet: ${reason}`,
   storeCleared: 'Issue-Radar-Speicher geleert (Cache, PR-Status, geschlossene und zugewiesene Issues, Recaps, Zuordnungen, Session-Zustände, frühere Versuche, Zustimmungen, Ansichten, Hinweise, Seitenleisten-Wahl, zuletzt Gesehenes).',
   unsupported: 'Diese Oberfläche zeigt keine Seitenleiste.',
+  spikeTyped: 'Der Spike läuft nur, wenn du /issue-radar spike selbst eingibst.',
   ago: { now: 'jetzt', m: 'm', h: 'h', d: 'd', w: 'w', mo: 'Mo' },
   // E14: filter, search, saved views
   filter: 'Filter',
@@ -395,6 +396,7 @@ const DE = {
   linkAlreadyPushed: 'Die Branch ist schon auf GitHub; der Pull Request mit „Closes …“ verknüpft das Issue.',
   linkBaseMoved: (branch: string) => `origin/${branch} hat sich bewegt; bitte erneut prüfen.`,
   linkSessionChanged: 'Die Zeile gehört inzwischen zu einer anderen Session; nichts verknüpft.',
+  linkNoCheckout: 'Das Repository dieses Checkouts ist noch nicht ermittelt; nichts verknüpft. Bitte erneut prüfen.',
 }
 
 const EN: typeof DE = {
@@ -500,6 +502,7 @@ const EN: typeof DE = {
   paneWaits: (reason: string) => `Issue Radar waits: ${reason}`,
   storeCleared: 'Issue Radar store cleared (cache, PR states, closed and assigned issues, recaps, mappings, session states, earlier attempts, consents, views, guidance, sidebar choice, last-seen records).',
   unsupported: 'This surface draws no side pane.',
+  spikeTyped: 'The spike runs only when you type /issue-radar spike yourself.',
   ago: { now: 'now', m: 'm', h: 'h', d: 'd', w: 'w', mo: 'mo' },
   // E14: filter, search, saved views
   filter: 'Filter',
@@ -784,6 +787,7 @@ const EN: typeof DE = {
   linkAlreadyPushed: "The branch is already on GitHub; the pull request's \"Closes …\" links the issue.",
   linkBaseMoved: (branch: string) => `origin/${branch} moved; review it again.`,
   linkSessionChanged: 'The row belongs to another session now; nothing linked.',
+  linkNoCheckout: "This checkout's repository is not known yet; nothing linked. Review it again.",
 }
 
 export type Strings = typeof DE

@@ -558,9 +558,13 @@ function peekOf(answer: DesktopCall, sessionId: string): Peek {
   return { kind: 'found', entry: prose ? { ...entry, archived: true } : entry }
 }
 
-/** This session's own id as the desktop app names it (get_session 'self', quiet); empty when it did not answer (S4). */
-export async function readSelfId($: EngineInterface): Promise<{ id: string; reason: string }> {
-  const answer = await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: 'self' })
+/**
+ * This session's own id as the desktop app names it (get_session 'self', quiet); empty when it did not answer (S4).
+ * `options` as quietDesktop takes them: a desktop attach reads with `isMeasurement`, past an earlier transport failure's
+ * hold (F-RUNTIME-1).
+ */
+export async function readSelfId($: EngineInterface, options: QuietOptions = {}): Promise<{ id: string; reason: string }> {
+  const answer = await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: 'self' }, options)
   if (!answer.ok) return { id: '', reason: answer.reason }
   const entry = entryOf(parseObject(answer.structured, answer.text))
 

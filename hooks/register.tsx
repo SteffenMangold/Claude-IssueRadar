@@ -117,6 +117,8 @@ const OWN_ACTIVITY_MS = 120_000
 const LISTED_KEEP = 1_000
 /** E18: the shortest gap between two board reads of the same rows that the timer, a tool or a re-run asks for. */
 const BOARDS_MIN_MS = 60_000
+/** E18 (F-BUDGET-1): how long a section's board read waits after a failure that is no rate limit, no network and no scope (a schema that refuses the field). */
+const BOARDS_FAILED_MS = 10 * 60_000
 /** E11: how long a scroll to a row the press just opened waits before its one retry (E11-5). */
 const SCROLL_RETRY_MS = 250
 /** How often a mapped issue session's pull request is read from the app while it answers (E3). */
@@ -150,6 +152,11 @@ const REATTACH_TURNS = 4
 const ATTACHED_KEPT = 100
 /** E2: the prompts a person sent (C-E2-10: the desktop stamps a typed prompt composer, bridge, sdk or unclassified). */
 const PERSON_ORIGINS: ReadonlySet<string> = new Set(['composer', 'bridge', 'sdk', 'unclassified'])
+/**
+ * F-SAFETY-7: the origins the engine attests as the person's own gesture (Enter at the composer, the Remote Control
+ * bridge): only a spike typed there carries the command's words as consent on the typed route.
+ */
+const GESTURE_ORIGINS: ReadonlySet<string> = new Set(['composer', 'bridge'])
 const NO_ATTACHED: AttachedRecord = { conversation: '', entries: {} }
 
 // Change a tag when the stored value's fields change: an earlier version's
@@ -290,6 +297,8 @@ const filteredPrs = new Map<string, { query: string; record: PrRecord }>()
 const filteredPrTried = new Map<string, { query: string; at: number }>()
 /** E18: when each section's board items were last asked, and for which rows. */
 const boardsReadAt = new Map<string, { at: number; rows: string }>()
+/** E18 (F-BUDGET-1): until when a section's board read waits after another failure; the owner's presses ask through it. */
+const boardsHeldUntil = new Map<string, number>()
 /**
  * E22: each repository's step that reads its closed part, claimed before its first wait, so a press and a refresh
  * never both fetch it; a reload clears it, unlike a flag in `$.state` (E22-1).
@@ -658,13 +667,17 @@ async function retireMapping($: EngineInterface, rowKey: string, mapping: Mappin
   await saveMapping($, rowKey, null)
 }
 
-/** Applies a change to the stored settings, read fresh so another pane's writes on the same repository survive, and mirrors the result into the state. */
+/**
+ * Applies a change to the stored settings, read fresh so another pane's writes on the same repository survive, and
+ * mirrors the result into the state. The store first (F-STATE-2): a refresh that syncs meanwhile reads the new settings
+ * or finds the state as it was, never puts the old ones back over the new.
+ */
 async function saveSettings($: EngineInterface, change: (current: RepoSettings) => RepoSettings): Promise<RepoSettings> {
   const key = settingsKey
   const current = key === null || key === '' ? await read($, settings) : readSettings(await readStore<unknown>($, storeKeyOf('settings:', key)))
   const next = change(current)
-  await update($, settings, () => next)
   if (key !== null && key !== '') await writeStore($, storeKeyOf('settings:', key), next)
+  await update($, settings, () => next)
 
   return next
 }
@@ -1332,14 +1345,47 @@ function forgetOtherRoot(root: string): void {
 /**
  * The checkout's key decides which settings the session reads: on a change, the stored settings and the key go into the
  * state. The key is taken only once both are in (R4-INT-3): the refresh and the tool adopt it, and a caller that came
- * meanwhile reads and writes the same again rather than going on with the settings of before.
+ * meanwhile reads and writes the same again rather than going on with the settings of before. With the key unchanged,
+ * the stored settings are read again (F-STATE-2): another pane of the repository may have changed them.
  */
-async function adoptSettingsKey($: EngineInterface, key: string): Promise<void> {
-  if (settingsKey === key) return
+async function adoptSettingsKey($: EngineInterface, key: string): Promise<RepoSettings> {
+  if (settingsKey === key) return syncSettings($)
   const stored = key === '' ? undefined : await readStore<unknown>($, storeKeyOf('settings:', key))
-  await update($, settings, () => readSettings(stored))
+  const next = readSettings(stored)
+  await update($, settings, () => next)
   await update($, checkoutKey, () => key)
   settingsKey = key
+
+  return next
+}
+
+/**
+ * F-STATE-2: the settings as the store holds them now, mirrored into the state when they differ. Every pane of the
+ * repository (and /issue-radar reset) writes `settings:<key>`, so a decision on guidance, beside, consent, views, boards
+ * or the expanded parts reads this, never a copy taken at an earlier refresh; a repository whose consent went loses its
+ * recaps from the state here too. A store that cannot be read, or no checkout key yet, leaves the state's copy.
+ */
+async function syncSettings($: EngineInterface): Promise<RepoSettings> {
+  const key = settingsKey
+  const held = await read($, settings)
+  if (key === null || key === '') return held
+  const raw = await $.store.get(storeKeyOf('settings:', key)).then(
+    value => ({ value }),
+    () => null,
+  )
+  if (raw === null) return held
+  const stored = readSettings(raw.value)
+  if (JSON.stringify(stored) === JSON.stringify(held)) return held
+  await update($, settings, () => stored)
+  const revoked = Object.keys(held.consent).filter(repo => held.consent[repo] === true && stored.consent[repo] !== true)
+  if (revoked.length > 0) await update($, recaps, current => Object.fromEntries(Object.entries(current).filter(([rowKey]) => !revoked.includes(rowKey.slice(0, rowKey.lastIndexOf('#'))))))
+
+  return stored
+}
+
+/** F-STATE-2: whether recaps may be made and kept for a repository, as the store says right now (V1's consent, read fresh). */
+async function isConsented($: EngineInterface, options: Options, repoKey: string): Promise<boolean> {
+  return options.recaps && (await syncSettings($)).consent[repoKey] === true
 }
 
 async function refresh($: EngineInterface, options: Options, reason: Reason): Promise<void> {
@@ -1384,8 +1430,7 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     // not repeated (R4-RT-4).
     if (resolvingCheckout !== null) await resolvingCheckout
     if (checkout === null || checkout.root !== root || checkout.info === null) checkout = { root, ...(await resolveCheckout($, root)) }
-    await adoptSettingsKey($, checkout.info === null ? '' : repoKey(checkout.info))
-    const chosen = await read($, settings)
+    const chosen = await adoptSettingsKey($, checkout.info === null ? '' : repoKey(checkout.info))
 
     // Open the pane once the folder turns out to be a GitHub repository.
     if (!paneDecided) {
@@ -1737,8 +1782,9 @@ async function hydrate($: EngineInterface, options: Options, current: readonly S
       : { fetchedAt: cache?.fetchedAt ?? section.fetchedAt ?? now, rows: cache?.rows ?? section.rows, meta, ...(total === undefined ? {} : { total }) }
     await writeStore($, storeKeyOf('cache:', section.key), written)
     // Recaps stay on disk only while the owner wants them for this repository: the listed rows' as they stand, the
-    // others' as long as the store keeps their meta.
-    if (options.recaps && chosen.consent[section.key] === true) {
+    // others' as long as the store keeps their meta. The consent is read again here (F-STATE-2): this pane or another
+    // may have switched recaps off while the details and the recaps were read.
+    if (await isConsented($, options, section.key)) {
       const stored = await readStore<Record<string, Recap>>($, storeKeyOf('recaps:', section.key))
       const others = Object.entries(typeof stored === 'object' && stored !== null ? stored : {}).filter(([number]) => !listed.has(number) && meta[number] !== undefined)
       await writeStore($, storeKeyOf('recaps:', section.key), { ...Object.fromEntries(others), ...repoRecaps })
@@ -1763,7 +1809,6 @@ function isRedoHeld(rowKey: string, row: IssueRow, language: Language, now: numb
 async function hydrateOne($: EngineInterface, options: Options, section: Section, row: IssueRow, now: number, mayRedo: boolean): Promise<IssueDetails | undefined> {
   if (section.info === null) return undefined
   const rowKey = rowKeyOf(section.key, row.number)
-  const chosen = await read($, settings)
   let have = (await read($, details))[rowKey]
   if (!isCurrent(have, row) || have?.fetchedAt === 0) {
     const viewed = await viewIssue($, section.info, row, now)
@@ -1776,17 +1821,21 @@ async function hydrateOne($: EngineInterface, options: Options, section: Section
     const fetched = viewed.details
     await update($, details, current => ({ ...current, [rowKey]: fetched }))
   }
-  const consented = options.recaps && chosen.consent[section.key] === true
+  // F-STATE-2: the consent as the store holds it once the read is in, not as it was when the refresh began: a switch
+  // off in this pane or another (or /issue-radar reset) meanwhile sends nothing to the model.
+  const consented = await isConsented($, options, section.key)
   const recap = (await read($, recaps))[rowKey]
   const isRedo = isRecapFor(recap, row)
   if (consented && have !== undefined && (!isRedo || (mayRedo && !isRecapCurrent(recap, row, options.language) && !isRedoHeld(rowKey, row, options.language, now)))) {
     const made = await recapIssue($, row, have, options.language, options.recapModel, now)
+    const spent = made.usage.input_tokens + made.usage.output_tokens + made.usage.cache_read_input_tokens + made.usage.cache_creation_input_tokens
+    if (spent > 0) await update($, tokens, current => current + spent)
+    // A consent switched off while the model answered: the recap is dropped, never kept.
+    if (!(await isConsented($, options, section.key))) return have
     // A failed redo of a working recap keeps that recap: the failure is only remembered, so it is not asked again soon.
     const keepsOld = isRedo && recap?.error === undefined && made.error !== undefined
     if (keepsOld) redoFailed.set(rowKey, { updatedAt: row.updatedAt, language: options.language, at: now })
     else await update($, recaps, current => ({ ...current, [rowKey]: made }))
-    const spent = made.usage.input_tokens + made.usage.output_tokens + made.usage.cache_read_input_tokens + made.usage.cache_creation_input_tokens
-    if (spent > 0) await update($, tokens, current => current + spent)
     if (made.error !== undefined) $.ui.log(`${PLUGIN}: recap of #${row.number} failed: ${made.error}${keepsOld ? ' (the earlier recap stays)' : ''}`, { to: 'debug' })
   }
 
@@ -1944,7 +1993,7 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
 
 /** Work on it's choice: understand first, own worktree, the pane session's model and effort, and E8's `beside` as the repository's setting says. */
 async function defaultChoice($: EngineInterface): Promise<StartChoice> {
-  return { ...DEFAULT_CHOICE, beside: (await read($, settings)).beside === true }
+  return { ...DEFAULT_CHOICE, beside: (await syncSettings($)).beside === true }
 }
 
 /**
@@ -1984,7 +2033,8 @@ async function startIssueSession($: EngineInterface, options: Options, sectionKe
     root,
     sourceBranch: facts?.branch ?? '',
     isSourceWorktree: facts?.isWorktree === true,
-    guidance: (await read($, settings)).guidance ?? '',
+    // F-STATE-2: the guidance as the store holds it now (another pane of the repository may have saved it).
+    guidance: (await syncSettings($)).guidance ?? '',
     note: choice.note,
   }
   const prompt = renderBrief(input, briefing)
@@ -2167,7 +2217,7 @@ async function toggleStartForm($: EngineInterface, rowKey: string, surface: Rend
     editorDrafts.clear()
     await update($, editor, () => null)
   }
-  const chosen = await read($, settings)
+  const chosen = await syncSettings($)
   const form: StartForm = { rowKey, ...DEFAULT_CHOICE, beside: chosen.beside === true }
   await touchForm($)
   await update($, startForm, () => form)
@@ -2341,7 +2391,7 @@ async function openMapped($: EngineInterface, options: Options, mapping: Mapping
     return false
   }
   // E8: with "beside" on, the session opens in split view, so the pane stays in view (focus would replace this session).
-  const beside = (await read($, settings)).beside === true
+  const beside = (await syncSettings($)).beside === true
   const opened = beside ? await openBeside($, mapping.sessionId, consent) : await openSessionIn($, mapping.sessionId, 'focus', consent)
   if (opened.outcome !== 'refused') return true
   $.ui.log(`${PLUGIN}: open_session_in ${mapping.sessionId} refused: ${opened.reason}`, { to: 'debug' })
@@ -2531,7 +2581,7 @@ async function takeHere($: EngineInterface, options: Options, sectionKey: string
     previous: (await read($, attempts))[rowKey] ?? [],
     mode: choice?.mode ?? 'understand',
     place: 'here',
-    guidance: (await read($, settings)).guidance ?? '',
+    guidance: (await syncSettings($)).guidance ?? '',
     note: choice?.note ?? '',
   })
   if (!(await fillPrompt($, options, brief))) return false
@@ -2548,7 +2598,7 @@ async function triageFor($: EngineInterface, options: Options, rowKey: string, f
   const recap = (await read($, recaps))[rowKey]
   const sectionKey = rowKey.slice(0, rowKey.lastIndexOf('#'))
 
-  return isRecapUsable(options, await read($, settings), sectionKey, recap, fresh) ? (recap.triage ?? null) : null
+  return isRecapUsable(options, await syncSettings($), sectionKey, recap, fresh) ? (recap.triage ?? null) : null
 }
 
 async function consent($: EngineInterface, options: Options, key: string, value: boolean): Promise<void> {
@@ -2702,7 +2752,10 @@ async function listSubIssues($: EngineInterface, options: Options, rowKey: strin
  * repository; collapsed sections wait (E18-2). The timer, a tool and the mod's own re-runs ask at most once a minute
  * for the same rows, and never while the host's token lacks the scope; the session's start, ↻ and the owner's presses
  * (`force`: the toggle, Erneut prüfen) always ask, since the owner may have granted the scope meanwhile. A rate limit,
- * no network or a signed-out gh keep the last items; another failure is named in the ⚙ panel.
+ * no network or a signed-out gh keep the last items; another failure is named in the ⚙ panel. F-BUDGET-1: the
+ * repository's shared back-off (plan 4.3) holds every read but a forced one, whichever request met the limit (the list,
+ * the pull-request read, E4, E6 or this one), and a rate limit or no network met here sets it as a failed list does; after
+ * another failure the timer, a tool and the re-runs wait BOARDS_FAILED_MS.
  */
 async function refreshBoards($: EngineInterface, current: readonly Section[], reason: Reason, now: number, force: boolean, onlyHost?: string): Promise<void> {
   const chosen = await read($, settings)
@@ -2714,8 +2767,10 @@ async function refreshBoards($: EngineInterface, current: readonly Section[], re
     const numbers = section.rows.map(row => row.number)
     const asked = numbers.join(',')
     const last = boardsReadAt.get(section.key)
+    if (!force && now < (backoffUntil.get(section.key) ?? 0)) continue
     if (!force && reason !== 'start' && reason !== 'press') {
       if ((await read($, boards)).scope[info.host] === 'missing') continue
+      if (now < (boardsHeldUntil.get(section.key) ?? 0)) continue
       if (last !== undefined && last.rows === asked && now - last.at < BOARDS_MIN_MS) continue
     }
     boardsReadAt.set(section.key, { at: now, rows: asked })
@@ -2730,11 +2785,16 @@ async function refreshBoards($: EngineInterface, current: readonly Section[], re
 
           return { ...had, scope: { ...had.scope, [info.host]: 'missing' }, needs: { ...had.needs, [info.host]: failed.detail ?? 'read:project' }, items }
         })
-      } else if (failed.kind !== 'rate-limited' && failed.kind !== 'offline' && failed.kind !== 'signed-out') {
+      } else if (failed.kind === 'rate-limited' || failed.kind === 'offline') {
+        // The GraphQL limit is the account's: the lists and the pull-request reads wait too, as after E3's request.
+        backoffFor(section.key, failed, now)
+      } else if (failed.kind !== 'signed-out') {
+        boardsHeldUntil.set(section.key, now + BOARDS_FAILED_MS)
         await update($, boards, (had): Boards => ({ ...had, detail: { ...had.detail, [info.host]: firstLine(failed.detail ?? failed.kind) || failed.kind } }))
       }
       continue
     }
+    boardsHeldUntil.delete(section.key)
     await update($, boards, (had): Boards => {
       const items = { ...had.items }
       for (const number of numbers) delete items[rowKeyOf(section.key, number)]
@@ -2868,7 +2928,9 @@ async function refreshClosed($: EngineInterface, options: Options, current: read
       const stored = asClosedCache(await readStore<unknown>($, storeKeyOf('closed:', section.key)))
       const cache = stored !== undefined && (have === undefined || stored.fetchedAt > have.fetchedAt) ? stored : have
       if (cache !== undefined && cache !== have) await update($, closed, all => ({ ...all, [section.key]: cache }))
+      // F-BUDGET-1: the repository's shared back-off holds too (a rate limit another read met); expanding asks through it.
       if (!mayFetch || chosen.collapsed[section.key] === true || now < (closedBackoff.get(section.key) ?? 0)) continue
+      if (reason !== 'expand' && now < (backoffUntil.get(section.key) ?? 0)) continue
       const tried = closedTriedAt.get(section.key)
       if (!isClosedDue(cache, since, reason, now, closedNudge.has(section.key), tried?.since === since ? tried.at : undefined)) continue
       closedTriedAt.set(section.key, { at: now, since })
@@ -3666,7 +3728,8 @@ async function heldCheckoutKey($: EngineInterface): Promise<string> {
 async function knownIssues($: EngineInterface): Promise<Known> {
   const listedSections = (await read($, sections)).filter(section => section.info !== null && (section.rows.length > 0 || isFilteredList(section)))
   if (listedSections.length > 0) {
-    const known: Known = { issues: [], settings: await read($, settings), recaps: { ...(await read($, recaps)) }, seeds: {} }
+    // F-STATE-2: the consent as the store holds it (another pane may have switched recaps off): the store only, never gh.
+    const known: Known = { issues: [], settings: await syncSettings($), recaps: { ...(await read($, recaps)) }, seeds: {} }
     for (const section of listedSections) {
       const info = section.info
       if (info === null) continue
@@ -3827,13 +3890,15 @@ async function recordBrief($: EngineInterface, text: string): Promise<void> {
 
 /**
  * This session's id as the desktop app names it (get_session 'self', quiet: never a card), once per module and kept in
- * the state; a failure is tried again a minute later at the earliest. Empty while unknown (S4).
+ * the state; a failure is tried again a minute later at the earliest. Empty while unknown (S4). `isAttach`: a desktop
+ * just attached, new evidence that its servers answer now, so the read passes the minute's hold and an earlier transport
+ * failure's (F-RUNTIME-1); a read already in flight is still shared.
  */
-async function resolveDesktopId($: EngineInterface): Promise<string> {
+async function resolveDesktopId($: EngineInterface, isAttach = false): Promise<string> {
   const known = await read($, desktopId)
   if (known !== '') return known
   // A read in flight is shared, never counted as a failed one (R5-RT-1): the check and the claim run without a wait between.
-  if (selfRead === null) selfRead = readDesktopId($)
+  if (selfRead === null) selfRead = readDesktopId($, isAttach)
   const pending = selfRead
   const id = await pending
   if (selfRead === pending) selfRead = null
@@ -3841,11 +3906,14 @@ async function resolveDesktopId($: EngineInterface): Promise<string> {
   return id
 }
 
-/** One read of this session's desktop id (resolveDesktopId shares it); only a failed read holds the next back a minute. */
-async function readDesktopId($: EngineInterface): Promise<string> {
+/**
+ * One read of this session's desktop id (resolveDesktopId shares it); only a failed read holds the next back a minute,
+ * except the one a desktop attach asks for (`isAttach`), which also tries the mcp route past its transport hold.
+ */
+async function readDesktopId($: EngineInterface, isAttach: boolean): Promise<string> {
   try {
-    if ((await $.clock.now()) < selfRetryAt) return ''
-    const self = await readSelfId($)
+    if (!isAttach && (await $.clock.now()) < selfRetryAt) return ''
+    const self = await readSelfId($, isAttach ? { isMeasurement: true } : {})
     if (self.id === '') {
       selfRetryAt = (await $.clock.now()) + SELF_RETRY_MS
       $.ui.log(`${PLUGIN}: this session's desktop id was not read: ${self.reason}`, { to: 'debug' })
@@ -3867,7 +3935,8 @@ async function readDesktopId($: EngineInterface): Promise<string> {
 async function identifyAfter($: EngineInterface, options: Options, prior: Promise<boolean> | null): Promise<boolean> {
   if (prior !== null && (await prior)) return true
 
-  return identifyByMapping($, options)
+  // F-RUNTIME-1: the attach's own read, asked once the prior one settled (so its failure cannot hold this one back).
+  return identifyByMapping($, options, true)
 }
 
 /** E12 (B5-BEH-1, plan 4.2): waits for the identification in flight, at most IDENTIFY_WAIT_MS; false when none ran or it did not answer in time. */
@@ -3911,7 +3980,7 @@ async function identifySelf($: EngineInterface, options: Options, found: SelfIss
  * a mapping could be this session's at all (one another session started; a pane's own mappings never name itself), on a
  * surface that may be the desktop. The store is read fresh: the mapping may have landed after this session started.
  */
-async function identifyByMapping($: EngineInterface, options: Options): Promise<boolean> {
+async function identifyByMapping($: EngineInterface, options: Options, isAttach = false): Promise<boolean> {
   if ((await read($, selfIssue)) !== null) return true
   const all = await loadMappings($)
   const match = async (): Promise<boolean> => {
@@ -3928,7 +3997,7 @@ async function identifyByMapping($: EngineInterface, options: Options): Promise<
   const isCandidate = Object.values(all).some(mapping => mapping.startedFrom !== myId && mapping.sessionId !== myId)
   const surfaces = await $.session.surfaces().catch(() => [])
   if (!isCandidate || !(surfaces.length === 0 || surfaces.some(surface => surface === 'desktop'))) return false
-  if ((await resolveDesktopId($)) === '') return false
+  if ((await resolveDesktopId($, isAttach)) === '') return false
 
   return match()
 }
@@ -4440,10 +4509,11 @@ function failureText(S: Strings, verdict: WriteVerdict, repo: string, host: stri
 /**
  * Confirm on the card: the write runs once, exactly as the card shows it. Ignored for another card, a card that runs,
  * one armed less than CONFIRM_ARM_MS ago (a double click on Review); an expired card is cleared and says so. E15's link
- * checks GitHub once more first (E15-1): a branch pushed meanwhile, or a base that moved, stops it.
+ * checks GitHub once more first (E15-1): a branch pushed meanwhile, or a base that moved, stops it. With writes off,
+ * nothing runs (F-SAFETY-6).
  */
 async function confirmWrite($: EngineInterface, options: Options, id: string): Promise<void> {
-  if (writing) return
+  if (!options.writes || writing) return
   writing = true
   let isClaimed = false
   try {
@@ -4643,7 +4713,8 @@ function doneText(S: Strings, kind: PendingWrite['kind']): string {
  * X-5: nothing of a fresh module is in flight. A card a reload left running says so: whether it reached GitHub is
  * unclear (B7-BEH-5). A row's write is read once more, as an ambiguous run is, and the read decides; a new issue's form
  * stays with its text but asks to look on GitHub before filing it again (it may be filed already); the next refresh shows
- * the rest. A preparation's busy mark and a start's mark go, a draft that was being drafted failed.
+ * the rest. A preparation's busy mark and a start's mark go, a draft that was being drafted failed. With writes off,
+ * every card, editor and form of the write path goes (F-SAFETY-6).
  */
 async function settleStaleWork($: EngineInterface, options: Options): Promise<void> {
   const S = strings(options.language)
@@ -4664,6 +4735,16 @@ async function settleStaleWork($: EngineInterface, options: Options): Promise<vo
   if (Object.keys(await read($, starting)).length > 0) await update($, starting, () => ({}))
   const open = await read($, draft)
   if (open !== null && open.phase === 'drafting') await update($, draft, current => (current !== null && current.phase === 'drafting' ? { ...current, phase: 'failed' as const, message: S.draftReloaded } : current))
+  // F-SAFETY-6: writes switched off (the change reloaded the module): no write is left waiting to come back armed once
+  // they are on again. The card, the editor, the new issue's form, the TODO list and what was typed into them go.
+  if (!options.writes) {
+    editorDrafts.clear()
+    draftTyped = { id: '' }
+    if ((await read($, pendingWrite)) !== null) await update($, pendingWrite, () => null)
+    if ((await read($, editor)) !== null) await update($, editor, () => null)
+    if ((await read($, draft)) !== null) await update($, draft, () => null)
+    if ((await read($, todos)).length > 0) await update($, todos, () => [])
+  }
 }
 
 /** X-1 (2): a refresh a tool or an attach asked for while the owner typed runs once the field closed. */
@@ -4797,6 +4878,7 @@ async function pickReason($: EngineInterface, rowKey: string, value: string): Pr
  * the card. The typed text is copied into the editor as its seed (X-1 (1)), so a Cancel of the card brings it back.
  */
 async function reviewEditor($: EngineInterface, options: Options, rowKey: string, field?: string, value?: string): Promise<void> {
+  if (!options.writes) return
   const S = strings(options.language)
   if (field !== undefined && value !== undefined) editorDrafts.set(editorKey(rowKey, field), value)
   await touchWrite($)
@@ -5028,25 +5110,32 @@ async function prepareLink($: EngineInterface, options: Options, rowKey: string)
 
 /**
  * E15-1 at Confirm: GitHub is asked once more. A branch pushed meanwhile is not linked (the offer goes); a base that
- * moved since Review sends the card back to review, its ancestry checked again and armed afresh. True: go on.
+ * moved since Review sends the card back to review, its ancestry checked again and armed afresh. True: go on. Every
+ * check fails closed (F-SAFETY-4): a card without its branch, or a checkout this module cannot resolve (a hot reload
+ * before the first refresh resolved it), links nothing and says so.
  */
 async function recheckLink($: EngineInterface, options: Options, card: PendingWrite): Promise<boolean> {
   const S = strings(options.language)
-  const code = checkout?.info ?? null
+  const now = await $.clock.now()
+  const stop = async (text: string): Promise<false> => {
+    await update($, pendingWrite, current => (current !== null && current.id === card.id ? null : current))
+    await setOutcome($, { target: card.target, kind: 'develop', ok: false, text, at: now })
+
+    return false
+  }
   const branch = card.expect?.branch
   const base = card.expect?.base
-  if (code === null || branch === undefined || base === undefined) return true
-  const now = await $.clock.now()
+  if (branch === undefined || base === undefined) return stop(S.linkUnknownBranch)
   // E15-2: the row's mapping must still name the session whose branch the card shows (a fresh start, another pane's
   // start since Review): another session's branch is never linked, nor kept on its mapping (B7-BEH-4).
   const mapping = await reloadMapping($, card.target)
   const sessionId = card.expect?.sessionId ?? mapping?.sessionId
-  if (mapping === undefined || mapping.sessionId !== sessionId) {
-    await update($, pendingWrite, current => (current !== null && current.id === card.id ? null : current))
-    await setOutcome($, { target: card.target, kind: 'develop', ok: false, text: S.linkSessionChanged, at: now })
-
-    return false
-  }
+  if (mapping === undefined || mapping.sessionId !== sessionId) return stop(S.linkSessionChanged)
+  // After a hot reload the module's checkout is unknown until the first refresh resolves it: resolved here (one shared
+  // `gh repo view`, as the issue tool does), never skipped.
+  if (checkout?.info === null || checkout?.info === undefined) await ensureProject($, true, now)
+  const code = checkout?.info ?? null
+  if (code === null) return stop(S.linkNoCheckout)
   const onGitHub = await remoteBranchTip($, code, branch)
   if ('stdout' in onGitHub && shaOf(onGitHub.stdout) !== null) {
     await update($, pendingWrite, current => (current !== null && current.id === card.id ? null : current))
@@ -5075,6 +5164,14 @@ async function recheckLink($: EngineInterface, options: Options, card: PendingWr
   return false
 }
 
+/** `owner/name` (lower case) of the repository a develop card's argv makes the branch in: `--branch-repo`, else `-R`. */
+function branchRepoOf(argv: readonly string[]): string {
+  const at = argv.indexOf(argv.includes('--branch-repo') ? '--branch-repo' : '-R')
+  const spec = at >= 0 ? (argv[at + 1] ?? '') : ''
+
+  return spec.split('/').slice(-2).join('/').toLowerCase()
+}
+
 /**
  * E15 after gh: GitHub's Development section decides (IssueRadarLinkedBranches): a branch listed there by name and
  * repository is linked, whatever gh's exit (a fetch that failed after the link, E15 risk 4); the mapping keeps it, while
@@ -5095,7 +5192,8 @@ async function afterDevelop($: EngineInterface, options: Options, card: PendingW
   }
   const answer = info === null ? null : await fetchLinkedBranches($, info, card.number ?? numberOfRow(rowKey))
   const listed = answer !== null && 'data' in answer ? readLinkedBranches(answer.data) : null
-  const codeRepo = code === null ? '' : repoLabel(code).toLowerCase()
+  // F-SAFETY-4: without the module's checkout (a reload meanwhile), the repository the card's argv names for the branch.
+  const codeRepo = code === null ? branchRepoOf(card.argv) : repoLabel(code).toLowerCase()
   const isListed = listed !== null && listed.some(found => found.name === branch && (found.repo === '' || found.repo.toLowerCase() === codeRepo))
   if (!isListed && !(listed === null && run.exitCode === 0)) {
     await fail(run.exitCode === 0 ? S.writeUnknown : failureText(S, run.verdict, repoOfKey(card.repoKey), host))
@@ -5198,6 +5296,7 @@ async function discardDraft($: EngineInterface, options: Options): Promise<void>
 
 /** The form's target: another repository that lists; its labels are read, the chosen ones dropped. */
 async function pickDraftRepo($: EngineInterface, options: Options, repoKey: string): Promise<void> {
+  if (!options.writes) return
   const S = strings(options.language)
   await touchWrite($)
   const target = draftTargets(await read($, sections)).find(section => section.key === repoKey)
@@ -5234,6 +5333,7 @@ async function toggleDraftAssign($: EngineInterface): Promise<void> {
  * is applied only to the draft it was asked for (E16-1): a discard or a new draft meanwhile drops it.
  */
 async function draftIssue($: EngineInterface, options: Options, source: DraftSource, todo?: Todo): Promise<void> {
+  if (!options.writes) return
   const S = strings(options.language)
   const current = await read($, draft)
   if (current === null || current.phase === 'drafting') return
@@ -5265,7 +5365,7 @@ async function draftIssue($: EngineInterface, options: Options, source: DraftSou
   draftingId = id
   try {
     await update($, draft, (had): IssueDraft | null => (had === null || had.id !== id ? had : { ...had, phase: 'drafting', source, message: undefined }))
-    const consented = options.recaps && (await read($, settings)).consent[section.key] === true
+    const consented = await isConsented($, options, section.key)
     const allowed = consented && canTriage(info) ? await ensureLabels($, section.key) : []
     // The repository's own titles: its default list, also while a filter shows other rows (E14).
     const titles = consented ? (await defaultListOf($, section, section.key)).slice(0, TITLES_SENT).map(row => row.title) : []
@@ -5292,6 +5392,7 @@ async function draftIssue($: EngineInterface, options: Options, source: DraftSou
  * Cancel brings them back) and the card shows `gh issue create … --body-file -` with the body it sends.
  */
 async function reviewDraft($: EngineInterface, options: Options, typedBody?: { id: string; value: string }): Promise<void> {
+  if (!options.writes) return
   const S = strings(options.language)
   if (typedBody !== undefined && typedBody.id === draftTyped.id) draftTyped = { ...draftTyped, body: typedBody.value }
   else if (typedBody !== undefined) draftTyped = { id: typedBody.id, body: typedBody.value }
@@ -5413,6 +5514,7 @@ async function resetStore($: EngineInterface): Promise<void> {
   filteredPrs.clear()
   filteredPrTried.clear()
   boardsReadAt.clear()
+  boardsHeldUntil.clear()
   closedBackoff.clear()
   closedTriedAt.clear()
   closedNudge.clear()
@@ -5487,10 +5589,12 @@ async function resetStore($: EngineInterface): Promise<void> {
 
 /**
  * The spike: one throw-away session, started the way the button starts one, to learn which route works and what the
- * app answers; then one quiet read of this session's own metadata, the way the mod's own calls go (never a card).
+ * app answers; then one quiet read of this session's own metadata, the way the mod's own calls go (never a card). The
+ * command's words go as consent only where the engine attests the person typed it (F-SAFETY-7); from the SDK or an
+ * unattested channel the typed route asks with its own card.
  */
-async function runSpike($: EngineInterface, command: string): Promise<string> {
-  const consent = commandConsent(`/${command} spike`)
+async function runSpike($: EngineInterface, command: string, originKind: string): Promise<string> {
+  const consent = GESTURE_ORIGINS.has(originKind) ? commandConsent(`/${command} spike`) : undefined
   // E12: the marker names this session (read now: a /clear goes on under another id, B-E10-5), so the spike's session
   // shows its own status line (S19) and this one never takes the brief for a hand-off.
   const brief = spikeBrief(await $.session.id().catch(() => myId))
@@ -5577,7 +5681,7 @@ async function layoutLine($: EngineInterface, sessionId: string): Promise<string
  * refusal names what the app takes (its model ids) and a start says through get_session what the session runs on. The
  * owner archives both spike sessions.
  */
-async function optionsSpike($: EngineInterface, consent: string, brief: ReturnType<typeof spikeBrief>): Promise<string[]> {
+async function optionsSpike($: EngineInterface, consent: string | undefined, brief: ReturnType<typeof spikeBrief>): Promise<string[]> {
   const asked = 'model haiku, effort low'
   const outcome = await startDesktopSession($, { ...brief, title: `${brief.title} (haiku, low)`, name: 'issue-radar-spike-opts', use_worktree: true, branch_name: 'issue-radar-spike-opts', model: 'haiku', effort: 'low' }, consent)
   if (outcome.route === 'none') return [`start_session with ${asked} (S23): refused: ${outcome.raw || outcome.reason || '?'}`]
@@ -5589,8 +5693,12 @@ async function optionsSpike($: EngineInterface, consent: string, brief: ReturnTy
   return [`start_session with ${asked} (S23) via ${outcome.route}: session id ${outcome.sessionId}; ${detached.ok ? 'detached' : `detach refused: ${detached.reason ?? '?'}`}; get_session (quiet, mcp only): ${runs}`]
 }
 
-/** `/issue-radar` and `/issues`: opens the pane, or `reset` clears the store, or `spike` measures the session tools. Top-level, as the engine requires of a function `$` is passed to. */
-async function runCommand($: EngineInterface, options: Options, command: string, args: string): Promise<{ text: string }> {
+/**
+ * `/issue-radar` and `/issues`: opens the pane, or `reset` clears the store, or `spike` measures the session tools (only
+ * from a person's prompt: a plugin's `$.command.run`, a schedule or a peer starts no session, F-SAFETY-7). Top-level,
+ * as the engine requires of a function `$` is passed to.
+ */
+async function runCommand($: EngineInterface, options: Options, command: string, args: string, originKind: string): Promise<{ text: string }> {
   const S = strings(options.language)
   const word = args.trim().toLowerCase()
   if (word === 'reset') {
@@ -5599,7 +5707,7 @@ async function runCommand($: EngineInterface, options: Options, command: string,
 
     return { text: S.storeCleared }
   }
-  if (word === 'spike') return { text: await runSpike($, command) }
+  if (word === 'spike') return { text: PERSON_ORIGINS.has(originKind) ? await runSpike($, command, originKind) : S.spikeTyped }
   if (!(await surfacesAllowPane($))) return { text: S.unsupported }
   const placed = await $.ui.open({ id: PANE, title: await paneTitle($, options), columns: PANE_COLUMNS })
   wantsPane = true
@@ -5816,8 +5924,8 @@ export const register: Register = (on, given) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  on('command.run', { command: 'issue-radar' }, ($, e) => runCommand($, options, 'issue-radar', e.args))
-  on('command.run', { command: 'issues' }, ($, e) => runCommand($, options, 'issues', e.args))
+  on('command.run', { command: 'issue-radar' }, ($, e) => runCommand($, options, 'issue-radar', e.args, e.origin.kind))
+  on('command.run', { command: 'issues' }, ($, e) => runCommand($, options, 'issues', e.args, e.origin.kind))
 
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
