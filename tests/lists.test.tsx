@@ -76,11 +76,12 @@ async function drawnRows(ui: Drawing): Promise<string[]> {
 
 // E14: filter, search, saved views ------------------------------------------
 
-test("a view narrows every section through gh's search, and clearing it restores V1's list", async ($, on) => {
-  const { argv } = project(on, { gh: args => (isList(args) && (searchOf(args) ?? '').includes('assignee:@me') ? ran(listOf([7])) : undefined) })
-  const clock = await started($, on)
-
-  for (const surface of ['desktop', 'terminal'] as const) {
+// One test per surface, each in a session of its own: the round trip on both in one test ran past the kit's 5,000 ms
+// on a busy machine (it is the file's first test, which also pays the kit's warm-up).
+for (const surface of ['desktop', 'terminal'] as const) {
+  test(`a view narrows every section through gh's search, and clearing it restores V1's list (${surface})`, async ($, on) => {
+    const { argv } = project(on, { gh: args => (isList(args) && (searchOf(args) ?? '').includes('assignee:@me') ? ran(listOf([7])) : undefined) })
+    const clock = await started($, on)
     const ui = await $.ui.mount({ ...PANE, surface })
     await openFilter(ui)
     expect((await ui.find({ key: 'filter-view' }))?.type).toBe('Select')
@@ -104,8 +105,8 @@ test("a view narrows every section through gh's search, and clearing it restores
     expect(await ui.find({ key: `row-title:${ROW_42}` })).toBeDefined()
     expect(await ui.find({ key: 'filter-line' })).toBeUndefined()
     await ui.unmount()
-  }
-})
+  })
+}
 
 test('the search composes, strips what would leave the repository, and goes as one argument', async ($, on) => {
   const { argv } = project(on, { gh: args => (isList(args) && searchOf(args) !== null ? ran(listOf([42])) : undefined) })
@@ -578,7 +579,8 @@ test('a control character in a board status reaches no picker value, so the pane
 })
 
 test('more than 100 rows read their board status in more than one request (R2-RT-3)', { options: { maxIssues: 150 } }, async ($, on) => {
-  const many = Array.from({ length: 120 }, (_, index) => ({ ...(ROWS[1] ?? {}), number: 1000 - index, title: `Issue ${1000 - index}`, url: `https://github.com/acme/widgets/issues/${1000 - index}` }))
+  // 101 rows, one past a request's 100 (BOARDS_MAX): the fewest that need a second request, and the cheapest to draw.
+  const many = Array.from({ length: 101 }, (_, index) => ({ ...(ROWS[1] ?? {}), number: 1000 - index, title: `Issue ${1000 - index}`, url: `https://github.com/acme/widgets/issues/${1000 - index}` }))
   const asked: number[] = []
   const { argv } = project(on, {
     stored: BOARDS_ON,
@@ -593,14 +595,14 @@ test('more than 100 rows read their board status in more than one request (R2-RT
   })
   await started($, on)
   expect(ops(argv, 'IssueRadarBoards')).toHaveLength(2)
-  expect(new Set(asked).size).toBe(120)
+  expect(new Set(asked).size).toBe(101)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  // The 111th row has its status too, and the facet keeps every row on the board.
-  expect((await ui.find({ key: `board:${SECTION}#890` }))?.text).toBe(DE.boardChip('Todo'))
+  // The 101st row, the second request's only one, has its status too, and the facet keeps every row on the board.
+  expect((await ui.find({ key: `board:${SECTION}#900` }))?.text).toBe(DE.boardChip('Todo'))
   await openFilter(ui)
   await ui.select({ key: 'filter-board', value: 'acme/3:Todo' })
-  expect((await ui.find({ key: `count:${SECTION}` }))?.text).toBe('120')
+  expect((await ui.find({ key: `count:${SECTION}` }))?.text).toBe('101')
   await ui.unmount()
 })
 
@@ -1081,8 +1083,9 @@ test('an expanded list refreshes slowly: on the timer after 15 minutes, for ↻ 
   await clock.advance(1_000)
   expect(closedLists(argv)).toHaveLength(3)
 
+  // Collapsed at 1,113 s, it is not read at the 2,160 s tick, where the list read at 1,112 s would be due if expanded.
   await ui.press({ key: `closed-toggle:${SECTION}` })
-  await tick(clock, 10)
+  await tick(clock, 6)
   expect(closedLists(argv)).toHaveLength(3)
   await ui.unmount()
 })

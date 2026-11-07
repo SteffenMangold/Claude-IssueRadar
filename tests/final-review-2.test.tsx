@@ -9,7 +9,7 @@ import { expect, test } from 'claude-code/testing'
 import { strings } from '../hooks/i18n'
 import type { Mapping, PhaseRecord } from '../types'
 import type { Ran } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, TICK_MS, count, graphAnswer, graphQuery, op, ops, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, count, graphAnswer, graphQuery, op, ops, project, ran, started, tick } from './harness'
 
 const DE = strings('de')
 const SETTINGS = `settings:${SECTION}`
@@ -66,9 +66,10 @@ test('a pending label the list now carries is one chip, and Review sends nothing
   await ui.select({ key: `lbl-add:${ROW_7}`, value: 'bug' })
   expect(await ui.findAll({ key: `lbl-x:${ROW_7}:bug` })).toHaveLength(1)
 
-  // Someone adds 'bug' on GitHub; the timed refreshes run once the editor's hold is over.
+  // Someone adds 'bug' on GitHub; the timed refreshes run once the editor's hold is over: the 720 s tick is the first
+  // past the ten minutes from the pick at 1 s (three ticks are not, so Review would still send the label).
   isLabelled = true
-  for (let period = 0; period < 6; period++) await clock.advance(TICK_MS)
+  await tick(clock, 4)
   expect(await ui.findAll({ key: `lbl-x:${ROW_7}:bug` })).toHaveLength(1)
   await ui.press({ key: `editor-review:${ROW_7}` })
   expect(await ui.find({ type: 'Code' })).toBeUndefined()

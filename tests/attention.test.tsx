@@ -999,7 +999,8 @@ test('the list, the GraphQL rows and the pull-request reads ask what E4, E5 and 
 })
 
 test('more than 100 rows read their pull-request states in more than one request, and the record keeps the account', { options: { maxIssues: 150 } }, async ($, on) => {
-  const many = Array.from({ length: 120 }, (_, index) => listed(1000 - index, '2026-11-01T09:00:00Z'))
+  // 101 rows, one past a request's 100 (PRS_MAX): the fewest that need a second request, and the cheapest to draw.
+  const many = Array.from({ length: 101 }, (_, index) => listed(1000 - index, '2026-11-01T09:00:00Z'))
   const asked: number[] = []
   const { argv, store } = project(on, {
     gh: args => {
@@ -1008,18 +1009,18 @@ test('more than 100 rows read their pull-request states in more than one request
       const numbers = [...graphQuery(args).matchAll(/ i(\d+): issue/g)].map(match => Number(match[1]))
       asked.push(...numbers)
       const pr = { number: 57, url: 'https://github.com/acme/widgets/pull/57', state: 'OPEN', isDraft: false, reviewDecision: null, repository: { nameWithOwner: 'acme/widgets' }, commits: { nodes: [] } }
-      const repository = Object.fromEntries(numbers.map(number => [`i${number}`, { number, closedByPullRequestsReferences: number === 890 ? { totalCount: 1, nodes: [pr] } : { totalCount: 0, nodes: [] } }]))
+      const repository = Object.fromEntries(numbers.map(number => [`i${number}`, { number, closedByPullRequestsReferences: number === 900 ? { totalCount: 1, nodes: [pr] } : { totalCount: 0, nodes: [] } }]))
 
       return graphAnswer({ repository, viewer: { login: 'steffen' }, rateLimit: LIMIT })
     },
   })
   await started($, on)
   expect(ops(argv, 'IssueRadarPrs')).toHaveLength(2)
-  expect(new Set(asked).size).toBe(120)
+  expect(new Set(asked).size).toBe(101)
   expect((store.get(`prs:${SECTION}`) as PrRecord).viewer).toBe('steffen')
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  // The 111th row has its chip too.
-  expect((await ui.find({ key: `prs:${SECTION}#890` }))?.text).toBe(`${DE.prRef('#57')} · ${DE.prOpen}`)
+  // The 101st row, the second request's only one, has its chip too.
+  expect((await ui.find({ key: `prs:${SECTION}#900` }))?.text).toBe(`${DE.prRef('#57')} · ${DE.prOpen}`)
   await ui.unmount()
 })
 
