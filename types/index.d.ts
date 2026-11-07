@@ -315,7 +315,63 @@ export type Mapping = {
   checkoutKey?: string
   /** E1: the branch slug the pane asked for (the app adds its prefix and a suffix); absent in mappings written before. */
   branch?: string
+  /** E20: how the session was asked to work; absent in mappings written before (read as `understand`). */
+  mode?: StartMode
+  /** E20/E21: where it works; absent in mappings written before (read as `worktree`). */
+  place?: StartPlace
 }
+
+/** E20: how an issue session works: V1's five phases (understand first), or plan section 3's "just fix it". */
+export type StartMode = 'understand' | 'fix'
+
+/** E20/E21: where it works: its own worktree, this checkout shared (B-E20-2), or a fork of this conversation (E21). */
+export type StartPlace = 'worktree' | 'shared' | 'fork'
+
+/** E20: the model the form asks for: the pane session's own, or an alias of a cheaper one (S16 measures the alias). */
+export type StartModel = 'inherit' | 'sonnet' | 'haiku'
+
+/** E20: the effort the form asks for: the pane session's own, or one at or below it. */
+export type StartEffort = 'inherit' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+/** E20/E21/E8: the choices of one start; Work on it's are the defaults (understand first, own worktree, inherited, `beside` as set). */
+export type StartChoice = {
+  mode: StartMode
+  place: StartPlace
+  model: StartModel
+  effort: StartEffort
+  /** E8: open the new session in split view beside the pane's session (desktop only). */
+  beside: boolean
+  /** The owner's note for this issue (at most 1,000 characters), appended to the brief; never stored. */
+  note: string
+}
+
+/** E20: the start form under one row (one at a time), the session's state only. */
+export type StartForm = StartChoice & { rowKey: string }
+
+/** E20/E21: what the form reads of this session when it opens (local git, the engine, one quiet desktop read). */
+export type StartFacts = {
+  /** The session's folder. */
+  root: string
+  /** Its current branch; empty when detached or unknown. */
+  branch: string
+  /** Whether the folder is a linked worktree (its git dir differs from the common dir): only then a fork is offered (plan section 3). */
+  isWorktree: boolean
+  /** Whether tracked files hold uncommitted changes. */
+  isDirty: boolean
+  /** The context window's input tokens as the last response counted them; null before the first response. */
+  contextTokens: number | null
+  /** The main loop's model as /model shows it; empty when unknown. */
+  model: string
+  /** This session's effort as the desktop names it; empty when unknown. */
+  effort: string
+  at: number
+}
+
+/** E21: whether the form may offer to carry this conversation: yes, not while a turn runs, or not at all. */
+export type ForkState = 'ok' | 'busy' | 'none'
+
+/** E13: the installation-wide choice whether issue sessions file themselves in the sidebar (store `sidebar:choice`). */
+export type SidebarChoice = 'unasked' | 'on' | 'off'
 
 /** E1: an earlier issue session of an issue, kept once its mapping was released because the session was archived or gone. */
 export type PreviousAttempt = {
@@ -380,6 +436,8 @@ export type SelfIssue = {
   isSpike: boolean
   /** How it was found (plan 4.5): a mapping naming this session's id, or the marker as its first user message. */
   via: 'mapping' | 'marker'
+  /** E20: `fix` when the owner chose "just fix it" (the mapping's mode, or the brief's FIX_LINE); absent otherwise. */
+  mode?: 'fix'
 }
 
 /** E1: what the app's session list (or one get_session) said of a mapped session at the last tracking pass. */
@@ -415,6 +473,10 @@ export type RepoSettings = {
   boards?: boolean
   /** The repositories whose "Recently closed" part is expanded (E22), by section key. */
   showClosed?: Record<string, boolean>
+  /** E8: open a new issue session in split view beside the pane's session (desktop); off unless true. */
+  beside?: boolean
+  /** E20: the owner's guidance appended to every brief started from this checkout, at most 1,000 characters; absent for none. */
+  guidance?: string
 }
 
 /** How a filtered list is sorted (E14); `updated` is V1's order. */
@@ -632,6 +694,12 @@ declare module 'claude-code' {
       freshAsk: string
       /** E22-b: the sessions of issues that closed, by row key, mirrored from the store's `done:`. */
       done: Shaped<Record<string, DoneMapping>>
+      /** E20: the start form under one row; null while none is open. */
+      startForm: Shaped<StartForm | null>
+      /** E20/E21: what the form read of this session when it opened. */
+      startFacts: Shaped<StartFacts | null>
+      /** E13: the installation-wide sidebar choice, mirrored from the store's `sidebar:choice`. */
+      sidebar: Shaped<{ choice: SidebarChoice }>
     }
   }
 }

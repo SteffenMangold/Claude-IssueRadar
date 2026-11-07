@@ -175,6 +175,25 @@ export type Setup = {
   model?: (request: { prompt: string; system: string }) => string
   /** The main conversation's messages `$.session.messages()` answers until `setMessages` changes them; none by default. */
   messages?: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>
+  /**
+   * Answers a git call by its argv (without the leading `git`); undefined, or no `git`, answers as a plain checkout
+   * on main (`git rev-parse`: the branch, the git dir and the common dir alike; `git status`: clean).
+   */
+  git?: (args: readonly string[]) => Ran | undefined
+  /** What `$.session.model()` answers; the default is 'claude-opus-test'. */
+  sessionModel?: string
+  /** The context window's input tokens `$.session.usage()` reports; absent by default (before the first response). */
+  contextTokens?: number
+}
+
+/** `git rev-parse --abbrev-ref HEAD --path-format=absolute --git-dir --git-common-dir` in a plain checkout on `branch`. */
+export function plainCheckout(branch = 'main'): Ran {
+  return ran(`${branch}\nD:/proj/.git\nD:/proj/.git\n`)
+}
+
+/** The same in a linked worktree of the checkout on `branch` (the git dir differs from the common dir). */
+export function linkedWorktree(branch = 'feature/x'): Ran {
+  return ran(`${branch}\nD:/proj/.git/worktrees/wt1\nD:/proj/.git\n`)
 }
 
 /** The model's default answer: a plain sentence, as V1 asked it (no JSON, so no triage). */
@@ -326,6 +345,8 @@ export function project(on: On, setup: Setup = {}): Project {
   })
   on('prompt.autocomplete', () => ({ suggestions: setup.autocomplete?.() ?? [] }))
   on('session.turns', () => ({ value: turns }))
+  on('session.model', () => ({ value: setup.sessionModel ?? 'claude-opus-test' }))
+  on('session.usage', () => ({ value: { startedAt: NOW, context: { window: 200_000, ...(setup.contextTokens === undefined ? {} : { tokens: setup.contextTokens }) }, rateLimits: [] } }))
   on('tool.register', (_, e) => {
     registered.push(e)
     const answer = setup.register === undefined ? { tool: `mcp__issue-radar__${e.name}` } : setup.register(e)
@@ -343,6 +364,12 @@ export function project(on: On, setup: Setup = {}): Project {
   on('process.run', async (_, e) => {
     const call = [...e.argv]
     argv.push(call)
+    if (call[0] === 'git') {
+      const own = setup.git?.(call.slice(1))
+      if (own !== undefined) return own
+
+      return call[1] === 'rev-parse' ? plainCheckout() : ran('')
+    }
     if (call[0] !== 'gh') return ran('')
     const own = setup.gh === undefined ? undefined : await setup.gh(call.slice(1))
     if (own !== undefined) return own

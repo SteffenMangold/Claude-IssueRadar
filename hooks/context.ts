@@ -13,9 +13,15 @@ const CONTROLS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g
 /** A closing tag of one of the data blocks the mod writes, as an issue's text could spell it to end the block early. */
 const DATA_CLOSERS = /<(\s*\/\s*)(issue-[\w-]*|triage-gaps|previous-attempts)/gi
 
-/** `text` with every closing tag of a data block turned harmless (`<\/issue-text>`), so quoted data cannot end its block. */
+/** E20: the tags of the owner's own blocks, opening or closing, as quoted data could spell them to pass for the owner's words. */
+const OWNER_TAGS = /<(\s*\/?\s*)(owner-(?:guidance|note))/gi
+
+/**
+ * `text` with every closing tag of a data block turned harmless (`<\/issue-text>`), so quoted data cannot end its block,
+ * and every tag of the owner's blocks turned (`‹owner-guidance`), so an issue's text cannot pass for the owner's guidance.
+ */
 export function neutralizeTags(text: string): string {
-  return text.replace(DATA_CLOSERS, (_, _slash: string, name: string) => `<\\/${name}`)
+  return text.replace(DATA_CLOSERS, (_, _slash: string, name: string) => `<\\/${name}`).replace(OWNER_TAGS, (_, slash: string, name: string) => `‹${slash}${name}`)
 }
 
 /**

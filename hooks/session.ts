@@ -16,9 +16,15 @@ export type StartArgs = {
   title: string
   name: string
   prompt: string
-  background: string
+  /** Required for a fresh start (at least 80 characters); a fork carries the conversation instead and sends none. */
+  background?: string
   branch_name?: string
   use_worktree?: boolean
+  /** E21: `fork` carries this whole conversation; it takes no background, worktree, branch, model or effort. */
+  context?: 'fresh' | 'fork'
+  /** E20: a cheaper model and an effort at or below this session's (fresh starts only). */
+  model?: string
+  effort?: string
 }
 
 export type DesktopRoute = Exclude<StartRoute, 'none'>
@@ -265,17 +271,23 @@ export function parseObject(structured: unknown, text: string): Record<string, u
 
 /** Starts a desktop session for a press (`consent` says which); `route: 'none'` means the caller falls back to the prompt box. */
 export async function startDesktopSession($: EngineInterface, args: StartArgs, consent?: string): Promise<StartOutcome> {
+  const isFork = args.context === 'fork'
   const input: Record<string, unknown> = {
     initiation: 'user_asked',
     title: args.title,
     name: args.name,
     prompt: args.prompt,
-    context: 'fresh',
-    background: args.background,
+    context: isFork ? 'fork' : 'fresh',
     wake_when_done: false,
   }
-  if (args.use_worktree !== undefined) input['use_worktree'] = args.use_worktree
-  if (args.branch_name !== undefined) input['branch_name'] = args.branch_name
+  // A fork sends none of the fresh-only fields: the app ignores a background there and rejects use_worktree (E21).
+  if (!isFork) {
+    input['background'] = args.background ?? ''
+    if (args.use_worktree !== undefined) input['use_worktree'] = args.use_worktree
+    if (args.branch_name !== undefined) input['branch_name'] = args.branch_name
+    if (args.model !== undefined) input['model'] = args.model
+    if (args.effort !== undefined) input['effort'] = args.effort
+  }
 
   const answer = await callDesktop($, 'ccd_session', 'start_session', input, consent)
   if (!answer.ok) {
@@ -377,6 +389,13 @@ export type SessionEntry = {
   detached: boolean | null
   /** Whether the entry names a pull request: `unknown` when it carries no such field at all. */
   pr: 'yes' | 'no' | 'unknown'
+  /** E20 (B-E20-4): the model and effort get_session names; null when it names none. */
+  model?: string | null
+  effort?: string | null
+  /** E13: the sidebar group's id; null when the session is ungrouped; undefined when the answer has no `group` key (unknown). */
+  group?: string | null
+  /** E13: whether the session is pinned (moving a pinned session into a group unpins it); null when not said. */
+  pinned?: boolean | null
   /** The entry's keys, for the spike (S20). */
   keys: string[]
 }
@@ -422,7 +441,25 @@ export function entryOf(data: Record<string, unknown>): SessionEntry | null {
     detached: flag(['detached']),
     pr: prValue !== undefined ? 'yes' : hasPrKey ? 'no' : 'unknown',
     keys: Object.keys(data).slice(0, 40),
+    model: text(['model', 'modelId', 'model_id']) || null,
+    effort: text(['effort', 'reasoningEffort', 'reasoning_effort']).toLowerCase() || null,
+    group: groupOf(data),
+    pinned: flag(['pinned', 'isPinned', 'is_pinned']),
   }
+}
+
+/** The `group` of an entry: its id (a string, or an object's `id`), null for an explicit null (ungrouped), undefined when absent or unreadable. */
+function groupOf(data: Record<string, unknown>): string | null | undefined {
+  if (!('group' in data)) return undefined
+  const value = data['group']
+  if (value === null) return null
+  if (typeof value === 'string') return value === '' ? null : value
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const id = (value as Record<string, unknown>)['id']
+    if (typeof id === 'string' && id !== '') return id
+  }
+
+  return undefined
 }
 
 /**
@@ -553,6 +590,14 @@ export function readOpenAnswer(answer: DesktopCall): OpenOutcome {
   }
 
   return { outcome: 'shown', reason: '' }
+}
+
+/**
+ * Whether open_session_in's refusal says the cursor held it back (A-F17): the app refuses `focus` while the owner's
+ * cursor is in a text field or a terminal. The pane then only says where to find the session (no split unasked).
+ */
+export function isTypingRefusal(reason: string): boolean {
+  return /\btext ?field\b|\bcursor\b|\bterminal\b|\btyping\b/i.test(reason)
 }
 
 /** Shows a session the pane started, for a press; the app's refusal (not started by this session, not on screen, a text field holds the cursor) is the result. */

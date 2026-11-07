@@ -7,7 +7,7 @@
 // mark would get the whole tree refused.
 import type { Elements, RenderElement, RenderSurface, Space } from 'claude-code'
 
-import type { Boards, ClosedCache, ClosedRow, DoneMapping, Facets, Filter, FilterGroup, FilterSort, Glimpse, Inbox, InboxRow, IssueDetails, IssueRef, IssueRow, Mapping, Mark, Options, PhaseRecord, PrRecord, PreviousAttempt, Reactions, Recap, RepoSettings, RepoState, SeenRecord, Section, SessionLive, SessionPr, StartRoute, Triage } from '../types'
+import type { Boards, ClosedCache, ClosedRow, DoneMapping, Facets, Filter, FilterGroup, FilterSort, ForkState, Glimpse, Inbox, InboxRow, IssueDetails, IssueRef, IssueRow, Mapping, Mark, Options, PhaseRecord, PrRecord, PreviousAttempt, Reactions, Recap, RepoSettings, RepoState, SeenRecord, Section, SessionLive, SessionPr, SidebarChoice, StartChoice, StartFacts, StartForm, StartRoute, Triage } from '../types'
 import { BOARD_STATUS_CHARS, boardItemFor, boardOptions } from './boards'
 import { CLOSED_LOADING_MS, closedCountLabel, sinceDate } from './closed'
 import { ANY, GROUPS, SORTS, VIEWS, cutText, isBuiltInView, isDefaultFilter, matchesUrl, sanitizeQuery } from './filter'
@@ -17,6 +17,7 @@ import { INBOX_CAP } from './inbox'
 import { cardRowsOf, isFilteredList, paneLayout, rowKeyOf, unreadCount, visibleMark } from './marks'
 import { linksOf, prCardLine, prChip, prLine, prRefOf } from './prs'
 import type { PrTone, ShownPr } from './prs'
+import { asEffort, asModel, effortChoices, modelChoices } from './startform'
 import { clean, cleanLine } from './text'
 import { isOwnSession, rowBadge } from './tracking'
 import type { Badge, BadgeKind } from './tracking'
@@ -64,6 +65,12 @@ export type ViewState = {
   freshAsk: string
   /** E22-b: the sessions of issues that closed, by row key. */
   done: Record<string, DoneMapping>
+  /** E20: the start form under one row, what it read of this session, and whether it may carry this conversation (E21). */
+  startForm: StartForm | null
+  startFacts: StartFacts | null
+  forkState: ForkState
+  /** E13: whether issue sessions file themselves in the sidebar (asked once, installation-wide). */
+  sidebar: SidebarChoice
   /** This session's ids (engine, and desktop once known): a mapping naming one is this very session. */
   ownIds: string[]
   /** This session's engine id: the pane that started a session may open it. */
@@ -104,7 +111,7 @@ export type ViewActions = {
   reopen: (sectionKey: string, number: number, label: string, surface: RenderSurface) => void
   /** E1: "Neu starten" asks for its confirmation; the confirmation starts afresh. */
   askFresh: (rowKey: string) => void
-  startAfresh: (sectionKey: string, number: number, label: string) => void
+  startAfresh: (sectionKey: string, number: number, label: string, surface: RenderSurface) => void
   /** E22-b: a closed row's "Zur Session". */
   openDone: (rowKey: string, label: string, surface: RenderSurface) => void
   takeHere: (sectionKey: string, number: number) => void
@@ -130,6 +137,21 @@ export type ViewActions = {
   toggleClosed: (sectionKey: string) => void
   /** E5: the title bar's unread pill marks every row of every section seen. */
   markAllSeen: () => void
+  /** E20: "▾" opens or closes a row's start form; its pickers, its note (typed: a draft; Enter: kept), its buttons. */
+  toggleForm: (rowKey: string, surface: RenderSurface) => void
+  patchForm: (rowKey: string, patch: Partial<StartChoice>) => void
+  draftNote: (rowKey: string, text: string) => void
+  keepNote: (rowKey: string, text: string) => void
+  startFromForm: (rowKey: string, label: string, surface: RenderSurface) => void
+  hereFromForm: (rowKey: string) => void
+  cancelForm: (rowKey: string) => void
+  /** E20: the repository's guidance in the ⚙ panel. */
+  saveGuidance: (text: string) => void
+  clearGuidance: () => void
+  /** E8: the ⚙ panel's "open beside" switch. */
+  toggleBeside: () => void
+  /** E13: the owner's answer to the sidebar question, or the ⚙ switch. */
+  sidebarChoice: (value: boolean) => void
 }
 
 /** Text colors: the theme's own keys, so the pane follows the app's light or dark mode. */
@@ -534,6 +556,8 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   // Settings panel -------------------------------------------------------
   const boardsOn = settings.boards === true
   const boardHosts = Object.entries(state.boards.scope).filter(([, scope]) => scope === 'missing').map(([host]) => host)
+  const hasCheckout = state.sections.some(section => section.isCheckout && section.info !== null)
+  const guidance = settings.guidance ?? ''
   const settingsPanel = state.isSettingsOpen ? (
     <Box flexDirection="column" marginTop={step('sm', 0)} paddingX={step('md', 1)} paddingY={step('sm', 0)} rowGap={step('xs', 0)} borderStyle="round" backgroundColor={wash(HUE.gray, 0.05)}>
       <Text size="caption" weight="semibold" color={INK.secondary}>
@@ -582,6 +606,49 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
               </Box>
             )
           })}
+      {/* E20: the repository's guidance, appended to every brief; kept under the checkout's key, so only once it is resolved. */}
+      {hasCheckout && (
+        <Text size="caption" weight="semibold" color={INK.secondary}>
+          {S.guidanceTitle}
+        </Text>
+      )}
+      {hasCheckout && (
+        <Box key="guidance-row" flexDirection="row" alignItems="flex-start" columnGap={step('sm', 1)}>
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Text size="footnote" color={guidance === '' ? INK.muted : INK.text} wrap="wrap">
+              {guidance === '' ? S.guidanceNone : cut(cleanLine(guidance), 200)}
+            </Text>
+          </Box>
+          {guidance !== '' && <Button key="guidance-clear" plain label={isRich ? '✕' : `✕ ${S.guidanceClear}`} onPress={actions.clearGuidance} />}
+        </Box>
+      )}
+      {/* No `value`: a field the hook redraws with every keystroke's echo drops typed characters. */}
+      {hasCheckout && Input !== undefined && <Input key="guidance-input" rows={3} placeholder={S.guidanceHint} submitLabel={S.guidanceSave} onSubmit={value => actions.saveGuidance(value)} />}
+      {hasCheckout && note(S.guidanceNote, INK.muted)}
+      {/* E8: a split is the desktop's; the terminal draws no switch. */}
+      {state.surface === 'desktop' && (
+        <Text size="caption" weight="semibold" color={INK.secondary}>
+          {S.afterStartTitle}
+        </Text>
+      )}
+      {state.surface === 'desktop' && (
+        <Box key="beside-row" flexDirection="row" alignItems="center" columnGap={step('sm', 1)}>
+          {pill(settings.beside === true ? S.on : S.off, settings.beside === true ? INK.success : INK.muted, settings.beside === true ? HUE.green : HUE.gray)}
+          <Button key="beside-toggle" plain label={S.besideLabel} onPress={actions.toggleBeside} />
+        </Box>
+      )}
+      {/* E13: installation-wide, the desktop's sidebar only. */}
+      {state.surface === 'desktop' && (
+        <Text size="caption" weight="semibold" color={INK.secondary}>
+          {S.sidebarTitle}
+        </Text>
+      )}
+      {state.surface === 'desktop' && (
+        <Box key="sidebar-row" flexDirection="row" alignItems="center" columnGap={step('sm', 1)}>
+          {pill(state.sidebar === 'on' ? S.on : state.sidebar === 'off' ? S.off : S.notAsked, state.sidebar === 'on' ? INK.success : INK.muted, state.sidebar === 'on' ? HUE.green : HUE.gray)}
+          <Button key="sidebar-toggle" plain label={S.sidebarLabel} onPress={() => actions.sidebarChoice(state.sidebar !== 'on')} />
+        </Box>
+      )}
       <Text size="caption" weight="semibold" color={INK.secondary}>
         {S.savedViewsTitle}
       </Text>
@@ -629,6 +696,23 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         ))}
     </Box>
   ) : null
+
+  // E13: asked once for the installation, on the desktop, once an issue has a session ------------------
+  const sidebarAsk =
+    state.surface === 'desktop' && state.sidebar === 'unasked' && Object.keys(state.mappings).length > 0 ? (
+      <Box key="sidebar-ask" flexDirection="column" rowGap="xs" marginX="sm" marginY="xs" paddingX="md" paddingY="sm" borderStyle="round" borderColor={tint(HUE.blue, 0.45)} backgroundColor={tint(HUE.blue, 0.06)}>
+        <Text size="footnote" weight="semibold" wrap="wrap">
+          {S.sidebarAskTitle}
+        </Text>
+        <Text size="caption" color={INK.secondary} wrap="wrap">
+          {S.sidebarAskDetail}
+        </Text>
+        <Box flexDirection="row" flexWrap="wrap" columnGap="xs" rowGap="xs">
+          <Button key="sidebar-on" label={S.sidebarAskOn} variant="primary" onPress={() => actions.sidebarChoice(true)} />
+          <Button key="sidebar-off" label={S.sidebarAskOff} onPress={() => actions.sidebarChoice(false)} />
+        </Box>
+      </Box>
+    ) : null
 
   // States ---------------------------------------------------------------
   const stateBlock = (section: Section) => {
@@ -1213,10 +1297,104 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             <Text size="caption" color={INK.warning} wrap="wrap">
               {S.freshAsk(item.number, badge?.kind === 'gone')}
             </Text>
-            <Button key={`fresh-confirm:${key}`} label={S.freshConfirm} variant="primary" onPress={() => actions.startAfresh(section.key, item.number, S.freshConfirm)} />
+            <Button key={`fresh-confirm:${key}`} label={S.freshConfirm} variant="primary" onPress={press => actions.startAfresh(section.key, item.number, S.freshConfirm, press.surface)} />
             <Button key={`fresh-cancel:${key}`} plain label={S.freshCancel} onPress={() => actions.askFresh(key)} />
           </Box>
         )}
+      </Box>
+    )
+  }
+
+  /**
+   * E20's start form under a row (one at a time): the mode; on the desktop the place (E21's fork only where it may), the
+   * model and effort (not for a fork, which inherits both) and E8's "open beside"; the note (no `value`: the typing is a
+   * draft, Enter keeps it, V1's rule); captions that say what a choice means; Starten (desktop only: the terminal starts
+   * no desktop session), Hier übernehmen and Abbrechen.
+   */
+  const formBlock = (section: Section, item: IssueRow, form: StartForm) => {
+    const key = rowKeyOf(section.key, item.number)
+    const isDesk = state.surface === 'desktop'
+    const isTerminal = state.surface === 'terminal'
+    const facts = state.startFacts
+    const branch = clean(facts === null || facts.branch === '' ? S.unknownBranch : facts.branch)
+    const placeChoices = [
+      { value: 'worktree', label: S.placeWorktree },
+      { value: 'shared', label: S.placeShared },
+      // A Select's value must be among its options: a form that holds the fork keeps it listed while it may not start.
+      ...(state.forkState === 'ok' || form.place === 'fork' ? [{ value: 'fork', label: S.placeFork }] : []),
+    ]
+    const models = modelChoices(facts?.model ?? '')
+    const efforts = effortChoices(facts?.effort ?? '')
+    const tokens = facts?.contextTokens ?? null
+    const captions: string[] = []
+    if (form.mode === 'fix') captions.push(S.captionFix)
+    if (isDesk && form.place === 'shared') captions.push(S.captionShared(branch, facts?.isWorktree === true))
+    if (isDesk && form.place === 'fork') {
+      captions.push(state.forkState === 'busy' ? S.captionForkBusy : state.forkState === 'none' ? S.captionForkNone : S.captionFork(branch, tokens === null ? null : fmtK(tokens)))
+      if (facts?.isDirty === true) captions.push(S.captionDirty)
+    }
+    if (isDesk && form.place !== 'fork' && form.model !== 'inherit') captions.push(S.captionModel)
+
+    return (
+      <Box
+        key={`form:${key}`}
+        flexDirection="column"
+        rowGap={step('xs', 0)}
+        paddingX={step('sm', 1)}
+        paddingY={step('xs', 0)}
+        borderStyle="round"
+        borderColor={isRich ? tint(HUE.brand, 0.35) : INK.brand}
+        backgroundColor={wash(HUE.brand, 0.04)}
+      >
+        <Text size="caption" weight="semibold" color={INK.secondary}>
+          {S.formTitle(item.number)}
+        </Text>
+        {picker(
+          `form-mode:${key}`,
+          S.formMode,
+          [
+            { value: 'understand', label: S.modeUnderstand },
+            { value: 'fix', label: S.modeFix },
+          ],
+          form.mode,
+          value => actions.patchForm(key, { mode: value === 'fix' ? 'fix' : 'understand' }),
+        )}
+        {isDesk && picker(`form-place:${key}`, S.formPlace, placeChoices, form.place, value => actions.patchForm(key, { place: value === 'shared' || value === 'fork' ? value : 'worktree' }))}
+        {isDesk &&
+          form.place !== 'fork' &&
+          models.length > 0 &&
+          picker(`form-model:${key}`, S.formModel, [{ value: 'inherit', label: S.inherit }, ...models.map(model => ({ value: model as string, label: model as string }))], form.model, value =>
+            actions.patchForm(key, { model: asModel(value) }),
+          )}
+        {isDesk &&
+          form.place !== 'fork' &&
+          picker(`form-effort:${key}`, S.formEffort, [{ value: 'inherit', label: S.inherit }, ...efforts.map(effort => ({ value: effort as string, label: effort as string }))], form.effort, value =>
+            actions.patchForm(key, { effort: asEffort(value) }),
+          )}
+        {isDesk && (
+          <Box key={`form-beside-row:${key}`} flexDirection="row" alignItems="center" columnGap={step('sm', 1)}>
+            {pill(form.beside ? S.on : S.off, form.beside ? INK.success : INK.muted, form.beside ? HUE.green : HUE.gray)}
+            <Button key={`form-beside:${key}`} plain label={S.formBeside} onPress={() => actions.patchForm(key, { beside: !form.beside })} />
+          </Box>
+        )}
+        {Input !== undefined && (
+          <Input key={`form-note:${key}`} rows={2} placeholder={S.formNote} submitLabel={S.formNoteKeep} onInput={value => actions.draftNote(key, value)} onSubmit={value => actions.keepNote(key, value)} />
+        )}
+        {form.note !== '' && (
+          <Text size="caption" color={INK.muted} wrap="wrap">
+            {S.formNoteKept(cut(cleanLine(form.note), 200))}
+          </Text>
+        )}
+        {captions.map(text => note(text, INK.muted))}
+        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
+          {isDesk && <Button key={`form-start:${key}`} label={S.formStart} variant="primary" onPress={press => actions.startFromForm(key, S.formStart, press.surface)} />}
+          {isTerminal ? (
+            <Button key={`form-here:${key}`} label={S.takeHere} variant="primary" onPress={() => actions.hereFromForm(key)} />
+          ) : (
+            <Button key={`form-here:${key}`} plain label={S.takeHere} onPress={() => actions.hereFromForm(key)} />
+          )}
+          <Button key={`form-cancel:${key}`} plain label={S.formCancel} onPress={() => actions.cancelForm(key)} />
+        </Box>
       </Box>
     )
   }
@@ -1242,6 +1420,9 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
               ? S.startAfresh
               : S.openSession
     const isPrimary = !isStarting && (mapping === undefined || badge?.kind === 'archived' || badge?.kind === 'gone')
+    // E20: the start form under this row while the issue has no session (another pane's start closes it).
+    const canForm = mapping === undefined && !isStarting
+    const form = canForm && state.startForm !== null && state.startForm.rowKey === key ? state.startForm : null
     // E4: the card goes before the row's own text in the tree, so it is drawn while the text before it stays well
     // under the tree's budget (E4-4); the row's visible text counts toward that too, by a rough measure.
     const card = cardKeys.has(key) && !isOpen && textSoFar < CARD_TEXT_STOP ? cardOf(section, item, details, recap) : null
@@ -1287,20 +1468,29 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           <Box flexGrow={1} flexShrink={1} minWidth={0}>
             <Link href={clean(item.url)} label={S.github} />
           </Box>
-          <Button
-            key={`work:${key}`}
-            label={workLabel}
-            variant={isPrimary ? 'primary' : undefined}
-            dimColor={isStarting || badge?.kind === 'self'}
-            onPress={press => {
-              if (isStarting || badge?.kind === 'self') return
-              if (badge?.kind === 'archived') actions.reopen(section.key, item.number, workLabel, press.surface)
-              else if (badge?.kind === 'gone') actions.askFresh(key)
-              else actions.workOn(section.key, item.number, workLabel, press.surface)
-            }}
-          />
-          <Button key={`here:${key}`} plain label={S.takeHere} onPress={() => actions.takeHere(section.key, item.number)} />
+          {form === null && (
+            <Button
+              key={`work:${key}`}
+              label={workLabel}
+              variant={isPrimary ? 'primary' : undefined}
+              dimColor={isStarting || badge?.kind === 'self'}
+              onPress={press => {
+                if (isStarting || badge?.kind === 'self') return
+                if (badge?.kind === 'archived') actions.reopen(section.key, item.number, workLabel, press.surface)
+                else if (badge?.kind === 'gone') actions.askFresh(key)
+                else actions.workOn(section.key, item.number, workLabel, press.surface)
+              }}
+            />
+          )}
+          {form === null && <Button key={`here:${key}`} plain label={S.takeHere} onPress={() => actions.takeHere(section.key, item.number)} />}
+          {/* E20: the start form's toggle, last on the line (plan 4.6), only while the issue has no session. */}
+          {canForm && (
+            <Button key={`opts:${key}`} plain label={S.formToggle} onPress={press => actions.toggleForm(key, press.surface)}>
+              {form === null ? '▾' : '▴'}
+            </Button>
+          )}
         </Box>
+        {form !== null && formBlock(section, item, form)}
       </Box>
     )
   }
@@ -1682,6 +1872,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       {filterLine}
       {filterPanel}
       {settingsPanel}
+      {sidebarAsk}
       <Box flexDirection="column" flexGrow={1} paddingY={step('sm', 0)} rowGap={step('sm', 0)}>
         {state.sections.length === 0 ? (
           <Box paddingX={step('sm', 1)}>

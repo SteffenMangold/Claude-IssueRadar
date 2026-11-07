@@ -37,7 +37,7 @@ const WRAPPING = /[*_`>#~"'„“”«»]/g
 
 /**
  * What a finished turn asked of the owner, from the last line of its answer (markdown and quote marks stripped): the
- * closing `Go?` (or `Los?`) of the brief's phase 4 is the proposal; any other line ending in `?` a question; anything
+ * closing `Go?` (or `Los?`) of the brief's phase 4, or the fix variant's `Push and open the PR?`, is the proposal; any other line ending in `?` a question; anything
  * else nothing. A model that wraps the question in a sentence reads as a question: a miss only weakens a badge.
  */
 export function askOf(answer: string): PhaseAsk {
@@ -47,7 +47,8 @@ export function askOf(answer: string): PhaseAsk {
     .map(line => line.replace(WRAPPING, '').trim())
     .filter(line => line !== '')
   const last = lines.at(-1) ?? ''
-  if (/^(?:go|los)\s*\?$/i.test(last)) return 'proposal'
+  // E20: the fix variant's stop before GitHub ("Push and open the PR?", PUSH_LINE) waits for the owner's go as well.
+  if (/^(?:go|los|push and open the pr)\s*\?$/i.test(last)) return 'proposal'
 
   return last.endsWith('?') ? 'question' : 'none'
 }
@@ -133,5 +134,5 @@ export function statusText(S: Strings, self: SelfIssue, record: PhaseRecord | nu
   if (self.isSpike) return S.statusSpike
   const waits = record !== null && record.activity === 'waiting' && record.ask === 'proposal'
 
-  return `${S.statusIssue(self.number, self.repo)}${waits ? S.statusProposal : ''}`
+  return `${S.statusIssue(self.number, self.repo)}${self.mode === 'fix' ? S.statusFix : ''}${waits ? S.statusProposal : ''}`
 }

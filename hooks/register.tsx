@@ -5,8 +5,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, PromptAutocompleteSuggestion, PromptSubmitInput, Register, RenderSurface, Timer, TurnCompleteReason } from 'claude-code'
 
-import type { Attached, AttachedRecord, Boards, ClosedCache, DoneMapping, Filter, Glimpse, Inbox, IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, PhaseActivity, PhaseAsk, PhaseRecord, PrRecord, PreviousAttempt, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section, SeenRecord, SelfIssue, SessionLive, Triage } from '../types'
-import { MARKER, branchName, renderBackground, renderBrief, sessionName, sessionTitle, spikeBrief } from './brief'
+import type { Attached, AttachedRecord, Boards, ClosedCache, DoneMapping, Filter, ForkState, Glimpse, Inbox, IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, PhaseActivity, PhaseAsk, PhaseRecord, PrRecord, PreviousAttempt, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section, SeenRecord, SelfIssue, SessionLive, SidebarChoice, StartChoice, StartFacts, StartForm, Triage } from '../types'
+import { FIX_LINE, MARKER, branchName, renderBackground, renderBrief, sessionName, sessionTitle, spikeBrief } from './brief'
+import type { BriefOptions } from './brief'
 import { asClosedCache, closedRecord, isClosedDue, listClosed, sinceDate } from './closed'
 import type { ClosedReason } from './closed'
 import { MENTION_LIMITS, TOOL_LIMITS, renderIssueText } from './context'
@@ -26,8 +27,10 @@ import { askOf, parseMarker, phaseFor, proposalsDue, readPhase, samePhases, stat
 import type { Marker } from './phase'
 import { asRecord, isPrsDue, mergeLinks, recordOf } from './prs'
 import { RECAP_VERSION, asRecap, isBetterRecap, isRecapCurrent, isRecapFor, isRecapUsable, recapIssue } from './recap'
-import { commandConsent, detachQuietly, detachSession, listSessions, lookUpSession, openSessionIn, parseObject, peekForPress, peekSession, pressConsent, quietDesktop, readPrStatus, readSelfId, routeInUse, settleWithin, startDesktopSession, unarchiveSession } from './session'
-import type { Listing, Peek, SessionEntry } from './session'
+import { commandConsent, detachQuietly, detachSession, isTypingRefusal, listSessions, lookUpSession, openSessionIn, parseObject, peekForPress, peekSession, pressConsent, quietDesktop, readPrStatus, readSelfId, routeInUse, settleWithin, startDesktopSession, unarchiveSession } from './session'
+import type { Listing, OpenOutcome, Peek, SessionEntry, StartArgs, StartOutcome } from './session'
+import { FILE_TRIES, SIDEBAR_GROUP, TITLE_GAP_MS, asSidebarChoice, groupFor, isOffScreen, parseGroupId, parseGroups, parseSections, storedGroupId, viewShowsGroup } from './sidebar'
+import { DEFAULT_CHOICE, GUIDANCE_CHARS, asEffort, asModel, asksOptions, cleanGuidance, cleanNote, forkState, looksSecret, optionsHeld, parseGitFacts } from './startform'
 import { clean } from './text'
 import { probeEngaged, runTiers } from './tiers'
 import { offerToast, takeToast } from './toasts'
@@ -38,7 +41,7 @@ const PLUGIN = 'issue-radar'
 const PANE = 'issue-radar'
 const PANE_COLUMNS = 46
 const DETAILS_CONCURRENCY = 2
-const STORE_PREFIXES = ['cache:', 'recaps:', 'session:', 'settings:', 'debug:', 'prs:', 'inbox:', 'closed:', 'seen:', 'phase:', 'attempts:', 'done:'] as const
+const STORE_PREFIXES = ['cache:', 'recaps:', 'session:', 'settings:', 'debug:', 'prs:', 'inbox:', 'closed:', 'seen:', 'phase:', 'attempts:', 'done:', 'sidebar:'] as const
 /** E10: how often a shown pane re-reads its mapped rows' issue-session records from the store (no gh, no model, no desktop call). */
 const PHASE_SYNC_MS = 15_000
 /** E12: a record without a mapping is swept once it is this old (the pane's hygiene at a session's start). */
@@ -158,6 +161,9 @@ const sessionLive = atom({ plugin: 'issue-radar', key: 'sessionLive' } as const,
 const attempts = atom({ plugin: 'issue-radar', key: 'attempts' } as const, {}, { shape: 'attempts-1' })
 const freshAsk = atom({ plugin: 'issue-radar', key: 'freshAsk' } as const, '')
 const done = atom({ plugin: 'issue-radar', key: 'done' } as const, {}, { shape: 'done-1' })
+const startForm = atom({ plugin: 'issue-radar', key: 'startForm' } as const, null, { shape: 'start-form-1' })
+const startFacts = atom({ plugin: 'issue-radar', key: 'startFacts' } as const, null, { shape: 'start-facts-1' })
+const sidebar = atom({ plugin: 'issue-radar', key: 'sidebar' } as const, { choice: 'unasked' }, { shape: 'sidebar-1' })
 
 // Module state: lost on a hot reload, which is fine, since the next refresh rebuilds it.
 let timer: Timer | undefined
@@ -296,6 +302,27 @@ let resolvingCheckout: Promise<void> | null = null
 const toolReading = new Map<string, Promise<Viewed>>()
 /** E2: the origin of the last prompt, for the spike (S16: what the desktop stamps on a typed prompt). */
 let lastPromptOrigin = ''
+/**
+ * E20: the start form's note as typed, per row, never in the state: an Input the hook redraws with each keystroke's
+ * echo drops characters (V1's rule), so only Enter writes the state. A hot reload forgets a draft; a kept note stays.
+ */
+const noteDrafts = new Map<string, string>()
+/**
+ * E21: the main loop's running turn as the turn hooks saw it, in module memory, since a read of the state within one
+ * dispatch sees the moment it began (a turn that started during a press would not show). Undefined after a hot reload
+ * until the next turn: the state's turnRunning answers then.
+ */
+let mainTurn: { turnId: string; since: number } | null | undefined
+/**
+ * E12/E13: the record this issue session wrote last, in module memory as well: the turn hooks and E13's tidy write it
+ * from different dispatches, and each must build on the other's latest write, not on its dispatch's moment.
+ */
+let ownLatest: PhaseRecord | null = null
+/** E13: the tidy that runs after an identification or a main-loop turn (its own dispatch), one pending at a time. */
+let tidyTimer: Timer | undefined
+let isTidying = false
+/** E13: when the issue session last compared its title with its issue's (at most every ten minutes). */
+let lastTitleCheck = Number.NEGATIVE_INFINITY
 
 type Resolved = { spec: string; info: RepoInfo | null; state: RepoState; isCheckout: boolean }
 /** What one `gh issue view` of the tool came back with. */
@@ -387,6 +414,10 @@ function readSettings(stored: unknown): RepoSettings {
   if (value['boards'] === true) settled.boards = true
   const showClosed = Object.fromEntries(Object.entries(record('showClosed')).filter(([, isShown]) => isShown))
   if (Object.keys(showClosed).length > 0) settled.showClosed = showClosed
+  // E8 and E20: kept only when they say something; the guidance is cleaned and cut again (another session wrote it).
+  if (value['beside'] === true) settled.beside = true
+  const guidance = typeof value['guidance'] === 'string' ? cleanGuidance(value['guidance']).text : ''
+  if (guidance !== '') settled.guidance = guidance
 
   return settled
 }
@@ -573,7 +604,17 @@ async function paneState($: EngineInterface, options: Options): Promise<PaneLike
     isFilterOpen: await read($, isFilterOpen),
     isSettingsOpen: await read($, isSettingsOpen),
     columns: viewport.columns,
+    startForm: await read($, startForm),
+    isSidebarAsking: await isSidebarAsking($),
   }
+}
+
+/** E13: whether the pane draws its question to file issue sessions in the sidebar (desktop only, not asked yet, a row mapped). */
+async function isSidebarAsking($: EngineInterface): Promise<boolean> {
+  if ((await read($, sidebar)).choice !== 'unasked' || Object.keys(await read($, mappings)).length === 0) return false
+  const surfaces = await $.session.surfaces().catch(() => [])
+
+  return surfaces.some(surface => surface === 'desktop')
 }
 
 /** Whether every surface the session has is the desktop: the title count is shown there only (E5-5; a terminal retitle could unplace the pane). */
@@ -643,11 +684,12 @@ async function mayRunInBackground($: EngineInterface): Promise<boolean> {
 
 /**
  * Whether the owner is typing in the pane: an inline editor or a form with an Input is open. Timed refreshes wait
- * while it holds, so a redraw never races the typing (F X-1). The pane has no such editor yet (the watch field of
- * the settings panel draws no value and keeps its text across redraws); the editors that come add their atoms here.
+ * while it holds, so a redraw never races the typing (F X-1): E20's start form under a row. The settings panel's
+ * fields (the watch list, E20's guidance) draw no value and keep their text across redraws, so they do not count; the
+ * filter panel neither (E14). Batch 7's editors add their atoms here.
  */
 async function isEditing($: EngineInterface): Promise<boolean> {
-  return false
+  return (await read($, startForm)) !== null
 }
 
 async function isPaneOpen($: EngineInterface): Promise<boolean> {
@@ -1174,7 +1216,9 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     const now = await $.clock.now()
     const root = await $.session.root()
     // Another pane, or an issue session of this project, may have started or released a session since the last refresh.
-    await loadMappings($)
+    const known = await loadMappings($)
+    // E13: another pane may have answered the sidebar question meanwhile.
+    await loadSidebar($)
     // E12 (B-E12-1): before the first refresh decides about the pane, this session asks whether it is an issue session
     // (its desktop id in a mapping); one that is stands down here, before any gh call. The wait is bounded (plan 4.2: no
     // desktop call blocks the GitHub part, B5-BEH-1): an answer that comes later still stands the session down.
@@ -1355,6 +1399,9 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     }
     await update($, recaps, current => Object.fromEntries(Object.entries(current).filter(([rowKey]) => live.has(rowKey))))
     await update($, opened, current => (current === '' || live.has(current) ? current : ''))
+    // E20 (B-E20-7): a start form whose row left the list, or whose issue got a session meanwhile (another pane), closes.
+    const form = await read($, startForm)
+    if (form !== null && (!live.has(form.rowKey) || known[form.rowKey] !== undefined)) await closeForm($, form.rowKey)
     // E5: each repository's baseline, before its rows are drawn, so a row is drawn with its mark from the start; the
     // glimpses whose hold has passed go into the baselines (R3-INT-3: a glimpse of a row no longer listed is kept, so
     // a row that leaves the list and comes back keeps its fade; written only when one faded, every write redraws).
@@ -1683,15 +1730,19 @@ async function freshDetails($: EngineInterface, options: Options, section: Secti
   return settled
 }
 
+/** What a press that may start a session came to: a session started or handled, the brief in the prompt box, or nothing yet (the form stays open). */
+type StartResult = 'started' | 'fallback' | 'kept'
+
 /**
  * "Bearbeiten" / "Zur Session" (as `label` says): the issue's session, opened after the click validated it (E1), or a
- * new one started. The store, not this pane's copy, says whether the issue has a session: another pane may have
- * started one. `surface` is where the press came from: only a desktop press opens a session in the window.
+ * new one started with `choice` (E20's form), else with Work on it's defaults and the repository's `beside` (E8). The
+ * store, not this pane's copy, says whether the issue has a session: another pane may have started one. `surface` is
+ * where the press came from: only a desktop press opens a session in the window.
  */
-async function workOn($: EngineInterface, options: Options, sectionKey: string, number: number, label: string, surface: RenderSurface): Promise<void> {
+async function workOn($: EngineInterface, options: Options, sectionKey: string, number: number, label: string, surface: RenderSurface, choice?: StartChoice): Promise<StartResult> {
   const S = strings(options.language)
   const rowKey = rowKeyOf(sectionKey, number)
-  if (inFlight.has(rowKey)) return
+  if (inFlight.has(rowKey)) return 'kept'
   inFlight.add(rowKey)
   await setStarting($, rowKey, true)
   try {
@@ -1703,7 +1754,7 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
     if (mapping !== undefined) {
       await reEnter($, options, rowKey, mapping, number, consent, surface)
 
-      return
+      return 'started'
     }
     // A start whose answer carried no id is looked for first: no second session meanwhile (A-F12).
     const pending = unparsed.get(rowKey)
@@ -1711,63 +1762,136 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
       $.ui.toast(S.startPending(number), { timeoutMs: 6_000 })
       scheduleTrack($, options, 0)
 
-      return
+      return 'started'
     }
-    await startIssueSession($, options, sectionKey, number, consent)
+
+    return await startIssueSession($, options, sectionKey, number, consent, choice ?? (await defaultChoice($)), surface)
   } finally {
     inFlight.delete(rowKey)
     await setStarting($, rowKey, false)
   }
 }
 
+/** Work on it's choice: understand first, own worktree, the pane session's model and effort, and E8's `beside` as the repository's setting says. */
+async function defaultChoice($: EngineInterface): Promise<StartChoice> {
+  return { ...DEFAULT_CHOICE, beside: (await read($, settings)).beside === true }
+}
+
 /**
- * Starts the issue's session (V1's start): the brief names the earlier attempts (E1) and the pane's id (E12), the
- * mapping keeps the branch slug; a start without a readable id is looked for in the listing (A-F12). The tracking pass
- * reads the new session 8 s later.
+ * Starts the issue's session (V1's start, with E20's choice): the brief names the earlier attempts (E1), the pane's id
+ * (E12), the mode, the place and the owner's guidance and note (E20); a fork carries this conversation (E21). A model or
+ * effort the app refuses is dropped once, and one it took is read back (B-E20-4). The new session opens beside this one
+ * when asked (E8), before the detach; one toast says how it went. A start without a readable id is looked for in the
+ * listing (A-F12). The tracking pass reads the new session 8 s later.
  */
-async function startIssueSession($: EngineInterface, options: Options, sectionKey: string, number: number, consent: string): Promise<void> {
+async function startIssueSession($: EngineInterface, options: Options, sectionKey: string, number: number, consent: string, choice: StartChoice, surface: RenderSurface): Promise<StartResult> {
   const S = strings(options.language)
   const rowKey = rowKeyOf(sectionKey, number)
   const found = findRow(await read($, sections), sectionKey, number)
-  if (found === null || found.section.info === null) return
+  if (found === null || found.section.info === null) return 'kept'
   const now = await $.clock.now()
   const fresh = await freshDetails($, options, found.section, found.row, now)
-  if (fresh === null) return
+  if (fresh === null) return 'kept'
   const input = { issueRepo: found.section.info, codeRepo: checkout?.info ?? null, row: found.row, details: fresh, fetchedAt: new Date(now).toISOString(), triage: await triageFor($, options, rowKey, fresh) }
   const previous = (await read($, attempts))[rowKey] ?? []
+  const root = checkout?.root ?? (await $.session.root())
+  // E20/E21: a shared checkout and a fork name this session's branch as it is now, not as it was when the form opened.
+  const facts = choice.place === 'worktree' ? null : await readStartFacts($, root)
   // E6: Phase 1 names the issue tool where this session's model can call it (the issue session's own is not known here).
-  const briefing = { issueTool: await issueToolOf($), fromId: myId, previous }
+  const briefing: BriefOptions = {
+    issueTool: await issueToolOf($),
+    fromId: myId,
+    previous,
+    mode: choice.mode,
+    place: choice.place,
+    root,
+    sourceBranch: facts?.branch ?? '',
+    isSourceWorktree: facts?.isWorktree === true,
+    guidance: (await read($, settings)).guidance ?? '',
+    note: choice.note,
+  }
   const prompt = renderBrief(input, briefing)
-  const background = renderBackground(input, checkout?.root ?? (await $.session.root()), briefing)
   const title = sessionTitle(found.row)
   const name = sessionName(found.row, found.section.info.name)
   const branch = branchName(found.row)
   const before = lastListed !== null && now - lastListed.at < UNPARSED_MS ? lastListed.ids : null
-  const outcome = await startDesktopSession($, { title, name, prompt, background, branch_name: branch, use_worktree: true }, consent)
+  let args: StartArgs
+  if (choice.place === 'fork') {
+    // B-E21-2: whether this conversation may be carried is asked again right before the start (a turn may have begun).
+    const state = await forkStateOf($, surface, facts)
+    if (state !== 'ok') {
+      $.ui.toast(state === 'busy' ? S.captionForkBusy : S.captionForkNone, { timeoutMs: 6_000 })
+
+      return 'kept'
+    }
+    args = { title, name, prompt, context: 'fork' }
+  } else {
+    const background = renderBackground(input, root, briefing)
+    args = choice.place === 'shared' ? { title, name, prompt, background, use_worktree: false } : { title, name, prompt, background, branch_name: branch, use_worktree: true }
+    if (choice.model !== 'inherit') args.model = choice.model
+    if (choice.effort !== 'inherit') args.effort = choice.effort
+  }
+  const notes: string[] = []
+  let readBack = asksOptions(choice)
+  let outcome: StartOutcome = await startDesktopSession($, args, consent)
+  // E20: a model or an effort the app refused is dropped once; the session then inherits both, and the toast says so.
+  if (outcome.route === 'none' && readBack && /\b(?:model|effort)\b/i.test(outcome.reason ?? '')) {
+    const plain: StartArgs = { ...args }
+    delete plain.model
+    delete plain.effort
+    outcome = await startDesktopSession($, plain, consent)
+    if (outcome.route !== 'none') notes.push(S.noteOptionsDropped)
+    readBack = false
+  }
   await update($, route, () => outcome.route)
   if (outcome.route === 'none') {
-    await fillPrompt($, options, prompt)
+    // V1's fallback, worded for this session (no shared checkout, no fork; mode, guidance and note stay). A refused fork
+    // is never retried as a fresh start: that would drop the conversation the owner chose to carry (E21).
+    const isFilled = await fillPrompt($, options, renderBrief(input, { ...briefing, place: 'here' }))
     $.ui.toast(clean(S.sessionNotStarted(outcome.reason ?? '?')), { timeoutMs: 8_000 })
 
-    return
+    return isFilled ? 'fallback' : 'kept'
   }
   if (outcome.sessionId === null) {
     $.ui.toast(S.noIdParsed, { timeoutMs: 8_000 })
     unparsed.set(rowKey, { title, name, branch, at: now, before })
     scheduleTrack($, options, TRACK_AFTER_START_MS)
 
-    return
+    return 'started'
   }
   // The checkout's key as this pane resolved it travels along: the issue session finds the project's lists under it
-  // without gh, where its git remote names another (a fork's origin; R4-INT-2).
+  // without gh, where its git remote names another (a fork's origin; R4-INT-2). Only an own worktree's branch is the slug.
   const held = await read($, checkoutKey)
-  const started: Mapping = { sessionId: outcome.sessionId, title, startedAt: now, startedFrom: myId, detached: false, branch, ...(held === '' ? {} : { checkoutKey: held }) }
+  const started: Mapping = {
+    sessionId: outcome.sessionId,
+    title,
+    startedAt: now,
+    startedFrom: myId,
+    detached: false,
+    ...(choice.place === 'worktree' ? { branch } : {}),
+    mode: choice.mode,
+    place: choice.place,
+    ...(held === '' ? {} : { checkoutKey: held }),
+  }
   await saveMapping($, rowKey, started)
-  $.ui.toast(clean(S.sessionStarted(title)))
+  // E8: beside this session, before the detach (whether a detach ends the right to split is S15), only for a press from
+  // the desktop. A refusal is told, never retried: the app says it changed nothing (A-F1, A-F17).
+  if (choice.beside && surface === 'desktop') {
+    const shown = await openBeside($, outcome.sessionId, consent)
+    if (shown.outcome === 'refused') {
+      $.ui.log(`${PLUGIN}: open_session_in split ${outcome.sessionId} refused: ${shown.reason}`, { to: 'debug' })
+      notes.push(S.noteNotBeside)
+    }
+  }
   const detached = await detachSession($, outcome.sessionId, consent)
   const settled: Mapping = detached.ok ? { ...started, detached: true } : started
   if (detached.ok) await saveMapping($, rowKey, settled)
-  else $.ui.toast(S.stayLinked, { timeoutMs: 6_000 })
+  else notes.push(S.noteLinked)
+  // B-E20-4: the app ignores a model above this session's without a word; the new session is read back.
+  if (readBack && !(await holdsOptions($, outcome.sessionId, choice, consent))) notes.push(S.noteOptionsDropped)
+  // One toast for the start (A crossCutting 6e): what went otherwise is named in it.
+  if (notes.length === 0) $.ui.toast(clean(S.startedNote(title, notes)))
+  else $.ui.toast(clean(S.startedNote(title, notes)), { timeoutMs: 8_000 })
   // B-X-1: issue sessions now write the shared store at every turn, and whether two processes' writes of different keys
   // both survive is not measured yet: the mapping that keeps the issue from a second session is read back once.
   if (!unsaved.has(rowKey) && asMapping(await readStore<unknown>($, storeKeyOf('session:', rowKey)))?.sessionId !== settled.sessionId) {
@@ -1775,6 +1899,182 @@ async function startIssueSession($: EngineInterface, options: Options, sectionKe
     await saveMapping($, rowKey, settled)
   }
   scheduleTrack($, options, TRACK_AFTER_START_MS)
+
+  return 'started'
+}
+
+/**
+ * E8: a session the pane started, opened in split view beside this one. Prose cannot tell a refusal ("changes nothing
+ * and says so") from a no-op ("already visible"), so an answer that is no error is checked against the window's layout
+ * (quiet, never a card, A-F17): a layout that answers as JSON without the session's id says it is not in view.
+ */
+async function openBeside($: EngineInterface, sessionId: string, consent: string): Promise<OpenOutcome> {
+  const opened = await openSessionIn($, sessionId, 'split', consent)
+  if (opened.outcome === 'refused') return opened
+  const layout = await quietDesktop($, 'ccd_window', 'get_window_layout', {})
+  if (!layout.ok) return opened
+  const data = parseObject(layout.structured, layout.text)
+  if (Object.keys(data).length === 0 || JSON.stringify(data).includes(sessionId)) return opened
+
+  return { outcome: 'refused', reason: 'not in the window layout after the split' }
+}
+
+/** B-E20-4: whether the session the app started runs on the model and effort the form asked; true when the app does not say. */
+async function holdsOptions($: EngineInterface, sessionId: string, choice: StartChoice, consent: string): Promise<boolean> {
+  const peek = await peekForPress($, sessionId, consent)
+
+  return peek.kind !== 'found' || optionsHeld(choice, { model: peek.entry.model, effort: peek.entry.effort })
+}
+
+/**
+ * E20/E21: what the form reads of this session: its branch and whether its folder is a linked worktree (one local git
+ * call, repo hooks off), whether tracked files are dirty (another), the context's tokens and the model (the engine), the
+ * effort (one quiet get_session 'self'). Each failure leaves its field empty.
+ */
+async function readStartFacts($: EngineInterface, root: string): Promise<StartFacts> {
+  const now = await $.clock.now()
+  const head = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD', '--path-format=absolute', '--git-dir', '--git-common-dir'], { cwd: root, timeoutMs: 5_000 }).catch(() => null)
+  const git = parseGitFacts(head !== null && head.exitCode === 0 ? head.stdout : '')
+  const status = head !== null && head.exitCode === 0 ? await $.process.run(['git', 'status', '--porcelain', '--untracked-files=no'], { cwd: root, timeoutMs: 5_000 }).catch(() => null) : null
+  const usage = await $.session.usage().catch(() => null)
+  const model = await $.session.model().catch(() => '')
+  const self = await peekSession($, 'self')
+
+  return {
+    root,
+    branch: git.branch,
+    isWorktree: git.isWorktree,
+    isDirty: status !== null && status.exitCode === 0 && status.stdout.trim() !== '',
+    contextTokens: typeof usage?.context.tokens === 'number' ? usage.context.tokens : null,
+    model,
+    effort: self.kind === 'found' ? (self.entry.effort ?? '') : '',
+    at: now,
+  }
+}
+
+/**
+ * E21: whether the form may carry this conversation now (startform.ts forkState). The running turn comes from the turn
+ * hooks' module memory where this module saw one, else from the state (which a drawing reads, so it redraws at a turn's
+ * end).
+ */
+async function forkStateOf($: EngineInterface, surface: RenderSurface, facts: StartFacts | null): Promise<ForkState> {
+  const held = await read($, turnRunning)
+  const turns = await $.session.turns().catch(() => 0)
+
+  return forkState({
+    surface,
+    isIssueSession: await read($, isIssueSession),
+    isWorktree: facts?.isWorktree === true,
+    turns,
+    running: mainTurn === undefined ? held : mainTurn,
+    now: await $.clock.now(),
+  })
+}
+
+// E20: the start form -----------------------------------------------------------
+
+/** "▾" on a row: opens the start form under it (one row at a time) or closes it; the desktop's choices read this session's facts. */
+async function toggleStartForm($: EngineInterface, rowKey: string, surface: RenderSurface): Promise<void> {
+  const current = await read($, startForm)
+  if (current !== null && current.rowKey === rowKey) {
+    await closeForm($, rowKey)
+
+    return
+  }
+  if (current !== null) noteDrafts.delete(current.rowKey)
+  noteDrafts.delete(rowKey)
+  const chosen = await read($, settings)
+  const form: StartForm = { rowKey, ...DEFAULT_CHOICE, beside: chosen.beside === true }
+  await update($, startForm, () => form)
+  if (surface === 'desktop') {
+    const facts = await readStartFacts($, checkout?.root ?? (await $.session.root()))
+    await update($, startFacts, () => facts)
+  }
+}
+
+/** Closes the start form of `rowKey` (another row's stays) and drops its draft. */
+async function closeForm($: EngineInterface, rowKey: string): Promise<void> {
+  noteDrafts.delete(rowKey)
+  await update($, startForm, current => (current !== null && current.rowKey === rowKey ? null : current))
+}
+
+/** A choice picked in the form of `rowKey`. */
+async function patchForm($: EngineInterface, rowKey: string, patch: Partial<StartChoice>): Promise<void> {
+  await update($, startForm, current => (current === null || current.rowKey !== rowKey ? current : { ...current, ...patch }))
+}
+
+/** Enter in the note: kept in the state (drawn as a caption); the typing itself only in the module's drafts. */
+async function keepNote($: EngineInterface, rowKey: string, text: string): Promise<void> {
+  noteDrafts.set(rowKey, text)
+  await patchForm($, rowKey, { note: cleanNote(text) })
+}
+
+/** The form's choice with the note as typed (a draft not yet kept counts); null when the note looks like a secret (told). */
+async function formChoice($: EngineInterface, options: Options, rowKey: string): Promise<StartChoice | null> {
+  const form = await read($, startForm)
+  if (form === null || form.rowKey !== rowKey) return null
+  const note = cleanNote(noteDrafts.get(rowKey) ?? form.note)
+  if (looksSecret(note)) {
+    $.ui.toast(strings(options.language).noteSecret, { timeoutMs: 6_000 })
+
+    return null
+  }
+
+  return { mode: form.mode, place: form.place, model: asModel(form.model), effort: asEffort(form.effort), beside: form.beside, note }
+}
+
+/** "Starten": Work on it with the form's choice; the form closes only after a start or the prompt-box fallback (B-E20-7). */
+async function startFromForm($: EngineInterface, options: Options, rowKey: string, label: string, surface: RenderSurface): Promise<void> {
+  const choice = await formChoice($, options, rowKey)
+  if (choice === null) return
+  const hash = rowKey.lastIndexOf('#')
+  const result = await workOn($, options, rowKey.slice(0, hash), Number(rowKey.slice(hash + 1)), label, surface, choice)
+  if (result !== 'kept') await closeForm($, rowKey)
+}
+
+/** "Hier übernehmen" in the form: the same brief (mode, note, guidance) in this prompt box. */
+async function hereFromForm($: EngineInterface, options: Options, rowKey: string): Promise<void> {
+  const choice = await formChoice($, options, rowKey)
+  if (choice === null) return
+  const hash = rowKey.lastIndexOf('#')
+  if (await takeHere($, options, rowKey.slice(0, hash), Number(rowKey.slice(hash + 1)), choice)) await closeForm($, rowKey)
+}
+
+/**
+ * E20: the repository's guidance, appended to every brief started from this checkout (plan 4.8). Kept in the settings,
+ * cleaned and cut to 1,000 characters (a toast says when it was cut); a text that looks like a token or a key is refused.
+ */
+async function saveGuidance($: EngineInterface, options: Options, text: string): Promise<void> {
+  const S = strings(options.language)
+  if (text.trim() === '') return
+  if (looksSecret(text)) {
+    $.ui.toast(S.guidanceSecret, { timeoutMs: 6_000 })
+
+    return
+  }
+  const cleaned = cleanGuidance(text)
+  await saveSettings($, current => withGuidance(current, cleaned.text))
+  if (cleaned.isCut) $.ui.toast(S.guidanceCut(GUIDANCE_CHARS))
+}
+
+/** The settings with `text` as the guidance; none for an empty one. */
+function withGuidance(current: RepoSettings, text: string): RepoSettings {
+  const next = { ...current }
+  if (text === '') delete next.guidance
+  else next.guidance = text
+
+  return next
+}
+
+/** E8: the ⚙ panel's switch: open each new issue session beside this one (per repository, off by default). */
+async function toggleBeside($: EngineInterface): Promise<void> {
+  await saveSettings($, current => {
+    const next = { ...current }
+    if (current.beside === true) delete next.beside
+    else next.beside = true
+
+    return next
+  })
 }
 
 /** Whether a session reads as archived: the app's own flag, or the last pass found it missing from a complete listing. */
@@ -1836,10 +2136,13 @@ async function openMapped($: EngineInterface, options: Options, mapping: Mapping
 
     return false
   }
-  const opened = await openSessionIn($, mapping.sessionId, 'focus', consent)
+  // E8: with "beside" on, the session opens in split view, so the pane stays in view (focus would replace this session).
+  const beside = (await read($, settings)).beside === true
+  const opened = beside ? await openBeside($, mapping.sessionId, consent) : await openSessionIn($, mapping.sessionId, 'focus', consent)
   if (opened.outcome !== 'refused') return true
   $.ui.log(`${PLUGIN}: open_session_in ${mapping.sessionId} refused: ${opened.reason}`, { to: 'debug' })
-  $.ui.toast(clean(S.openElsewhere(title)), { timeoutMs: 6_000 })
+  // A-F17: with the switch off, a focus the cursor held back is only told (open it from the sidebar, or drag it beside); never a split unasked.
+  $.ui.toast(clean(!beside && isTypingRefusal(opened.reason) ? S.focusTyping(title) : S.openElsewhere(title)), { timeoutMs: 6_000 })
 
   return false
 }
@@ -1912,7 +2215,7 @@ async function askFresh($: EngineInterface, rowKey: string): Promise<void> {
  * finds it (archived) let the start go on, and the old session becomes an attempt the new brief names; a session that is
  * still listed, or one that cannot be checked, stops it.
  */
-async function startAfresh($: EngineInterface, options: Options, sectionKey: string, number: number, label: string): Promise<void> {
+async function startAfresh($: EngineInterface, options: Options, sectionKey: string, number: number, label: string, surface: RenderSurface): Promise<void> {
   const S = strings(options.language)
   const rowKey = rowKeyOf(sectionKey, number)
   await update($, freshAsk, () => '')
@@ -1948,7 +2251,7 @@ async function startAfresh($: EngineInterface, options: Options, sectionKey: str
         await releaseMapping($, rowKey, mapping, 'archived', peek.entry.branch)
       } else await releaseMapping($, rowKey, mapping, 'gone', null)
     }
-    await startIssueSession($, options, sectionKey, number, consent)
+    await startIssueSession($, options, sectionKey, number, consent, await defaultChoice($), surface)
   } finally {
     inFlight.delete(rowKey)
     await setStarting($, rowKey, false)
@@ -2001,21 +2304,36 @@ async function openDone($: EngineInterface, options: Options, rowKey: string, la
   }
 }
 
-async function takeHere($: EngineInterface, options: Options, sectionKey: string, number: number): Promise<void> {
+/**
+ * "Hier übernehmen": the brief in this session's own prompt box (V1), with the repository's guidance (E20) and, from the
+ * start form, its mode and note. True when the box took it.
+ */
+async function takeHere($: EngineInterface, options: Options, sectionKey: string, number: number, choice?: Pick<StartChoice, 'mode' | 'note'>): Promise<boolean> {
   const S = strings(options.language)
   const found = findRow(await read($, sections), sectionKey, number)
-  if (found === null || found.section.info === null) return
+  if (found === null || found.section.info === null) return false
   const rowKey = rowKeyOf(sectionKey, number)
   // E5: taking a row here acknowledges it.
   await acknowledgeRow($, options, rowKey)
   const now = await $.clock.now()
   const fresh = await freshDetails($, options, found.section, found.row, now)
-  if (fresh === null) return
+  if (fresh === null) return false
   const input = { issueRepo: found.section.info, codeRepo: checkout?.info ?? null, row: found.row, details: fresh, fetchedAt: new Date(now).toISOString(), triage: await triageFor($, options, rowKey, fresh) }
   // E1: the earlier attempts are named here too; E12: the marker names this session, so sending the brief here never
   // makes it an issue session, even after a hot reload.
-  const brief = renderBrief(input, { issueTool: await issueToolOf($), fromId: myId, previous: (await read($, attempts))[rowKey] ?? [] })
-  if (await fillPrompt($, options, brief)) $.ui.toast(S.briefInPrompt)
+  const brief = renderBrief(input, {
+    issueTool: await issueToolOf($),
+    fromId: myId,
+    previous: (await read($, attempts))[rowKey] ?? [],
+    mode: choice?.mode ?? 'understand',
+    place: 'here',
+    guidance: (await read($, settings)).guidance ?? '',
+    note: choice?.note ?? '',
+  })
+  if (!(await fillPrompt($, options, brief))) return false
+  $.ui.toast(S.briefInPrompt)
+
+  return true
 }
 
 /**
@@ -3350,14 +3668,14 @@ async function identifiedSoon($: EngineInterface): Promise<boolean> {
   return identifying === null ? false : settleWithin($, identifying, IDENTIFY_WAIT_MS, false)
 }
 
-/** The issue a row key names, as SelfIssue says it. */
-function selfOf(rowKey: string, via: SelfIssue['via']): SelfIssue | null {
+/** The issue a row key names, as SelfIssue says it; `fix` when the owner chose "just fix it" (E20). */
+function selfOf(rowKey: string, via: SelfIssue['via'], mode?: string): SelfIssue | null {
   const hash = rowKey.lastIndexOf('#')
   const number = Number(rowKey.slice(hash + 1))
   const parts = rowKey.slice(0, hash).split('/')
   if (hash < 0 || !Number.isInteger(number) || number <= 0 || parts.length < 3) return null
 
-  return { rowKey, number, repo: parts.slice(-2).join('/'), isSpike: false, via }
+  return { rowKey, number, repo: parts.slice(-2).join('/'), isSpike: false, via, ...(mode === 'fix' ? { mode: 'fix' as const } : {}) }
 }
 
 /**
@@ -3368,7 +3686,7 @@ function selfOf(rowKey: string, via: SelfIssue['via']): SelfIssue | null {
 async function identifySelf($: EngineInterface, options: Options, found: SelfIssue): Promise<void> {
   const current = await read($, selfIssue)
   const settled = current !== null && current.via === 'mapping' && found.via !== 'mapping' ? current : found
-  if (current === null || current.rowKey !== settled.rowKey || current.via !== settled.via) {
+  if (current === null || current.rowKey !== settled.rowKey || current.via !== settled.via || current.mode !== settled.mode) {
     await update($, selfIssue, () => settled)
     $.ui.log(`${PLUGIN}: this session works on ${settled.rowKey} (found by its ${settled.via})`, { to: 'debug' })
   }
@@ -3376,7 +3694,9 @@ async function identifySelf($: EngineInterface, options: Options, found: SelfIss
   isSelfFound = true
   standDown()
   if (await isPaneOpen($)) void $.ui.close({ id: PANE }).catch(() => undefined)
-  await applyStatus($, options, settled, await read($, ownPhase))
+  await applyStatus($, options, settled, ownLatest ?? (await read($, ownPhase)))
+  // E13: an issue session files itself once it knows it is one (in a dispatch of its own, which sees this one's writes).
+  if (!settled.isSpike) scheduleTidy($, options, 1_000)
 }
 
 /**
@@ -3390,7 +3710,7 @@ async function identifyByMapping($: EngineInterface, options: Options): Promise<
   const match = async (): Promise<boolean> => {
     const ids = await ownIds($)
     const found = Object.entries(all).find(([, mapping]) => isOwnSession(mapping, ids))
-    const self = found === undefined ? null : selfOf(found[0], 'mapping')
+    const self = found === undefined ? null : selfOf(found[0], 'mapping', found[1].mode)
     if (self === null) return false
     await identifySelf($, options, self)
 
@@ -3414,7 +3734,7 @@ async function identifyByMarker($: EngineInterface, options: Options, text: stri
   const marker = parseMarker(text)
   if (marker === null || (await isOwnBrief($, text, marker))) return false
   if (marker.kind === 'spike') await identifySelf($, options, { rowKey: 'spike', number: 0, repo: '', isSpike: true, via: 'marker' })
-  else await identifySelf($, options, { rowKey: marker.rowKey, number: marker.number, repo: marker.repo, isSpike: false, via: 'marker' })
+  else await identifySelf($, options, { rowKey: marker.rowKey, number: marker.number, repo: marker.repo, isSpike: false, via: 'marker', ...(text.includes(FIX_LINE) ? { mode: 'fix' as const } : {}) })
 
   return true
 }
@@ -3442,17 +3762,22 @@ async function firstUserText($: EngineInterface, fallback: string): Promise<stri
 async function writePhase($: EngineInterface, options: Options, activity: PhaseActivity, ask: PhaseAsk, isTurnEnd: boolean, extra: Partial<Pick<PhaseRecord, 'title' | 'filedGroupId' | 'filedAt' | 'fileTries'>> = {}): Promise<PhaseRecord | null> {
   const self = await read($, selfIssue)
   if (self === null) return null
-  const before = await read($, ownPhase)
-  if (!isTurnEnd && before !== null && before.activity === activity && before.ask === ask && Object.keys(extra).length === 0) return before
+  // The module's last write first: the turn hooks and E13's tidy write from different dispatches (each reads its own moment).
+  const before = ownLatest ?? (await read($, ownPhase))
+  const isSameState = !isTurnEnd && before !== null && before.activity === activity && before.ask === ask
+  if (isSameState && Object.keys(extra).length === 0) return before
   const engineId = await $.session.id().catch(() => myId)
   const known = await read($, desktopId)
-  const record: PhaseRecord = { v: 1, sessionId: known === '' ? engineId : known, activity, ask, at: await $.clock.now(), turns: (before?.turns ?? 0) + (isTurnEnd ? 1 : 0) }
+  // An E13 stamp changes no state: it keeps the state's time, so no pane takes it for a new proposal or a newer word (E10, E1).
+  const at = isSameState && before !== null ? before.at : await $.clock.now()
+  const record: PhaseRecord = { v: 1, sessionId: known === '' ? engineId : known, activity, ask, at, turns: (before?.turns ?? 0) + (isTurnEnd ? 1 : 0) }
   if (known !== '' && engineId !== '' && engineId !== known) record.engineId = engineId
   for (const field of ['title', 'filedGroupId', 'filedAt', 'fileTries'] as const) {
     const value = extra[field] ?? before?.[field]
     if (value !== undefined) (record as Record<string, unknown>)[field] = value
   }
   if (!self.isSpike) await writeStore($, storeKeyOf('phase:', self.rowKey), record)
+  ownLatest = record
   await update($, ownPhase, () => record)
   await applyStatus($, options, self, record)
 
@@ -3497,6 +3822,8 @@ async function noteTurnEnd($: EngineInterface, options: Options, reason: TurnCom
   if ((await read($, selfIssue)) !== null) {
     const isAnswered = reason === 'answer' || reason === 'aborted'
     await writePhase($, options, isAnswered ? 'waiting' : 'error', reason === 'answer' ? askOf(answer) : 'none', true)
+    // E13: filing, title and the unread mark, in a dispatch of their own a moment later (they never hold up the record).
+    scheduleTidy($, options, 400, reason)
 
     return
   }
@@ -3556,6 +3883,174 @@ async function syncPhases($: EngineInterface, options: Options): Promise<void> {
   const refs = due.map(rowKey => toastRef(rowKey, home))
   offerToast('proposal', refs.length === 1 ? S.proposalToast(refs[0] ?? '') : S.proposalsToast(refs.join(', ')), 8_000)
   if (!isRunning) flushToasts($)
+}
+
+// E13: issue sessions in the sidebar ----------------------------------------------------
+
+/** The installation-wide sidebar choice from the store into the state (written only on a change: every write redraws). */
+async function loadSidebar($: EngineInterface): Promise<SidebarChoice> {
+  const choice = asSidebarChoice(await readStore<unknown>($, 'sidebar:choice'))
+  if ((await read($, sidebar)).choice !== choice) await update($, sidebar, () => ({ choice }))
+
+  return choice
+}
+
+/** The owner's answer in the pane (the question, or the ⚙ switch): kept for the installation; running issue sessions read it at their next turn. */
+async function setSidebarChoice($: EngineInterface, value: boolean): Promise<void> {
+  await writeStore($, 'sidebar:choice', { file: value, at: await $.clock.now() })
+  await update($, sidebar, () => ({ choice: value ? ('on' as const) : ('off' as const) }))
+}
+
+/** Runs E13's tidy after `delayMs`, in a dispatch of its own (it reads what the identification or the turn just wrote); one pending at a time. */
+function scheduleTidy($: EngineInterface, options: Options, delayMs: number, reason?: TurnCompleteReason): void {
+  tidyTimer?.cancel()
+  tidyTimer = $.clock.after(delayMs, () => {
+    tidyTimer = undefined
+    void tidySelf($, options, reason).catch(() => undefined)
+  })
+}
+
+/**
+ * E13, inside an issue session only and only for 'self' (plan section 3): while the owner said yes (read from the store
+ * each time, so a later yes reaches running sessions), the session files itself under "Issues" once, follows a GitHub
+ * rename of its issue while its title is still the one the mod gave it, and after a finished turn marks itself unread
+ * when the app says it is open nowhere. Every call quiet (never a card). Nothing before the session's first record (its
+ * first turn's end), and nothing for the spike's session.
+ */
+async function tidySelf($: EngineInterface, options: Options, reason: TurnCompleteReason | undefined): Promise<void> {
+  const self = await read($, selfIssue)
+  if (self === null || self.isSpike || isTidying) return
+  if (asSidebarChoice(await readStore<unknown>($, 'sidebar:choice')) !== 'on') return
+  const record = ownLatest ?? (await read($, ownPhase))
+  if (record === null) return
+  isTidying = true
+  try {
+    const now = await $.clock.now()
+    const wantsFile = record.filedAt === undefined && (record.fileTries ?? 0) < FILE_TRIES
+    const wantsTitle = now - lastTitleCheck >= TITLE_GAP_MS
+    if (wantsFile || wantsTitle) {
+      const me = await peekSession($, 'self')
+      if (wantsFile) await fileSelf($, options, me, record)
+      if (wantsTitle) {
+        lastTitleCheck = now
+        await syncSelfTitle($, options, self, me)
+      }
+    }
+    if (reason !== undefined && reason !== 'aborted') await markIfAway($)
+  } catch (error) {
+    $.ui.log(`${PLUGIN}: tidying the sidebar failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
+  } finally {
+    isTidying = false
+  }
+}
+
+/** An E13 field in the session's own record, through its one write point; the state stays as it is (writePhase keeps its time). */
+async function stampSelf($: EngineInterface, options: Options, extra: Partial<Pick<PhaseRecord, 'title' | 'filedGroupId' | 'filedAt' | 'fileTries'>>): Promise<void> {
+  const before = ownLatest ?? (await read($, ownPhase))
+  if (before === null) return
+  await writePhase($, options, before.activity, before.ask, false, extra)
+}
+
+/**
+ * Files this session under the "Issues" group, once (A-F7): a session in a group already (the owner's filing) is only
+ * noted; a pinned one is left alone (a move unpins it); nothing moves unless the sidebar's list groups by custom groups
+ * (a move would switch the owner's view otherwise); the stored group the app no longer lists was removed by the owner,
+ * so it is never made again and the pane asks anew; a group is made only when the app's list of groups answered. A try
+ * the app could not answer counts (at most five); one the layout did not allow does not.
+ */
+async function fileSelf($: EngineInterface, options: Options, me: Peek, record: PhaseRecord): Promise<void> {
+  const S = strings(options.language)
+  const now = await $.clock.now()
+  const countTry = async () => stampSelf($, options, { fileTries: (record.fileTries ?? 0) + 1 })
+  if (me.kind !== 'found' || me.entry.group === undefined) {
+    await countTry()
+
+    return
+  }
+  if (me.entry.group !== null) {
+    await stampSelf($, options, { filedAt: now, filedGroupId: me.entry.group })
+
+    return
+  }
+  if (me.entry.pinned === true) return
+  const sectionsAnswer = await quietDesktop($, 'ccd_sidebar', 'list_sections', {})
+  const listed = sectionsAnswer.ok ? parseSections(sectionsAnswer.structured, sectionsAnswer.text) : null
+  if (listed === null) return
+  const groupsAnswer = await quietDesktop($, 'ccd_sidebar', 'list_groups', {})
+  const groups = groupsAnswer.ok ? parseGroups(groupsAnswer.structured, groupsAnswer.text) : null
+  if (groups === null) {
+    await countTry()
+
+    return
+  }
+  const storedId = storedGroupId(await readStore<unknown>($, 'sidebar:group'))
+  if (storedId !== null && !groups.some(group => group.id === storedId)) {
+    await $.store.delete('sidebar:group').catch(() => undefined)
+    await $.store.delete('sidebar:choice').catch(() => undefined)
+    $.ui.log(`${PLUGIN}: the sidebar group ${storedId} is gone; issue sessions file themselves again only after a new yes`, { to: 'debug' })
+
+    return
+  }
+  let group = groupFor(groups, storedId)
+  if (!viewShowsGroup(listed, group?.id ?? null)) return
+  if (group === undefined) {
+    const created = await quietDesktop($, 'ccd_sidebar', 'create_group', { name: SIDEBAR_GROUP })
+    const id = created.ok ? parseGroupId(created.structured, created.text) : null
+    if (id === null) {
+      await countTry()
+
+      return
+    }
+    group = { id, name: SIDEBAR_GROUP, order: groups.length }
+    $.ui.toast(S.groupCreated)
+  }
+  await writeStore($, 'sidebar:group', { id: group.id, name: group.name, at: now })
+  const moved = await quietDesktop($, 'ccd_sidebar', 'move_sessions', { session_ids: ['self'], group_id: group.id })
+  if (moved.ok) await stampSelf($, options, { filedAt: now, filedGroupId: group.id })
+  else await countTry()
+}
+
+/**
+ * Follows a GitHub rename of this session's issue (the panes' stored list, no gh call) only while the session's title is
+ * the one the mod gave it: the mapping's (what start_session got) or one the mod set and noted since (A-F6). A session
+ * the store's mapping does not name (marker only) is never retitled; any other title is the owner's and stays.
+ */
+async function syncSelfTitle($: EngineInterface, options: Options, self: SelfIssue, me: Peek): Promise<void> {
+  if (me.kind !== 'found' || me.entry.title === '') return
+  const mapping = asMapping(await readStore<unknown>($, storeKeyOf('session:', self.rowKey)))
+  if (mapping === undefined || !isOwnSession(mapping, [...(await ownIds($)), me.entry.id])) return
+  const mine = (ownLatest ?? (await read($, ownPhase)))?.title ?? mapping.title
+  if (me.entry.title !== mine) return
+  const cache = await readStore<RepoCache>($, storeKeyOf('cache:', self.rowKey.slice(0, self.rowKey.lastIndexOf('#'))))
+  const row = (Array.isArray(cache?.rows) ? cache.rows : []).filter(isRowLike).find(found => found.number === self.number)
+  if (row === undefined) return
+  const expected = sessionTitle(row)
+  if (expected === mine) return
+  const set = await quietDesktop($, 'ccd_session_mgmt', 'set_session_title', { session_id: 'self', title: expected })
+  if (set.ok) await stampSelf($, options, { title: expected })
+}
+
+/** After a finished turn: unread only when ccd_view's layout positively says this session is open nowhere (A-F9); anything else leaves it. */
+async function markIfAway($: EngineInterface): Promise<void> {
+  const layout = await quietDesktop($, 'ccd_view', 'get_layout', {})
+  if (!layout.ok || isOffScreen(layout.structured, layout.text) !== true) return
+  await quietDesktop($, 'ccd_sidebar', 'set_unread', { session_id: 'self', unread: true })
+}
+
+/** The spike's line for E13 (S22): the sidebar's sections and how they group, the groups, and what get_layout says; read-only, the mcp route alone. */
+async function sidebarLine($: EngineInterface): Promise<string> {
+  const quiet = { isMeasurement: true, isMcpOnly: true }
+  const sectionsAnswer = await quietDesktop($, 'ccd_sidebar', 'list_sections', {}, quiet)
+  const groupsAnswer = await quietDesktop($, 'ccd_sidebar', 'list_groups', {}, quiet)
+  const layout = await quietDesktop($, 'ccd_view', 'get_layout', {}, quiet)
+  const listed = sectionsAnswer.ok ? parseSections(sectionsAnswer.structured, sectionsAnswer.text) : null
+  const groups = groupsAnswer.ok ? parseGroups(groupsAnswer.structured, groupsAnswer.text) : null
+  const away = layout.ok ? isOffScreen(layout.structured, layout.text) : null
+  const sectionsText = listed === null ? `not read (${sectionsAnswer.ok ? 'no list in the answer' : sectionsAnswer.reason})` : listed.map(found => `${found.id}:${found.kind || '?'}:${found.groupBy || '-'}${found.isShown ? '' : ':hidden'}`).join(', ') || 'none'
+  const groupsText = groups === null ? `not read (${groupsAnswer.ok ? 'no list in the answer' : groupsAnswer.reason})` : String(groups.length)
+  const layoutText = away === null ? `unreadable (${layout.ok ? layout.text.slice(0, 80) : layout.reason})` : away ? 'views empty' : 'views listed'
+
+  return `sidebar (quiet, mcp only): sections ${sectionsText}; groups ${groupsText}; get_layout ${layoutText}`
 }
 
 /**
@@ -3642,6 +4137,8 @@ async function resetStore($: EngineInterface): Promise<void> {
   await update($, attempts, () => ({}))
   await update($, freshAsk, () => '')
   await update($, done, () => ({}))
+  // E13: the sidebar choice went with the store: the pane asks again (the group is found again by name, never made twice).
+  await update($, sidebar, () => ({ choice: 'unasked' as const }))
 }
 
 /**
@@ -3700,6 +4197,8 @@ async function runSpike($: EngineInterface, command: string): Promise<string> {
       `list_sessions (quiet, via ${listing.via}): ${listing.entries.length} active${listing.isFull ? ' (the limit)' : ''}; keys ${listing.entries[0]?.keys.join(', ') || 'none'}; state words ${words.join(', ') || 'none'}; pull-request field ${listing.entries.some(entry => entry.pr !== 'unknown') ? 'present' : 'absent'}`,
     )
   } else lines.push(`list_sessions (quiet): not read (${listing.reason})`)
+  // S22 (E13): how the sidebar groups, which groups there are, and whether get_layout tells "open nowhere"; read-only.
+  lines.push(await sidebarLine($))
   // S19 (E12): the spike's session sets its status line; the owner looks for it.
   lines.push('status line: the spike session shows "Issue-Radar-Spike" under its prompt where the app draws a plugin status line (S19)')
   // S18 (E6): whether this host adds a plugin's tool at run time; S16 (E2, E5): what the desktop stamps on a typed prompt.
@@ -3758,7 +4257,11 @@ export const register: Register = (on, given) => {
       await update($, isIssueSession, () => true)
       standDown()
       await applyStatus($, options, await read($, selfIssue), await read($, ownPhase))
+      // E13: a reloaded issue session looks at its filing again (the tidy reads the state in a dispatch of its own).
+      scheduleTidy($, options, 1_000)
     } else {
+      // E13: whether the pane asks to file issue sessions in the sidebar.
+      await loadSidebar($)
       // No pane and no polling inside an issue session; /issue-radar still opens it there.
       armTimer($, options)
       schedule($, options, 600, 'start')
@@ -3835,6 +4338,8 @@ export const register: Register = (on, given) => {
   // The work runs in hook order through one chain (R5-RT-2): a turn's end never lands after the next turn's start.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
+    // E21: the running turn, at once and in module memory (a press's dispatch would not see the state's write).
+    if (e.agentId === undefined) mainTurn = { turnId: e.turnId, since: await $.clock.now() }
     if (e.agentId === undefined) void inOrder(() => noteTurnStart($, options, e.turnId, e.text))
 
     return started
@@ -3842,6 +4347,7 @@ export const register: Register = (on, given) => {
 
   on('turn.complete', async ($, e, next) => {
     const finished = await next(e)
+    if (e.agentId === undefined) mainTurn = null
     if (e.agentId === undefined) void inOrder(() => noteTurnEnd($, options, e.reason, e.answer))
 
     return finished
@@ -3937,6 +4443,11 @@ export const register: Register = (on, given) => {
     const activeFilter = await read($, filter)
     // E5, E4: where the window stands, for what a look covers and where the cards go.
     viewport = { offset: e.props.scroll.offset, bodyRows: e.props.scroll.bodyRows, columns: e.props.bodyColumns }
+    // E20/E21: the start form, what it read of this session, and whether it may carry this conversation (asked only while
+    // a form is open on the desktop, so the running turn is read, and redraws, only then).
+    const form = await read($, startForm)
+    const facts = await read($, startFacts)
+    const fork = form !== null && e.surface === 'desktop' ? await forkStateOf($, e.surface, facts) : 'none'
 
     return renderPane(
       ui,
@@ -3965,6 +4476,10 @@ export const register: Register = (on, given) => {
         attempts: await read($, attempts),
         freshAsk: await read($, freshAsk),
         done: await read($, done),
+        startForm: form,
+        startFacts: facts,
+        forkState: fork,
+        sidebar: (await read($, sidebar)).choice,
         ownIds: await ownIds($),
         myId,
         options,
@@ -3995,7 +4510,7 @@ export const register: Register = (on, given) => {
         workOn: (sectionKey, number, label, surface) => void workOn($, options, sectionKey, number, label, surface),
         reopen: (sectionKey, number, label, surface) => void reopen($, options, sectionKey, number, label, surface),
         askFresh: rowKey => void askFresh($, rowKey),
-        startAfresh: (sectionKey, number, label) => void startAfresh($, options, sectionKey, number, label),
+        startAfresh: (sectionKey, number, label, surface) => void startAfresh($, options, sectionKey, number, label, surface),
         openDone: (rowKey, label, surface) => void openDone($, options, rowKey, label, surface),
         takeHere: (sectionKey, number) => void takeHere($, options, sectionKey, number),
         consent: (key, value) => void consent($, options, key, value),
@@ -4014,6 +4529,19 @@ export const register: Register = (on, given) => {
         showInSection: rowKey => void showInSection($, options, rowKey),
         toggleClosed: key => void toggleClosed($, options, key),
         markAllSeen: () => void markAllSeen($, options),
+        toggleForm: (rowKey, surface) => void toggleStartForm($, rowKey, surface),
+        patchForm: (rowKey, patch) => void patchForm($, rowKey, patch),
+        draftNote: (rowKey, text) => {
+          noteDrafts.set(rowKey, text)
+        },
+        keepNote: (rowKey, text) => void keepNote($, rowKey, text),
+        startFromForm: (rowKey, label, surface) => void startFromForm($, options, rowKey, label, surface),
+        hereFromForm: rowKey => void hereFromForm($, options, rowKey),
+        cancelForm: rowKey => void closeForm($, rowKey),
+        saveGuidance: text => void saveGuidance($, options, text),
+        clearGuidance: () => void saveSettings($, current => withGuidance(current, '')),
+        toggleBeside: () => void toggleBeside($),
+        sidebarChoice: value => void setSidebarChoice($, value),
       },
     )
   })
