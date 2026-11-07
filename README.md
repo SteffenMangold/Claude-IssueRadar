@@ -64,9 +64,9 @@ opens it any time.
 ## 🧭 What you see
 
 <p align="center">
-  <img src="docs/images/issues-pane.png" width="360" alt="The Issues pane in the Claude desktop app: one repository section with its open issues, each with label chips, age, comment count, an AI recap and the actions GitHub, Work on it (Bearbeiten) and Take it here (Hier übernehmen)">
+  <img src="docs/images/issues-pane.png" width="480" alt="The Issues pane in the Claude desktop app: two repository sections, one without open issues and with its recently closed fold, one with eight open issues, each with its triage gaps, label chips, age, comment count, an AI recap and the actions GitHub, Work on it (Bearbeiten), Take it here (Hier übernehmen) and the start options (Startoptionen); the start form of one issue is open">
 </p>
-<p align="center"><sub>The screenshot shows the pane of 0.1; the table below describes 0.2.0.</sub></p>
+<p align="center"><sub>The pane of 0.2.0, with the start form (Startoptionen) of one issue open.</sub></p>
 
 | Part | What it does |
 |---|---|
