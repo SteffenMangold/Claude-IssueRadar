@@ -5,7 +5,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, PromptAutocompleteSuggestion, PromptSubmitInput, Register, RenderSurface, Timer, TurnCompleteReason } from 'claude-code'
 
-import type { Attached, AttachedRecord, Boards, CloseReason, ClosedCache, DoneMapping, DraftSource, Filter, ForkState, Glimpse, Inbox, IssueDetails, IssueDraft, IssueMeta, IssueRow, Language, Mapping, Options, PendingWrite, PhaseActivity, PhaseAsk, PhaseRecord, PrRecord, PreviousAttempt, Recap, RepoCache, RepoInfo, RepoLabels, RepoSettings, RepoState, RowEditor, Section, SeenRecord, SelfIssue, SessionLive, SidebarChoice, StartChoice, StartFacts, StartForm, Todo, Triage, WriteOutcome } from '../types'
+import type { Attached, AttachedRecord, Boards, CloseReason, ClosedCache, DoneMapping, DraftSource, Filter, ForkState, Glimpse, Inbox, InboxRow, IssueDetails, IssueDraft, IssueMeta, IssueRow, Language, Mapping, Options, PendingWrite, PhaseActivity, PhaseAsk, PhaseRecord, PrRecord, PreviousAttempt, Recap, RepoCache, RepoInfo, RepoLabels, RepoSettings, RepoState, RowEditor, Section, SeenRecord, SelfIssue, SessionLive, SidebarChoice, StartChoice, StartFacts, StartForm, Todo, Triage, WriteOutcome } from '../types'
 import { FIX_LINE, MARKER, branchName, renderBackground, renderBrief, sessionName, sessionTitle, spikeBrief } from './brief'
 import type { BriefOptions } from './brief'
 import { asClosedCache, closedRecord, isClosedDue, listClosed, sinceDate } from './closed'
@@ -384,8 +384,15 @@ let writing = false
 const editorDrafts = new Map<string, string>()
 /** E16: the new issue's title and body as typed, for the draft of that id; Review commits them into the draft. */
 let draftTyped: { id: string; title?: string; body?: string } = { id: '' }
-/** E16: a draft's model call in flight (one at a time). */
-let isDrafting = false
+/**
+ * E16: the form whose draft's model call is in flight (one per form; B7-BEH-6). A discard lets it go, so a new form's
+ * sources work at once; the late reply of the discarded one is dropped by its id (E16-1).
+ */
+let draftingId = ''
+/** E16: counts the forms opened, so each has its own id even within one millisecond (E16-1). */
+let draftSeq = 0
+/** E16 (B7-BEH-3): `/issue-radar new` came before any repository listed: the next refresh that lists opens the form. */
+let draftOnList = false
 /** When the owner last touched an editor or the new issue's form: they hold the timed refresh for FORM_HOLD_MS at most (F X-1). */
 let writeTouchedAt = Number.NEGATIVE_INFINITY
 /** X-1 (2): the refresh a tool or an attach asked for while the owner typed; it runs once the field closes. */
@@ -1298,7 +1305,11 @@ async function readSessionPrs($: EngineInterface, wanted: ReadonlyArray<[string,
       await update($, sessionPrs, had => {
         const next = { ...had }
         // The session it was read for goes with it: the row draws it only while its mapping still names that session.
-        if (look.kind === 'pr') next[rowKey] = { ...look.pr, sessionId: mapping.sessionId }
+        // E19-2 (B7-BEH-2): when this pane first read it MERGED stands for its merge time until GraphQL gives that.
+        const was = had[rowKey]
+        const isSamePr = was !== undefined && was.sessionId === mapping.sessionId && look.kind === 'pr' && was.number === look.pr.number
+        const mergedSeenAt = isSamePr && was.state === 'MERGED' ? (was.mergedSeenAt ?? now) : now
+        if (look.kind === 'pr') next[rowKey] = { ...look.pr, sessionId: mapping.sessionId, ...(look.pr.state === 'MERGED' ? { mergedSeenAt } : {}) }
         else delete next[rowKey]
 
         return next
@@ -1332,15 +1343,16 @@ async function adoptSettingsKey($: EngineInterface, key: string): Promise<void> 
 }
 
 async function refresh($: EngineInterface, options: Options, reason: Reason): Promise<void> {
-  if (isRunning) {
-    // The ask is kept with its reason (E7-2, E11-2): a ↻ pressed meanwhile still runs as the owner's press.
-    queuedReason = strongerReason(queuedReason, reason)
+  // X-1 (2): a tool's or an attach's refresh redraws what the owner is typing into; it runs once the field closes. Asked
+  // first: the single-flight check and its claim below have no wait between them (R7-RT-2), so two never run at once.
+  if (reason === 'tool' && (await isTyping($, options))) {
+    deferredReason = strongerReason(deferredReason, reason)
 
     return
   }
-  // X-1 (2): a tool's or an attach's refresh redraws what the owner is typing into; it runs once the field closes.
-  if (reason === 'tool' && (await isTyping($, options))) {
-    deferredReason = strongerReason(deferredReason, reason)
+  if (isRunning) {
+    // The ask is kept with its reason (E7-2, E11-2): a ↻ pressed meanwhile still runs as the owner's press.
+    queuedReason = strongerReason(queuedReason, reason)
 
     return
   }
@@ -1541,8 +1553,17 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     // E20 (B-E20-7): a start form whose row left the list, or whose issue got a session meanwhile (another pane), closes.
     const form = await read($, startForm)
     if (form !== null && (!live.has(form.rowKey) || known[form.rowKey] !== undefined)) await closeForm($, form.rowKey)
-    // Batch 7: an editor or a waiting card whose row left goes; so does a card nobody confirmed in time (X-4).
-    await settleWrites($, live, now)
+    // Batch 7: an editor or a waiting card whose row left goes; so does a card nobody confirmed in time (X-4). A row a
+    // filter only hides is still in its repository's default list (R7-INT-4).
+    const hidden = new Set<string>()
+    for (const section of nextSections) {
+      if (!isFilteredList(section)) continue
+      for (const row of cachedLists.get(section.key) ?? []) {
+        const rowKey = rowKeyOf(section.key, row.number)
+        if (overlay.get(rowKey)?.isClosed !== true) hidden.add(rowKey)
+      }
+    }
+    await settleWrites($, live, hidden, now)
     // E5: each repository's baseline, before its rows are drawn, so a row is drawn with its mark from the start; the
     // glimpses whose hold has passed go into the baselines (R3-INT-3: a glimpse of a row no longer listed is kept, so
     // a row that leaves the list and comes back keeps its fade; written only when one faded, every write redraws).
@@ -1594,6 +1615,12 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
       if (await isPaneOpen($)) void $.ui.close({ id: PANE }).catch(() => undefined)
 
       return
+    }
+    // E16 (B7-BEH-3): `/issue-radar new` came before anything listed (a fresh session, an issue session that stood down):
+    // the form opens now that the repositories listed; when none can take an issue, the refresh's toast says so.
+    if (draftOnList) {
+      draftOnList = false
+      if (!(await openDraft($, options, false))) offerToast('failure', strings(options.language).draftNoTarget)
     }
     await hydrate($, options, nextSections, now, isShown)
     // E5-c: an update the owner made by their own comment is no news to them.
@@ -2575,15 +2602,16 @@ async function toggleRow($: EngineInterface, options: Options, rowKey: string): 
   if (now !== rowKey) return
   // E5: opening a row acknowledges it.
   await acknowledgeRow($, options, rowKey)
-  // E19: the write bar names the owner's own assignment (Mir zuweisen / Abgeben): the signed-in account, once per host.
-  if (options.writes) await ensureViewer($, options, rowKey.split('/')[0] ?? 'github.com')
   const have = (await read($, details))[rowKey]
   // A seeded entry has no body or comments: fetch them for the opened row.
-  if (have !== undefined && have.fetchedAt !== 0) return
-  const hash = rowKey.lastIndexOf('#')
-  const found = findRow(await read($, sections), rowKey.slice(0, hash), Number(rowKey.slice(hash + 1)))
-  if (found === null) return
-  await hydrateOne($, options, found.section, found.row, await $.clock.now(), true)
+  if (have === undefined || have.fetchedAt === 0) {
+    const hash = rowKey.lastIndexOf('#')
+    const found = findRow(await read($, sections), rowKey.slice(0, hash), Number(rowKey.slice(hash + 1)))
+    if (found !== null) await hydrateOne($, options, found.section, found.row, await $.clock.now(), true)
+  }
+  // E19: the write bar names the owner's own assignment (Mir zuweisen / Abgeben): the signed-in account, once per host,
+  // asked after the body and comments, so the opened row never waits for it (R7-RT-5).
+  if (options.writes) await ensureViewer($, options, rowKey.split('/')[0] ?? 'github.com')
 }
 
 // E14: the filter ------------------------------------------------------------
@@ -2989,13 +3017,13 @@ async function announceArrivals($: EngineInterface, options: Options, current: r
  * comment): its mark goes at once, the session's baseline and the stored record take its update time. `newest` stays,
  * so an older issue they have not seen stays new.
  */
-async function acknowledgeRow($: EngineInterface, options: Options, rowKey: string): Promise<void> {
+async function acknowledgeRow($: EngineInterface, options: Options, rowKey: string, given?: IssueRow): Promise<void> {
   const hash = rowKey.lastIndexOf('#')
   const sectionKey = rowKey.slice(0, hash)
-  const found = findRow(await read($, sections), sectionKey, Number(rowKey.slice(hash + 1)))
+  // `given`: the row as GitHub said it a moment ago, for one the list does not hold (a new issue under a filter, E16).
+  const row = given ?? findRow(await read($, sections), sectionKey, Number(rowKey.slice(hash + 1)))?.row
   const base = (await read($, seenBase))[sectionKey]
-  if (found === null || base === undefined) return
-  const row = found.row
+  if (row === undefined || base === undefined) return
   const now = await $.clock.now()
   await serialSeen(() => writeAcknowledged($, storeKeyOf('seen:', sectionKey), base, row, now))
   // The baseline changes only when it did not hold the row as it stands (every write redraws the pane).
@@ -4402,6 +4430,8 @@ function failureText(S: Strings, verdict: WriteVerdict, repo: string, host: stri
       return S.rateLimited
     case 'offline':
       return S.offline
+    case 'reloaded':
+      return S.writeReloaded
     default:
       return S.writeFailed(clean(verdict.detail ?? verdict.kind))
   }
@@ -4428,8 +4458,12 @@ async function confirmWrite($: EngineInterface, options: Options, id: string): P
       return
     }
     if (card.kind === 'develop' && !(await recheckLink($, options, card))) return
+    // The card is claimed only while it still waits as it was read: a Cancel, a refresh that cleared it or another
+    // Review that replaced it meanwhile (E15's re-check takes seconds) runs nothing (R7-RT-1). Every get of one dispatch
+    // reads one moment, so the claim's own result decides, not a second read.
     const running: PendingWrite = { ...card, phase: 'running' }
-    await update($, pendingWrite, current => (current !== null && current.id === id ? running : current))
+    const claimed = await update($, pendingWrite, current => (current !== null && current.id === id && current.phase === 'confirm' ? running : current))
+    if (claimed === null || claimed.id !== id || claimed.phase !== 'running') return
     isClaimed = true
     const run = await runWrite($, card)
     await writeStore($, 'debug:lastWrite', {
@@ -4514,16 +4548,28 @@ async function afterRowWrite($: EngineInterface, options: Options, card: Pending
   }
   const { row: seen, details: fresh } = viewed.read
   if (fresh.state.toUpperCase() !== 'OPEN') {
+    await closeForm($, rowKey)
+    await retireMapping($, rowKey, (await read($, mappings))[rowKey])
+    closedNudge.add(sectionKey)
+    // E11: a closed issue leaves 'Mir zugewiesen' too (the inbox's search runs every 15 minutes at most).
+    await patchInbox($, rowKey, null, 0)
+    // E19-3: gh found the issue closed already and sent no closing comment. The text is not lost: the row stays (until a
+    // list drops it) with a comment editor holding it, so Prüfen can still send it to the closed issue.
+    const comment = hasComment ? (card.argv[card.argv.indexOf('--comment') + 1] ?? '') : ''
+    if (card.kind === 'close' && run.verdict.kind === 'already-closed' && comment !== '') {
+      editorDrafts.clear()
+      await touchWrite($)
+      await update($, editor, (): RowEditor => ({ rowKey, kind: 'comment', add: [], remove: [], reason: 'completed', prefill: comment, message: S.closedKeepComment }))
+      await fail(S.doneAlreadyClosedNoComment(number))
+
+      return
+    }
     // Gone from the list (and from the next lists, which lag, X-6), its session kept for the closed row (E22-b).
     overlay.set(rowKey, { at: now, sectionKey, isClosed: true })
     await update($, sections, current => current.map(section => (section.key === sectionKey ? { ...section, rows: section.rows.filter(row => row.number !== number) } : section)))
-    await closeForm($, rowKey)
     await dropEditor($, rowKey)
-    await retireMapping($, rowKey, (await read($, mappings))[rowKey])
-    closedNudge.add(sectionKey)
     // Another write on an issue closed meanwhile still says what it did; the row goes either way.
-    const text =
-      card.kind !== 'close' ? doneText(S, card.kind) : run.verdict.kind === 'already-closed' ? (hasComment ? S.doneAlreadyClosedNoComment(number) : S.doneAlreadyClosed(number)) : S.doneClose(number)
+    const text = card.kind !== 'close' ? doneText(S, card.kind) : run.verdict.kind === 'already-closed' ? S.doneAlreadyClosed(number) : S.doneClose(number)
     await setOutcome($, { target: rowKey, kind: card.kind, ok: true, text, at: now })
     $.ui.toast(clean(text), { timeoutMs: 6_000 })
 
@@ -4536,6 +4582,11 @@ async function afterRowWrite($: EngineInterface, options: Options, card: Pending
     overlay.set(rowKey, { at: now, sectionKey, row: patched })
     await update($, sections, current => current.map(section => (section.key === sectionKey ? { ...section, rows: section.rows.map(row => (row.number === number ? patched : row)) } : section)))
     await update($, details, current => ({ ...current, [rowKey]: { ...compactDetails(fresh), updatedAt: patched.updatedAt } }))
+    // E5: the owner's own write is no news to them (as their new issue is not): the row is acknowledged at its new time,
+    // so it carries no mark, the unread count and the title stay (R7-INT-2).
+    await acknowledgeRow($, options, rowKey)
+    // E11: an assignment the owner made or gave up shows in 'Mir zugewiesen' at once (R7-INT-5).
+    await patchInbox($, rowKey, patched, fresh.commentCount)
   }
   const isChanged = before === undefined || fresh.commentCount !== before.commentCount || seen.updatedAt > (found?.row.updatedAt ?? '')
   if (card.kind === 'close') {
@@ -4557,21 +4608,56 @@ async function afterRowWrite($: EngineInterface, options: Options, card: Pending
   await setOutcome($, { target: rowKey, kind: card.kind, ok: true, text: doneText(S, card.kind), at: now })
 }
 
+/**
+ * E11 after a write (R7-INT-5): the issue as GitHub said it a moment ago goes into 'Mir zugewiesen' or out of it, so the
+ * section does not wait for its next search: out when it closed (`row` null) or the signed-in account is no longer among
+ * its assignees, in (first, the most recently updated) when it now is. Nothing while the section shows another host or
+ * has not listed, or while the account is unknown (then nobody can tell).
+ */
+async function patchInbox($: EngineInterface, rowKey: string, row: IssueRow | null, commentCount: number): Promise<void> {
+  const host = rowKey.split('/')[0] ?? 'github.com'
+  const repo = repoOfKey(rowKey).toLowerCase()
+  const number = numberOfRow(rowKey)
+  const had = await read($, inbox)
+  if (had.host !== host || had.fetchedAt === null) return
+  const login = row === null ? undefined : (await viewersOf($))[host]
+  if (row !== null && login === undefined) return
+  const isMine = row !== null && login !== undefined && row.assignees.some(name => name.toLowerCase() === login.toLowerCase())
+  const isSame = (found: InboxRow) => found.number === number && found.repo.toLowerCase() === repo
+  if (!isMine && !had.rows.some(isSame)) return
+  await update($, inbox, current => {
+    if (current.host !== host) return current
+    if (!isMine || row === null) return { ...current, rows: current.rows.filter(found => !isSame(found)) }
+    const entry: InboxRow = { host, repo: repoOfKey(rowKey), number, title: row.title, url: row.url, createdAt: row.createdAt, updatedAt: row.updatedAt, commentCount, labels: row.labels }
+
+    return { ...current, rows: current.rows.some(isSame) ? current.rows.map(found => (isSame(found) ? entry : found)) : [entry, ...current.rows] }
+  })
+}
+
 /** What a row's write did, in the pane's words. */
 function doneText(S: Strings, kind: PendingWrite['kind']): string {
   return kind === 'comment' ? S.doneComment : kind === 'labels' ? S.doneLabels : kind === 'assign' ? S.doneAssign : kind === 'unassign' ? S.doneUnassign : S.doneLabels
 }
 
 /**
- * X-5: nothing of a fresh module is in flight. A card a reload left running reads as unclear (the next refresh shows
- * the state), a preparation's busy mark and a start's mark go, a draft that was being drafted failed.
+ * X-5: nothing of a fresh module is in flight. A card a reload left running says so: whether it reached GitHub is
+ * unclear (B7-BEH-5). A row's write is read once more, as an ambiguous run is, and the read decides; a new issue's form
+ * stays with its text but asks to look on GitHub before filing it again (it may be filed already); the next refresh shows
+ * the rest. A preparation's busy mark and a start's mark go, a draft that was being drafted failed.
  */
 async function settleStaleWork($: EngineInterface, options: Options): Promise<void> {
   const S = strings(options.language)
   const card = await read($, pendingWrite)
   if (card !== null && card.phase === 'running') {
     await update($, pendingWrite, () => null)
-    await setOutcome($, { target: card.target, kind: card.kind, ok: false, text: S.writeUnknown, at: await $.clock.now() })
+    await setOutcome($, { target: card.target, kind: card.kind, ok: false, text: S.writeReloaded, at: await $.clock.now() })
+    if (card.kind === 'create') {
+      await update($, draft, current => (current !== null && card.target === `create:${current.repoKey}` ? { ...current, message: S.draftCheckGitHub } : current))
+    } else if (card.kind !== 'develop') {
+      // Not awaited: the start goes on; the read's outcome replaces the line above once it answers.
+      const reloaded: WriteRun = { exitCode: null, stdout: '', stderr: '', verdict: { kind: 'reloaded' }, isAmbiguous: true }
+      void afterRowWrite($, options, card, reloaded).catch(() => undefined)
+    }
     schedule($, options, 1_500, 'manual')
   }
   if (Object.keys(await read($, busy)).length > 0) await update($, busy, () => ({}))
@@ -4638,6 +4724,20 @@ function editorKey(rowKey: string, field: string): string {
   return `${rowKey}\u0000${field}`
 }
 
+/**
+ * X-1 (1): the editor's typing folded into its seeds (the comment or the closing comment into `prefill`, the duplicate
+ * field into `duplicateOf`) by every handler that writes the editor while its fields are drawn, so a redraw draws the
+ * text as typed and the field shows what Review would send (B7-BEH-7). The same editor when nothing changes.
+ */
+function foldEditorTyped(current: RowEditor): RowEditor {
+  const field = current.kind === 'comment' ? 'comment' : current.kind === 'close' ? 'closeComment' : null
+  const typed = field === null ? undefined : editorDrafts.get(editorKey(current.rowKey, field))
+  const duplicate = current.kind === 'close' ? editorDrafts.get(editorKey(current.rowKey, 'duplicateOf')) : undefined
+  if ((typed === undefined || typed === current.prefill) && (duplicate === undefined || duplicate === current.duplicateOf)) return current
+
+  return { ...current, ...(typed === undefined ? {} : { prefill: typed }), ...(duplicate === undefined ? {} : { duplicateOf: duplicate }) }
+}
+
 /** Opens an editor under a row (one per pane; the start form closes, plan 4.6); the same one pressed again closes. */
 async function openEditor($: EngineInterface, options: Options, rowKey: string, kind: RowEditor['kind']): Promise<void> {
   if (!options.writes) return
@@ -4681,15 +4781,15 @@ async function editRowLabel($: EngineInterface, rowKey: string, name: string, is
     if (isAdd && !has) add.push(name)
     if (!isAdd && has) remove.push(name)
 
-    return { ...current, add, remove, message: undefined }
+    return { ...foldEditorTyped(current), add, remove, message: undefined }
   })
 }
 
-/** The close editor's reason. */
+/** The close editor's reason; what was typed into its fields stays drawn (X-1 (1)). */
 async function pickReason($: EngineInterface, rowKey: string, value: string): Promise<void> {
   await touchWrite($)
   const reason: CloseReason = value === 'not planned' || value === 'duplicate' ? value : 'completed'
-  await update($, editor, current => (current === null || current.rowKey !== rowKey ? current : { ...current, reason, message: undefined }))
+  await update($, editor, current => (current === null || current.rowKey !== rowKey ? current : { ...foldEditorTyped(current), reason, message: undefined }))
 }
 
 /**
@@ -4707,7 +4807,7 @@ async function reviewEditor($: EngineInterface, options: Options, rowKey: string
   const info = found.section.info
   const number = found.row.number
   const spec = repoSpec(info)
-  const say = (message: string) => update($, editor, had => (had === null || had.rowKey !== rowKey ? had : { ...had, message }))
+  const say = (message: string) => update($, editor, had => (had === null || had.rowKey !== rowKey ? had : { ...foldEditorTyped(had), message }))
   const kinds = (text: string) => scanSecrets(text).map(kind => S.secretKinds[kind] ?? kind)
   if (current.kind === 'comment') {
     const text = sanitizeText(editorDrafts.get(editorKey(rowKey, 'comment')) ?? current.prefill ?? '').trim()
@@ -4871,6 +4971,14 @@ async function prepareLink($: EngineInterface, options: Options, rowKey: string)
   const found = findRow(await read($, sections), sectionOfRow(rowKey), numberOfRow(rowKey))
   if (code === null || mapping === undefined || found === null || found.section.info === null) return
   if (mapping.startedFrom !== myId || mapping.linkedBranch !== undefined || mapping.branchOnRemote === true || found.section.info.host !== code.host) return
+  // R7-INT-7: a pull request of the session (E3, the app's word) means its branch is on GitHub: no link (E15-1).
+  const sessionPr = (await read($, sessionPrs))[rowKey]
+  if (sessionPr !== undefined && sessionPr.sessionId === mapping.sessionId && sessionPr.number > 0) {
+    await markBranchPushed($, rowKey, mapping.sessionId)
+    await setOutcome($, { target: rowKey, kind: 'develop', ok: true, text: S.linkAlreadyPushed, at: await $.clock.now() })
+
+    return
+  }
   linkInFlight.add(rowKey)
   await setBusy($, `link:${rowKey}`, true)
   try {
@@ -4910,7 +5018,7 @@ async function prepareLink($: EngineInterface, options: Options, rowKey: string)
       secrets: [],
       warnings: isAncestor ? [] : [S.linkNotAncestor(base)],
       notes: [S.writeFetchNote],
-      expect: { branch, base, baseSha },
+      expect: { branch, base, baseSha, sessionId: mapping.sessionId },
     })
   } finally {
     linkInFlight.delete(rowKey)
@@ -4929,11 +5037,20 @@ async function recheckLink($: EngineInterface, options: Options, card: PendingWr
   const base = card.expect?.base
   if (code === null || branch === undefined || base === undefined) return true
   const now = await $.clock.now()
+  // E15-2: the row's mapping must still name the session whose branch the card shows (a fresh start, another pane's
+  // start since Review): another session's branch is never linked, nor kept on its mapping (B7-BEH-4).
+  const mapping = await reloadMapping($, card.target)
+  const sessionId = card.expect?.sessionId ?? mapping?.sessionId
+  if (mapping === undefined || mapping.sessionId !== sessionId) {
+    await update($, pendingWrite, current => (current !== null && current.id === card.id ? null : current))
+    await setOutcome($, { target: card.target, kind: 'develop', ok: false, text: S.linkSessionChanged, at: now })
+
+    return false
+  }
   const onGitHub = await remoteBranchTip($, code, branch)
   if ('stdout' in onGitHub && shaOf(onGitHub.stdout) !== null) {
     await update($, pendingWrite, current => (current !== null && current.id === card.id ? null : current))
-    const mapping = (await read($, mappings))[card.target]
-    if (mapping !== undefined) await markBranchPushed($, card.target, mapping.sessionId)
+    await markBranchPushed($, card.target, mapping.sessionId)
     await setOutcome($, { target: card.target, kind: 'develop', ok: true, text: S.linkAlreadyPushed, at: now })
 
     return false
@@ -4985,43 +5102,66 @@ async function afterDevelop($: EngineInterface, options: Options, card: PendingW
 
     return
   }
+  // E15-2: kept only on the mapping of the session whose branch it is (B7-BEH-4).
   const mapping = await reloadMapping($, rowKey)
-  if (mapping !== undefined && mapping.linkedBranch === undefined) await saveMapping($, rowKey, { ...mapping, linkedBranch: branch, linkedAt: now })
+  const sessionId = card.expect?.sessionId
+  if (mapping !== undefined && mapping.linkedBranch === undefined && (sessionId === undefined || mapping.sessionId === sessionId)) await saveMapping($, rowKey, { ...mapping, linkedBranch: branch, linkedAt: now })
   const text = !isListed ? S.writeVerifyFailed : run.exitCode === 0 ? S.doneDevelop(branch) : S.doneDevelopAfter(clean(firstLine(run.stderr)).slice(0, 160))
   await setOutcome($, { target: rowKey, kind: 'develop', ok: true, text, ...(code === null ? {} : { url: `${code.url}/tree/${branch.split('/').map(encodeURIComponent).join('/')}` }), at: now })
 }
 
 // E16: a new issue ------------------------------------------------------------------
 
-/** The section a new issue goes to by default: the checkout's when it lists, else the first that lists. */
+/**
+ * The repositories a new issue may go to: every one that lists and is not archived, whatever filter, search, sort or
+ * view the list shows (R7-INT-1: the target is the repository, not the rows it currently lists).
+ */
 function draftTargets(current: readonly Section[]): Section[] {
-  return current.filter(section => section.info !== null && section.state.kind === 'ok' && section.query === undefined && !section.info.isArchived)
+  return current.filter(section => section.info !== null && section.state.kind === 'ok' && !section.info.isArchived)
+}
+
+/** The form's own message (its target went, a press waited for a draft): only on the draft it was meant for. */
+async function sayInDraft($: EngineInterface, id: string, message: string): Promise<void> {
+  await update($, draft, had => (had === null || had.id !== id ? had : { ...foldDraftTyped(had), message }))
+}
+
+/**
+ * E16 (X-1 (1)): what the owner typed into the title and the body, folded into the draft's seeds by every handler that
+ * writes the draft while the fields are drawn, so a redraw draws the text as typed, whatever S16 turns out to be.
+ */
+function foldDraftTyped(current: IssueDraft): IssueDraft {
+  if (draftTyped.id !== current.id) return current
+
+  return { ...current, ...(draftTyped.title === undefined ? {} : { title: draftTyped.title }), ...(draftTyped.body === undefined ? {} : { body: draftTyped.body }) }
 }
 
 /**
  * `+` in the title bar (and `/issue-radar new`): the form opens with its target and sources; pressed again it closes
  * (E16-1: never a second draft over the first). It reads what costs nothing: the context's size, the owner's selection.
+ * False when no repository lists yet (the command then waits for the next list, B7-BEH-3).
  */
-async function openDraft($: EngineInterface, options: Options, isToggle: boolean): Promise<void> {
-  if (!options.writes) return
+async function openDraft($: EngineInterface, options: Options, isToggle: boolean): Promise<boolean> {
+  if (!options.writes) return false
   const current = await read($, draft)
   if (current !== null) {
     if (isToggle && current.phase !== 'drafting') await discardDraft($, options)
 
-    return
+    return true
   }
   const targets = draftTargets(await read($, sections))
   const target = targets.find(section => section.isCheckout) ?? targets[0]
-  if (target === undefined || target.info === null) return
+  if (target === undefined || target.info === null) return false
   const usage = await $.session.usage().catch(() => null)
   const selected = await $.ui.selection().catch(() => undefined)
   const text = (selected?.text ?? '').trim()
   const now = await $.clock.now()
   draftTyped = { id: '' }
+  draftSeq += 1
   await touchWrite($)
   await update($, todos, () => [])
   await update($, draft, (): IssueDraft => ({
-    id: `d${now}`,
+    // Unique per form: a form opened in the same millisecond as a discarded one never takes its late draft (E16-1).
+    id: `d${now}-${draftSeq}`,
     repoKey: target.key,
     phase: 'choose',
     source: null,
@@ -5040,12 +5180,16 @@ async function openDraft($: EngineInterface, options: Options, isToggle: boolean
     ...(Number.isFinite(lastTurnEndAt) && now - lastTurnEndAt > CACHE_COLD_MS ? { isCacheCold: true } : {}),
   }))
   if (canTriage(target.info)) await ensureLabels($, target.key)
+
+  return true
 }
 
 /** Verwerfen: the form goes with its typing, its TODOs and a card that waits for it; a draft in flight is dropped when it lands. */
 async function discardDraft($: EngineInterface, options: Options): Promise<void> {
   const current = await read($, draft)
   draftTyped = { id: '' }
+  // The discarded form's model call no longer holds a new form's sources (B7-BEH-6); its late reply is dropped by id.
+  draftingId = ''
   await update($, draft, () => null)
   await update($, todos, () => [])
   if (current !== null) await update($, pendingWrite, card => (card !== null && card.target === `create:${current.repoKey}` && card.phase === 'confirm' ? null : card))
@@ -5053,11 +5197,17 @@ async function discardDraft($: EngineInterface, options: Options): Promise<void>
 }
 
 /** The form's target: another repository that lists; its labels are read, the chosen ones dropped. */
-async function pickDraftRepo($: EngineInterface, repoKey: string): Promise<void> {
+async function pickDraftRepo($: EngineInterface, options: Options, repoKey: string): Promise<void> {
+  const S = strings(options.language)
   await touchWrite($)
   const target = draftTargets(await read($, sections)).find(section => section.key === repoKey)
-  if (target === undefined) return
-  await update($, draft, current => (current === null || current.phase === 'drafting' ? current : { ...current, repoKey, labels: [] }))
+  const open = await read($, draft)
+  if (target === undefined) {
+    if (open !== null) await sayInDraft($, open.id, S.draftNoTarget)
+
+    return
+  }
+  await update($, draft, current => (current === null || current.phase === 'drafting' ? current : { ...foldDraftTyped(current), repoKey, labels: [], message: undefined }))
   if (canTriage(target.info)) await ensureLabels($, repoKey)
 }
 
@@ -5068,14 +5218,14 @@ async function editDraftLabel($: EngineInterface, name: string, isAdd: boolean):
     if (current === null) return current
     const labels = current.labels.filter(found => found !== name)
 
-    return { ...current, labels: isAdd ? [...labels, name] : labels }
+    return { ...foldDraftTyped(current), labels: isAdd ? [...labels, name] : labels }
   })
 }
 
 /** ☐/☑ Mir zuweisen. */
 async function toggleDraftAssign($: EngineInterface): Promise<void> {
   await touchWrite($)
-  await update($, draft, current => (current === null ? current : { ...current, assignMe: !current.assignMe }))
+  await update($, draft, current => (current === null ? current : { ...foldDraftTyped(current), assignMe: !current.assignMe }))
 }
 
 /**
@@ -5086,9 +5236,13 @@ async function toggleDraftAssign($: EngineInterface): Promise<void> {
 async function draftIssue($: EngineInterface, options: Options, source: DraftSource, todo?: Todo): Promise<void> {
   const S = strings(options.language)
   const current = await read($, draft)
-  if (current === null || isDrafting || current.phase === 'drafting') return
+  if (current === null || current.phase === 'drafting') return
   const section = draftTargets(await read($, sections)).find(found => found.key === current.repoKey)
-  if (section === undefined || section.info === null) return
+  if (section === undefined || section.info === null) return void (await sayInDraft($, current.id, S.draftNoTarget))
+  // One model call per form (B7-BEH-6): a press of this form while its draft is under way says so; a discarded form's
+  // call holds nothing (discardDraft lets it go), and a blank draft or the TODO list call no model.
+  const isModelCall = source !== 'blank' && !(source === 'todo' && todo === undefined)
+  if (isModelCall && draftingId === current.id) return void (await sayInDraft($, current.id, S.drafting))
   const info = section.info
   const root = checkout?.root ?? (await $.session.root())
   await touchWrite($)
@@ -5108,12 +5262,13 @@ async function draftIssue($: EngineInterface, options: Options, source: DraftSou
 
     return
   }
-  isDrafting = true
+  draftingId = id
   try {
     await update($, draft, (had): IssueDraft | null => (had === null || had.id !== id ? had : { ...had, phase: 'drafting', source, message: undefined }))
     const consented = options.recaps && (await read($, settings)).consent[section.key] === true
     const allowed = consented && canTriage(info) ? await ensureLabels($, section.key) : []
-    const titles = consented ? section.rows.slice(0, TITLES_SENT).map(row => row.title) : []
+    // The repository's own titles: its default list, also while a filter shows other rows (E14).
+    const titles = consented ? (await defaultListOf($, section, section.key)).slice(0, TITLES_SENT).map(row => row.title) : []
     const result =
       source === 'todo' && todo !== undefined
         ? await draftFromTodo($, { root, todo, repo: repoLabel(info), allowed, titles, model: options.recapModel, permalink: await permalinkFor($, root, checkout?.info ?? null, todo) })
@@ -5128,7 +5283,7 @@ async function draftIssue($: EngineInterface, options: Options, source: DraftSou
       return { ...base, title: '', body: sanitizeText(result.raw).slice(0, BODY_MAX), labels: [], message: S.draftNotJson }
     })
   } finally {
-    isDrafting = false
+    if (draftingId === id) draftingId = ''
   }
 }
 
@@ -5153,7 +5308,7 @@ async function reviewDraft($: EngineInterface, options: Options, typedBody?: { i
   if (title.length > TITLE_MAX) return void (await say(S.draftTitleTooLong))
   if (body.length > BODY_MAX) return void (await say(S.draftBodyTooLong(BODY_MAX)))
   const section = draftTargets(await read($, sections)).find(found => found.key === current.repoKey)
-  if (section === undefined || section.info === null) return
+  if (section === undefined || section.info === null) return void (await say(S.draftNoTarget))
   const info = section.info
   const mayTriage = canTriage(info)
   await update($, draft, had => (had === null || had.id !== current.id ? had : { ...had, title, body, message: undefined }))
@@ -5199,24 +5354,33 @@ async function afterCreate($: EngineInterface, options: Options, card: PendingWr
       const row = viewed.read.row
       const rowKey = rowKeyOf(section.key, row.number)
       overlay.set(rowKey, { at: now, sectionKey: section.key, row, isNew: true })
-      await update($, sections, current => current.map(found => (found.key === section.key && !found.rows.some(had => had.number === row.number) ? { ...found, rows: [row, ...found.rows] } : found)))
+      // Into the default list only: a list under a filter shows what GitHub's search for it said (the overlay lays the
+      // new row into the default list again once the filter goes).
+      await update($, sections, current => current.map(found => (found.key === section.key && found.query === undefined && !found.rows.some(had => had.number === row.number) ? { ...found, rows: [row, ...found.rows] } : found)))
       await update($, details, current => ({ ...current, [rowKey]: compactDetails(viewed.read.details) }))
-      // ...and carries no mark: acknowledged as an opened row is.
-      await acknowledgeRow($, options, rowKey)
+      // ...and carries no mark: acknowledged as an opened row is (the row as read, listed or not).
+      await acknowledgeRow($, options, rowKey, row)
     }
   }
   await setOutcome($, { target: card.target, kind: 'create', ok: true, text: S.doneCreate(made.number), url: made.url, at: now })
   schedule($, options, 2_500, 'manual')
 }
 
-/** Batch 7 at the end of a refresh's list: an editor or a waiting card whose row left goes, a card past its time too (X-4). */
-async function settleWrites($: EngineInterface, live: ReadonlySet<string>, now: number): Promise<void> {
+/**
+ * Batch 7 at the end of a refresh's list: an editor or a waiting card whose row left goes, a card past its time too
+ * (X-4). A row a filter merely hides (`hidden`: in its repository's stored default list, not closed by this pane) has
+ * not left: its editor and its typing stay for when the filter goes (R7-INT-4).
+ */
+async function settleWrites($: EngineInterface, live: ReadonlySet<string>, hidden: ReadonlySet<string>, now: number): Promise<void> {
+  const isGone = (rowKey: string) => !live.has(rowKey) && !hidden.has(rowKey)
   const card = await read($, pendingWrite)
-  if (card !== null && card.phase === 'confirm' && ((!card.target.startsWith('create:') && !live.has(card.target)) || now - card.createdAt >= CONFIRM_TTL_MS)) {
+  if (card !== null && card.phase === 'confirm' && ((!card.target.startsWith('create:') && isGone(card.target)) || now - card.createdAt >= CONFIRM_TTL_MS)) {
     await update($, pendingWrite, current => (current !== null && current.id === card.id ? null : current))
   }
   const open = await read($, editor)
-  if (open !== null && !live.has(open.rowKey)) await dropEditor($, open.rowKey)
+  if (open !== null && isGone(open.rowKey)) await dropEditor($, open.rowKey)
+  // A hidden row's field is drawn afresh when the filter goes: it draws what was typed (X-1 (1)).
+  else if (open !== null && !live.has(open.rowKey)) await update($, editor, had => (had === null || had.rowKey !== open.rowKey ? had : foldEditorTyped(had)))
   await pruneOutcomes($)
 }
 
@@ -5306,6 +5470,8 @@ async function resetStore($: EngineInterface): Promise<void> {
   overlay.clear()
   editorDrafts.clear()
   draftTyped = { id: '' }
+  draftingId = ''
+  draftOnList = false
   viewerAsked.clear()
   deferredReason = null
   await update($, starting, () => ({}))
@@ -5441,8 +5607,9 @@ async function runCommand($: EngineInterface, options: Options, command: string,
   schedule($, options, 0)
   // E5: the owner's command is a look at the pane it opens.
   if (placed.isPlaced) await noteLook($, options).catch(() => undefined)
-  // E16: `new` only opens the new issue's form; a command's argument never writes (the model may run commands).
-  if (word === 'new') await openDraft($, options, false)
+  // E16: `new` only opens the new issue's form; a command's argument never writes (the model may run commands). Before
+  // any repository listed, the refresh just scheduled opens it once it has (B7-BEH-3).
+  if (word === 'new' && options.writes && !(await openDraft($, options, false))) draftOnList = true
 
   return { text: placed.isPlaced ? S.paneOpened : S.paneWaits(placed.reason) }
 }
@@ -5802,7 +5969,7 @@ export const register: Register = (on, given) => {
         },
         reviewDraft: typed => void reviewDraft($, options, typed),
         discardDraft: () => void discardDraft($, options),
-        draftRepo: repoKey => void pickDraftRepo($, repoKey),
+        draftRepo: repoKey => void pickDraftRepo($, options, repoKey),
         draftLabel: (name, isAdd) => void editDraftLabel($, name, isAdd),
         draftAssign: () => void toggleDraftAssign($),
       },

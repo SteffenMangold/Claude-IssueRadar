@@ -189,8 +189,8 @@ export type Setup = {
   sessionModel?: string
   /** The context window's input tokens `$.session.usage()` reports; absent by default (before the first response). */
   contextTokens?: number
-  /** What `$.model.fork` answers its prompt with (batch 7, E16); the default has nothing to fork. */
-  fork?: (prompt: string) => ModelForkResult
+  /** What `$.model.fork` answers its prompt with (batch 7, E16), at once or once the promise settles; the default has nothing to fork. */
+  fork?: (prompt: string) => ModelForkResult | Promise<ModelForkResult>
   /** The owner's selection `$.ui.selection()` answers; none by default. */
   selection?: string
   /** What `$.fs.read` answers for a path (undefined: a file that is not there); the default answers the manifest for any path. */
@@ -373,10 +373,10 @@ export function project(on: On, setup: Setup = {}): Project {
 
     return text === undefined ? { deny: `no such file: ${e.path}` } : { value: text }
   })
-  on('model.fork', (_, e) => {
+  on('model.fork', async (_, e) => {
     forks.push(e.prompt)
 
-    return { value: setup.fork === undefined ? { isAnswered: false, reason: 'nothing-to-fork' } : setup.fork(e.prompt) }
+    return { value: setup.fork === undefined ? { isAnswered: false, reason: 'nothing-to-fork' } : await setup.fork(e.prompt) }
   })
   on('ui.selection', () => ({ value: setup.selection === undefined ? undefined : { text: setup.selection } }))
   on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))

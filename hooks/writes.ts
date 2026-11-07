@@ -82,8 +82,8 @@ export function redactArgv(argv: readonly string[]): string[] {
   return argv.map((arg, index) => (index > 0 && TEXT_FLAGS.has(argv[index - 1] ?? '') ? `<${arg.length} chars>` : arg))
 }
 
-/** What a write came to, as gh's exit and words say. */
-export type WriteVerdict = { kind: 'ok' | 'already-closed' | 'no-permission' | 'old-gh' | RepoStateKind; detail?: string }
+/** What a write came to, as gh's exit and words say; `reloaded`: a hot reload came while gh ran, nobody saw its answer (X-5, B7-BEH-5). */
+export type WriteVerdict = { kind: 'ok' | 'already-closed' | 'no-permission' | 'old-gh' | 'reloaded' | RepoStateKind; detail?: string }
 
 /**
  * gh's answer to a write: exit 0 is done (an issue that was already closed says so, exit 0 still), exit 4 signed out, a
@@ -179,14 +179,17 @@ export function canPush(info: Pick<RepoInfo, 'permission'> | null | undefined): 
 /**
  * The merged pull request a still open issue could be closed for (E19 part C), or null: none for an issue someone
  * reopened (E19-2: on purpose), none while a pull request merged into the default branch less than five minutes ago
- * (GitHub closes the issue itself; the list lags behind), the session's own first (the links come ranked).
+ * (GitHub closes the issue itself; the list lags behind), the session's own first (the links come ranked). An unknown
+ * base counts as the default branch and an unknown merge time as just now (B7-BEH-2): only a merge known to be older, or
+ * known to go elsewhere, is offered.
  */
 export function closeoutOf(links: readonly ShownPr[], row: Pick<IssueRow, 'stateReason'>, defaultBranch: string, now: number): ShownPr | null {
   if (row.stateReason === 'REOPENED') return null
   for (const pr of links) {
     if (pr.state !== 'MERGED') continue
     const merged = pr.mergedAt === undefined ? Number.NaN : Date.parse(pr.mergedAt)
-    if (pr.base === defaultBranch && Number.isFinite(merged) && now - merged < CLOSEOUT_QUIET_MS) continue
+    const isDefault = pr.base === undefined || pr.base === '' || pr.base === defaultBranch
+    if (isDefault && (!Number.isFinite(merged) || now - merged < CLOSEOUT_QUIET_MS)) continue
 
     return pr
   }

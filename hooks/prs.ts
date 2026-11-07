@@ -220,14 +220,18 @@ export function linksOf(record: PrRecord | undefined, number: number, details: I
   if (session !== undefined && now - session.at < SESSION_PR_STALE_MS && session.number > 0) {
     const repo = session.repo || repoOfPr(session.url) || sectionRepo
     const state: PrState | null = session.state === 'DRAFT' ? 'OPEN' : session.state === '' ? null : session.state
+    // E19-2 (B7-BEH-2): a merge only the app reported carries no time from GraphQL: when this pane first read it merged
+    // stands for it (its base stays unknown, which the close-out reads as the default branch), so the hold applies.
+    const seenMerged = state === 'MERGED' ? new Date(session.mergedSeenAt ?? session.at).toISOString() : undefined
     const own = shown.find(found => found.number === session.number && sameRepo(found.repo, repo))
     if (own !== undefined) {
       own.fromSession = true
       if (state !== null) own.state = state
       if (session.state === 'DRAFT') own.isDraft = true
       if (session.review !== null) own.review = session.review
+      if (seenMerged !== undefined && own.mergedAt === undefined) own.mergedAt = seenMerged
     } else {
-      shown.push({ number: session.number, url: session.url, repo, state, isDraft: session.state === 'DRAFT', review: session.review, checks: null, fromSession: true })
+      shown.push({ number: session.number, url: session.url, repo, state, isDraft: session.state === 'DRAFT', review: session.review, checks: null, fromSession: true, ...(seenMerged === undefined ? {} : { mergedAt: seenMerged }) })
       if (state !== 'CLOSED') total += 1
     }
   }

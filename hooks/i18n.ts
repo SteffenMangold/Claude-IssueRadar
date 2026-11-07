@@ -302,6 +302,7 @@ const DE = {
   secretKinds: { github: 'GitHub-Token', anthropic: 'Anthropic-Schlüssel', aws: 'AWS-Schlüssel', slack: 'Slack-Token', privateKey: 'privater Schlüssel', jwt: 'JWT', userPath: 'lokaler Pfad mit Benutzername' } as Record<string, string>,
   writeExpired: 'Bestätigung abgelaufen; bitte erneut prüfen.',
   writeUnknown: 'Ergebnis unklar; das Issue wurde neu gelesen, ohne Änderung.',
+  writeReloaded: 'Neu geladen, während der Schreibvorgang lief; ob er GitHub erreicht hat, ist unklar.',
   writeVerifyFailed: 'Gesendet; das Neulesen schlug fehl, die nächste Aktualisierung zeigt den Stand.',
   writeNoPermission: (repo: string) => `Keine Schreibrechte für ${repo}.`,
   writeOldGh: 'Diese gh-Version kennt den Befehl nicht (gh --version).',
@@ -343,6 +344,7 @@ const DE = {
   doneAlreadyClosed: (n: number) => `#${n} war schon geschlossen`,
   doneAlreadyClosedNoComment: (n: number) => `#${n} war schon geschlossen; der Abschlusskommentar wurde nicht gesendet`,
   doneCommentNotClosed: (detail: string) => `Kommentar gesendet, Schließen abgelehnt: ${detail}`,
+  closedKeepComment: 'Der Text steht noch hier: Prüfen sendet ihn als Kommentar zum geschlossenen Issue.',
   closeoutAction: 'Abschließen …',
   // E16: a new issue
   newIssue: 'Neues Issue',
@@ -369,6 +371,8 @@ const DE = {
   draftNotJson: 'Antwort ohne erkennbaren Entwurf; ihr Text steht in der Beschreibung.',
   draftEmptyChat: 'Noch kein Gespräch: leerer Entwurf.',
   draftReloaded: 'Neu geladen, während der Entwurf entstand.',
+  draftCheckGitHub: 'Neu geladen, während das Issue angelegt wurde; vielleicht ist es schon angelegt. Bitte erst auf GitHub nachsehen, dann erneut prüfen.',
+  draftNoTarget: 'Kein Repository der Liste nimmt gerade ein neues Issue an.',
   draftNoTitle: 'Bitte einen Titel angeben.',
   draftTitleTooLong: 'Titel zu lang (höchstens 256 Zeichen).',
   draftBodyTooLong: (max: number) => `Beschreibung zu lang (höchstens ${max} Zeichen).`,
@@ -390,6 +394,7 @@ const DE = {
   linkNotAncestor: (branch: string) => `Die Branch enthält origin/${branch} nicht: ihr erster Push gelingt erst nach einem Merge von origin/${branch}.`,
   linkAlreadyPushed: 'Die Branch ist schon auf GitHub; der Pull Request mit „Closes …“ verknüpft das Issue.',
   linkBaseMoved: (branch: string) => `origin/${branch} hat sich bewegt; bitte erneut prüfen.`,
+  linkSessionChanged: 'Die Zeile gehört inzwischen zu einer anderen Session; nichts verknüpft.',
 }
 
 const EN: typeof DE = {
@@ -686,6 +691,7 @@ const EN: typeof DE = {
   secretKinds: { github: 'GitHub token', anthropic: 'Anthropic key', aws: 'AWS key', slack: 'Slack token', privateKey: 'private key', jwt: 'JWT', userPath: 'local path with a user name' } as Record<string, string>,
   writeExpired: 'The confirmation expired; review it again.',
   writeUnknown: 'Outcome unclear; the issue was read again and shows no change.',
+  writeReloaded: 'Reloaded while the write ran; whether it reached GitHub is unclear.',
   writeVerifyFailed: 'Sent; reading it back failed, the next refresh shows the state.',
   writeNoPermission: (repo: string) => `No write access to ${repo}.`,
   writeOldGh: 'This gh version does not know the command (gh --version).',
@@ -727,6 +733,7 @@ const EN: typeof DE = {
   doneAlreadyClosed: (n: number) => `#${n} was already closed`,
   doneAlreadyClosedNoComment: (n: number) => `#${n} was already closed; the closing comment was not sent`,
   doneCommentNotClosed: (detail: string) => `Comment posted, closing refused: ${detail}`,
+  closedKeepComment: 'The text is still here: Review sends it as a comment on the closed issue.',
   closeoutAction: 'Close out …',
   // E16: a new issue
   newIssue: 'New issue',
@@ -753,6 +760,8 @@ const EN: typeof DE = {
   draftNotJson: 'The reply held no recognizable draft; its text is in the description.',
   draftEmptyChat: 'No conversation yet: blank draft.',
   draftReloaded: 'Reloaded while drafting.',
+  draftCheckGitHub: 'Reloaded while the issue was being filed: it may exist already. Check GitHub first, then review again.',
+  draftNoTarget: 'No repository in the list takes a new issue right now.',
   draftNoTitle: 'Please give a title.',
   draftTitleTooLong: 'Title too long (at most 256 characters).',
   draftBodyTooLong: (max: number) => `Description too long (at most ${max} characters).`,
@@ -774,6 +783,7 @@ const EN: typeof DE = {
   linkNotAncestor: (branch: string) => `The branch does not contain origin/${branch}: its first push works only after merging origin/${branch}.`,
   linkAlreadyPushed: "The branch is already on GitHub; the pull request's \"Closes …\" links the issue.",
   linkBaseMoved: (branch: string) => `origin/${branch} moved; review it again.`,
+  linkSessionChanged: 'The row belongs to another session now; nothing linked.',
 }
 
 export type Strings = typeof DE

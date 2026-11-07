@@ -3,7 +3,7 @@
 // E19's quick actions in the opened row and the close-out after a merge, E16's
 // new issue drafted from this conversation, a TODO or nothing, and E15's link of
 // the issue session's branch. Asserted on keys and argv.
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 import { DRAFT_SYSTEM, parseDraft, parseTodos, sourceLine, touchedFiles, transcriptExcerpt } from '../hooks/draft'
 import { TOOL_VIEW_FIELDS } from '../hooks/github'
@@ -31,7 +31,7 @@ import {
   scanSecrets,
   shellWord,
 } from '../hooks/writes'
-import type { Mapping, PrRecord, RepoSettings } from '../types'
+import type { Mapping, PrRecord, RepoSettings, SeenRecord } from '../types'
 import type { McpAnswer, McpCall, Project, Ran, Setup } from './harness'
 import { ISSUES, NOW, PANE, REPO, ROW_42, ROW_7, SECTION, TICK_MS, USAGE, command, count, graphAnswer, mcpText, op, project, ran, started } from './harness'
 
@@ -207,11 +207,12 @@ test('labels and assignment build their gh issue edit argv and patch the row fro
   await ui.unmount()
 })
 
-test('a close with a reason and a comment; an issue closed meanwhile leaves the list and says the comment was not sent', async ($, on) => {
+test('a close with a reason and a comment on an issue closed meanwhile keeps the text to send as a comment (E19-3); then the row leaves for good', async ($, on) => {
   const { runs, toasts, store } = project(on, {
     stored: { [`session:${ROW_42}`]: MAPPED },
     gh: args => {
       if (args[0] === 'issue' && args[1] === 'close') return ran('', 0, '! Issue acme/widgets#42 (Export fails for empty folders) is already closed\n')
+      if (args[0] === 'issue' && args[1] === 'comment') return ran('https://github.com/acme/widgets/issues/42#issuecomment-2\n')
       if (isFullView(args, 42)) return fullView(42, { state: 'CLOSED', stateReason: 'COMPLETED' })
 
       return undefined
@@ -231,9 +232,18 @@ test('a close with a reason and a comment; an issue closed meanwhile leaves the 
   await clock.advance(1_000)
   await ui.press({ key: 'confirm-write' })
   expect(writes(runs, 'issue', 'close')).toHaveLength(1)
-  expect(await ui.find({ key: `row:${ROW_42}` })).toBeUndefined()
   expect(store.get(`session:${ROW_42}`)).toBeUndefined()
   expect(toasts.at(-1)).toBe(DE.doneAlreadyClosedNoComment(42))
+  // gh sent no closing comment: the text stays, in a comment editor under the row (B7-BEH-8).
+  expect(await ui.find({ key: `row:${ROW_42}` })).toBeDefined()
+  expect((await ui.find({ key: `cmt:${ROW_42}` }))?.props['value']).toBe('Out of scope.')
+  expect(await textOf(ui, `editor:${ROW_42}`)).toContain(DE.closedKeepComment)
+  await ui.press({ key: `editor-review:${ROW_42}` })
+  expect(await codeOf(ui)).toBe('gh issue comment 42 -R acme/widgets --body-file -')
+  await clock.advance(1_000)
+  await ui.press({ key: 'confirm-write' })
+  expect(writes(runs, 'issue', 'comment')[0]?.init?.stdin).toBe('Out of scope.')
+  expect(await ui.find({ key: `row:${ROW_42}` })).toBeUndefined()
   // X-6: the next list, which still holds the issue (the search lags), does not bring the row back.
   await clock.advance(TICK_MS)
   expect(await ui.find({ key: `row:${ROW_42}` })).toBeUndefined()
@@ -806,6 +816,14 @@ test('the close-out, branch and draft helpers', () => {
   expect(closeoutOf([{ ...merged, base: 'release' }], {}, 'main', NOW)?.number).toBe(57)
   expect(closeoutOf([merged], { stateReason: 'REOPENED' }, 'main', NOW + 10 * 60_000)).toBeNull()
   expect(closeoutOf([{ ...merged, state: 'OPEN' }], {}, 'main', NOW + 10 * 60_000)).toBeNull()
+  // B7-BEH-2: an unknown base counts as the default branch, an unknown merge time as just now.
+  const plain = { number: 57, url: '', repo: 'a/b', state: 'MERGED' as const, isDraft: false, review: null, checks: null, fromSession: false }
+  const noBase = { ...plain, mergedAt: merged.mergedAt }
+  expect(closeoutOf([noBase], {}, 'main', NOW)).toBeNull()
+  expect(closeoutOf([noBase], {}, 'main', NOW + 5 * 60_000)?.number).toBe(57)
+  const noTime = { ...plain, base: 'main' }
+  expect(closeoutOf([noTime], {}, 'main', NOW + 60 * 60_000)).toBeNull()
+  expect(closeoutOf([{ ...noTime, base: 'release' }], {}, 'main', NOW)?.number).toBe(57)
   const porcelain = 'worktree D:/proj\nHEAD aaa\nbranch refs/heads/main\n\nworktree D:/wt\nHEAD bbb\nbranch refs/heads/claude/issue-42-x-7k2\n'
   expect(pickWorktreeBranch(porcelain, 'issue-42-x')).toBe('claude/issue-42-x-7k2')
   expect(pickWorktreeBranch(`${porcelain}\nworktree D:/wt2\nbranch refs/heads/issue-42-x-other\n`, 'issue-42-x')).toBeNull()
@@ -856,4 +874,430 @@ test('the layout counts the new issue form above the sections and an editor unde
   const withEditor = paneLayout({ ...pane, writeAt: ROW_42 }).tops
   expect((withDraft[0]?.top ?? 0) - (plain[0]?.top ?? 0)).toBe(headRows(false, false, false, false, true))
   expect((withEditor[1]?.top ?? 0) - (plain[1]?.top ?? 0)).toBeGreaterThan(0)
+})
+
+// The review of batch 7 ------------------------------------------------------------------
+
+test('a filter, a search or a sort keeps + and the new issue form working; the new row joins the default list only (R7-INT-1)', async ($, on) => {
+  const { runs } = project(on, {
+    gh: args => {
+      if (args[0] === 'issue' && args[1] === 'create') return ran('https://github.com/acme/widgets/issues/58\n')
+      if (isFullView(args, 58)) return fullView(58, { title: 'Export crash' })
+
+      return undefined
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: 'new-issue' })
+  await ui.press({ key: 'draft-src-blank' })
+  await ui.input({ key: 'draft-title', text: 'Export crash', kind: 'change' })
+  // The owner looks for a duplicate first: a sort alone makes every section a filtered list.
+  await ui.press({ key: 'filter' })
+  await ui.select({ key: 'filter-sort', value: 'oldest' })
+  await clock.advance(1_000)
+  expect(await ui.find({ key: 'new-issue' })).toBeDefined()
+  await ui.press({ key: 'draft-review' })
+  expect(await codeOf(ui)).toBe("gh issue create -R acme/widgets --title 'Export crash' --body-file -")
+  await clock.advance(1_000)
+  await ui.press({ key: 'confirm-write' })
+  expect(writes(runs, 'issue', 'create')).toHaveLength(1)
+  expect(await textOf(ui, `outcome:create:${SECTION}`)).toContain(DE.doneCreate(58))
+  // The filtered list shows what its search said; the default list takes the new issue, unmarked, once the filter goes.
+  expect(await ui.find({ key: `row:${SECTION}#58` })).toBeUndefined()
+  await ui.press({ key: 'filter-clear' })
+  await clock.advance(1_000)
+  expect(await ui.find({ key: `row:${SECTION}#58` })).toBeDefined()
+  expect(await ui.find({ key: `mark:${SECTION}#58` })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('Cancel pressed while Confirm asks GitHub again runs nothing (R7-RT-1)', async ($, on) => {
+  const base = linkSetup()
+  let hold: Promise<void> | null = null
+  let release: () => void = () => undefined
+  const { runs } = project(on, {
+    ...base,
+    gh: async args => {
+      if (hold !== null && args[0] === 'api' && args[1] === `repos/acme/widgets/git/ref/heads/${BRANCH}`) await hold
+
+      return base.gh?.(args)
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `act-link:${ROW_42}` })
+  await clock.advance(1_000)
+  hold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  await ui.press({ key: 'confirm-write' })
+  await clock.advance(10)
+  // The re-check is under way and the card still waits: the owner cancels.
+  await ui.press({ key: 'cancel-write' })
+  expect(await ui.find({ key: 'write-card' })).toBeUndefined()
+  release()
+  await clock.advance(1_000)
+  expect(writes(runs, 'issue', 'develop')).toHaveLength(0)
+  expect(await ui.find({ key: 'write-card' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test("the owner's own comment marks nothing: the row is acknowledged at its new time (R7-INT-2)", async ($, on) => {
+  const SEEN: SeenRecord = { v: 1, at: 1, newest: '2026-11-03T10:00:00Z', rows: { '42': '2026-11-05T09:00:00Z', '7': '2026-11-01T09:00:00Z' } }
+  const { store, titles } = project(on, {
+    stored: { [`seen:${SECTION}`]: SEEN },
+    gh: args => {
+      if (args[0] === 'issue' && args[1] === 'comment') return ran('https://github.com/acme/widgets/issues/42#issuecomment-1\n')
+      if (isFullView(args, 42)) return fullView(42, { updatedAt: '2026-11-06T12:00:01Z', comments: [{ author: { login: 'maintainer' }, createdAt: '2026-11-04T08:00:00Z', body: 'Can reproduce on main.' }, { author: { login: 'steffen' }, createdAt: '2026-11-06T12:00:01Z', body: 'Mine' }] })
+
+      return undefined
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  expect(await ui.find({ key: `mark:${ROW_42}` })).toBeUndefined()
+  await ui.press({ key: `row-title:${ROW_42}` })
+  await ui.press({ key: `act-comment:${ROW_42}` })
+  await ui.input({ key: `cmt:${ROW_42}`, text: 'Mine', kind: 'change' })
+  await ui.press({ key: `editor-review:${ROW_42}` })
+  await clock.advance(1_000)
+  await ui.press({ key: 'confirm-write' })
+  expect(await textOf(ui, `outcome:${ROW_42}`)).toContain(DE.doneComment)
+  expect(await ui.find({ key: `mark:${ROW_42}` })).toBeUndefined()
+  expect(await ui.find({ key: 'seen-all' })).toBeUndefined()
+  expect((store.get(`seen:${SECTION}`) as SeenRecord).rows['42']).toBe('2026-11-06T12:00:01Z')
+  // The next lists (the search still says the old time) mark nothing either; the title stays.
+  await clock.advance(5 * 60_000)
+  expect(await ui.find({ key: `mark:${ROW_42}` })).toBeUndefined()
+  expect(titles.at(-1)).toBe(DE.title)
+  await ui.unmount()
+})
+
+test("the session's own pull request merged as only the app says waits five minutes for its close-out too (B7-BEH-2)", async ($, on) => {
+  const record: PrRecord = { v: 1, fetchedAt: NOW - 60_000, asOf: '2026-11-05T09:00:00Z', rows: { '42': [{ number: 57, url: 'https://github.com/acme/widgets/pull/57', repo: 'acme/widgets', state: 'OPEN', isDraft: false, review: null, checks: null }] }, total: { '42': 1 } }
+  project(on, {
+    stored: { [`prs:${SECTION}`]: record, [`session:${ROW_42}`]: MAPPED },
+    mcp: call => (call.tool === 'get_status' ? mcpText(JSON.stringify({ pr: { number: 57, url: 'https://github.com/acme/widgets/pull/57', state: 'MERGED' } })) : mcpText('ok')),
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  expect(await textOf(ui, `prs:${ROW_42}`)).toContain(DE.prMerged)
+  expect(await ui.find({ key: `closeout:${ROW_42}` })).toBeUndefined()
+  await clock.advance(6 * 60_000)
+  await ui.press({ key: 'refresh' })
+  await clock.advance(1_000)
+  expect(await ui.find({ key: `closeout:${ROW_42}` })).toBeDefined()
+  await ui.unmount()
+})
+
+test('/issue-radar new before anything listed opens the form once the list is in (B7-BEH-3)', async ($, on) => {
+  project(on)
+  const clock = mock.clock(on, { now: NOW })
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  expect(await command($, 'issue-radar', 'new')).toBe(DE.paneOpened)
+  await clock.advance(2_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'draft-form' })).toBeDefined()
+  expect(await ui.find({ key: 'draft-src-blank' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('/issue-radar new in an issue session (its pane stood down) opens the form after the list (B7-BEH-3)', async ($, on) => {
+  const { argv } = project(on, { stored: { [`session:${ROW_42}`]: { ...MAPPED, sessionId: 'local_pane', startedFrom: 'local_other' } } })
+  const clock = await started($, on)
+  expect(count(argv, 'issue', 'list')).toBe(0)
+  expect(await command($, 'issue-radar', 'new')).toBe(DE.paneOpened)
+  await clock.advance(3_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'draft-form' })).toBeDefined()
+  await ui.unmount()
+})
+
+test("a branch link reviewed for one session is never linked once the row's mapping names another (B7-BEH-4)", async ($, on) => {
+  const { runs, store } = project(on, linkSetup())
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `act-link:${ROW_42}` })
+  expect(await codeOf(ui)).toContain('gh issue develop 42')
+  // Meanwhile the row was started afresh: its mapping names another session.
+  store.set(`session:${ROW_42}`, { ...MAPPED, sessionId: 'local_new', startedAt: NOW })
+  await clock.advance(1_000)
+  await ui.press({ key: 'confirm-write' })
+  expect(writes(runs, 'issue', 'develop')).toHaveLength(0)
+  expect(await textOf(ui, `outcome:${ROW_42}`)).toContain(DE.linkSessionChanged)
+  expect((store.get(`session:${ROW_42}`) as Mapping).linkedBranch).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a reload while a write runs says it is unclear; a new issue asks to look first, a row is read again (B7-BEH-5)', async ($, on) => {
+  const release: Record<string, () => void> = {}
+  const held = (verb: string) =>
+    new Promise<void>(resolve => {
+      release[verb] = resolve
+    })
+  const holds = { create: held('create'), comment: held('comment') }
+  project(on, {
+    gh: async args => {
+      if (args[0] === 'issue' && (args[1] === 'create' || args[1] === 'comment')) {
+        await holds[args[1] === 'create' ? 'create' : 'comment']
+
+        return ran(`https://github.com/acme/widgets/issues/${args[1] === 'create' ? '58' : '42#issuecomment-3'}\n`)
+      }
+      if (isFullView(args, 42)) return fullView(42, { updatedAt: '2026-11-06T12:00:02Z', comments: [{ author: { login: 'maintainer' }, createdAt: '2026-11-04T08:00:00Z', body: 'Can reproduce on main.' }, { author: { login: 'steffen' }, createdAt: '2026-11-06T12:00:02Z', body: 'Sent' }] })
+
+      return undefined
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: 'new-issue' })
+  await ui.press({ key: 'draft-src-blank' })
+  await ui.input({ key: 'draft-title', text: 'Export crash', kind: 'change' })
+  await ui.press({ key: 'draft-review' })
+  await clock.advance(1_000)
+  await ui.press({ key: 'confirm-write' })
+  await clock.advance(10)
+  // A hot reload runs session.start again while gh files the issue.
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(10)
+  expect(await textOf(ui, `outcome:create:${SECTION}`)).toContain(DE.writeReloaded)
+  expect(await textOf(ui, 'draft-form')).toContain(DE.draftCheckGitHub)
+  // (The kit keeps the module: the old run ends here, as a fresh module would never see.)
+  release['create']?.()
+  await clock.advance(10)
+
+  // A comment left running: the read after the reload finds it sent.
+  await ui.press({ key: `row-title:${ROW_42}` })
+  await ui.press({ key: `act-comment:${ROW_42}` })
+  await ui.input({ key: `cmt:${ROW_42}`, text: 'Sent', kind: 'change' })
+  await ui.press({ key: `editor-review:${ROW_42}` })
+  await clock.advance(1_000)
+  await ui.press({ key: 'confirm-write' })
+  await clock.advance(10)
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(10)
+  expect(await textOf(ui, `outcome:${ROW_42}`)).toContain(DE.doneComment)
+  release['comment']?.()
+  await clock.advance(10)
+  await ui.unmount()
+})
+
+test("a discarded draft's model call holds no new form: blank and chat work at once, the late reply is dropped (B7-BEH-6)", async ($, on) => {
+  let release: () => void = () => undefined
+  let calls = 0
+  const { forks } = project(on, {
+    fork: async () => {
+      calls += 1
+      if (calls === 1) {
+        await new Promise<void>(resolve => {
+          release = resolve
+        })
+
+        return { isAnswered: true, text: '{"title":"Late","body":"Old","labels":[]}', usage: USAGE }
+      }
+
+      return { isAnswered: true, text: '{"title":"Fresh","body":"New","labels":[]}', usage: USAGE }
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: 'new-issue' })
+  await ui.press({ key: 'draft-src-chat' })
+  await clock.advance(10)
+  expect(await textOf(ui, 'draft-form')).toContain(DE.drafting)
+  await ui.press({ key: 'draft-discard' })
+  await ui.press({ key: 'new-issue' })
+  await ui.press({ key: 'draft-src-blank' })
+  expect(await ui.find({ key: 'draft-title' })).toBeDefined()
+  await ui.press({ key: 'draft-discard' })
+  await ui.press({ key: 'new-issue' })
+  await ui.press({ key: 'draft-src-chat' })
+  await clock.advance(10)
+  expect(forks).toHaveLength(2)
+  expect((await ui.find({ key: 'draft-title' }))?.props['value']).toBe('Fresh')
+  release()
+  await clock.advance(10)
+  expect((await ui.find({ key: 'draft-title' }))?.props['value']).toBe('Fresh')
+  await ui.unmount()
+})
+
+test('a press in a form draws its fields with what was typed, not an older seed (B7-BEH-7)', async ($, on) => {
+  project(on, { gh: args => (args[0] === 'label' && args[1] === 'list' ? ran(JSON.stringify([{ name: 'bug', color: 'd73a4a' }])) : undefined) })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: 'new-issue' })
+  await ui.press({ key: 'draft-src-blank' })
+  // An empty seed draws no value.
+  expect((await ui.find({ key: 'draft-title' }))?.props['value']).toBeUndefined()
+  await ui.input({ key: 'draft-title', text: 'Export crash', kind: 'change' })
+  await ui.press({ key: 'draft-assign' })
+  expect((await ui.find({ key: 'draft-title' }))?.props['value']).toBe('Export crash')
+  await ui.press({ key: 'draft-discard' })
+
+  await ui.press({ key: `row-title:${ROW_42}` })
+  await ui.press({ key: `act-close:${ROW_42}` })
+  await ui.input({ key: `close-cmt:${ROW_42}`, text: 'First', kind: 'change' })
+  await ui.press({ key: `editor-review:${ROW_42}` })
+  await ui.press({ key: 'cancel-write' })
+  await ui.input({ key: `close-cmt:${ROW_42}`, text: 'Second', kind: 'change' })
+  await ui.select({ key: `close-reason:${ROW_42}`, value: 'not planned' })
+  expect((await ui.find({ key: `close-cmt:${ROW_42}` }))?.props['value']).toBe('Second')
+  await ui.unmount()
+})
+
+test("the session's branch is found in git's worktree list when the app names none (B7-BEH-9)", async ($, on) => {
+  const base = linkSetup()
+  const { runs } = project(on, {
+    ...base,
+    mcp: (call: McpCall): McpAnswer => {
+      if (call.tool === 'get_session' && call.args['session_id'] === 'self') return mcpText(JSON.stringify({ sessionId: 'local_pane', title: 'Pane' }))
+      if (call.tool === 'get_session') return mcpText(JSON.stringify({ sessionId: 'local_abc123', title: TITLE_42, state: 'idle' }))
+
+      return mcpText('ok')
+    },
+    git: args => (args[0] === 'worktree' ? ran(`worktree D:/proj\nHEAD aaa\nbranch refs/heads/main\n\nworktree D:/wt\nHEAD bbb\nbranch refs/heads/${BRANCH}\n`) : base.git?.(args)),
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `act-link:${ROW_42}` })
+  expect(runs.some(run => run.argv[0] === 'git' && run.argv[1] === 'worktree' && run.init?.cwd === 'D:\\proj')).toBe(true)
+  expect(await codeOf(ui)).toBe(`gh issue develop 42 -R acme/widgets --name ${BRANCH}`)
+  await ui.unmount()
+})
+
+test("an issue of a watched repository links the checkout's branch with --branch-repo (B7-BEH-9)", async ($, on) => {
+  const ROW_12 = 'github.com/acme/reports#12'
+  const branch = 'claude/issue-12-report-totals-ab12'
+  const reports = JSON.stringify({ ...(JSON.parse(REPO) as Row), nameWithOwner: 'acme/reports', url: 'https://github.com/acme/reports', viewerPermission: 'ADMIN' })
+  const listed = JSON.stringify([{ number: 12, title: 'Report totals', url: 'https://github.com/acme/reports/issues/12', createdAt: '2026-11-01T10:00:00Z', updatedAt: '2026-11-05T10:00:00Z', author: { login: 'x' }, labels: [], assignees: [], milestone: null, isPinned: false }])
+  const base = linkSetup()
+  project(on, {
+    ...base,
+    stored: { [SETTINGS]: { watch: ['acme/reports'], consent: {}, collapsed: {} }, [`session:${ROW_12}`]: { ...MAPPED, title: '#12 Report totals', branch: 'issue-12-report-totals' } },
+    mcp: (call: McpCall): McpAnswer => {
+      if (call.tool === 'get_session' && call.args['session_id'] === 'self') return mcpText(JSON.stringify({ sessionId: 'local_pane', title: 'Pane' }))
+      if (call.tool === 'get_session') return mcpText(JSON.stringify({ sessionId: 'local_abc123', title: '#12 Report totals', state: 'idle', branch }))
+
+      return mcpText('ok')
+    },
+    gh: args => {
+      if (args[0] === 'repo' && args.includes('acme/reports')) return ran(reports)
+      if (args[0] === 'issue' && args[1] === 'list' && args.includes('acme/reports')) return ran(listed)
+      if (args[0] === 'api' && args[1] === `repos/acme/widgets/git/ref/heads/${branch}`) return ran('', 1, 'gh: Not Found (HTTP 404)')
+
+      return base.gh?.(args)
+    },
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `act-link:${ROW_12}` })
+  expect(await codeOf(ui)).toBe(`gh issue develop 12 -R acme/reports --name ${branch} --branch-repo acme/widgets`)
+  await ui.unmount()
+})
+
+test('a write whose gh run gave no answer is decided by the read: sent, or unclear (B7-BEH-9)', async ($, on) => {
+  // GitHub holds one new comment: the first run's, which the second read finds again.
+  project(on, {
+    gh: args => {
+      if (args[0] === 'issue' && args[1] === 'comment') throw new Error('the process was killed')
+      if (isFullView(args, 42)) return fullView(42, { updatedAt: '2026-11-06T12:00:03Z', comments: [{ author: { login: 'maintainer' }, createdAt: '2026-11-04T08:00:00Z', body: 'Can reproduce on main.' }, { author: { login: 'steffen' }, createdAt: '2026-11-06T12:00:03Z', body: 'One' }] })
+
+      return undefined
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const comment = async (text: string) => {
+    await ui.press({ key: `act-comment:${ROW_42}` })
+    await ui.input({ key: `cmt:${ROW_42}`, text })
+    await clock.advance(1_000)
+    await ui.press({ key: 'confirm-write' })
+  }
+
+  await ui.press({ key: `row-title:${ROW_42}` })
+  await comment('One')
+  expect(await textOf(ui, `outcome:${ROW_42}`)).toContain(DE.doneComment)
+  // The read shows nothing new this time: unclear, and the editor stays.
+  await comment('Two')
+  expect(await textOf(ui, `outcome:${ROW_42}`)).toContain(DE.writeUnknown)
+  expect(await ui.find({ key: `editor:${ROW_42}` })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a search that hides the edited row keeps its editor and the typing (R7-INT-4)', async ($, on) => {
+  project(on, { gh: args => (args[0] === 'issue' && args[1] === 'list' && args.some(arg => arg.startsWith('--search=')) ? ran(JSON.stringify(LISTED.filter(row => row['number'] === 7))) : undefined) })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `row-title:${ROW_42}` })
+  await ui.press({ key: `act-comment:${ROW_42}` })
+  await ui.input({ key: `cmt:${ROW_42}`, text: 'Same as #', kind: 'change' })
+  await ui.press({ key: 'filter' })
+  await ui.input({ key: 'filter-search:0', text: 'dark' })
+  await clock.advance(1_000)
+  expect(await ui.find({ key: `row:${ROW_42}` })).toBeUndefined()
+  await ui.press({ key: 'filter-clear' })
+  await clock.advance(1_000)
+  expect(await ui.find({ key: `editor:${ROW_42}` })).toBeDefined()
+  expect((await ui.find({ key: `cmt:${ROW_42}` }))?.props['value']).toBe('Same as #')
+  await ui.press({ key: `editor-review:${ROW_42}` })
+  expect(await textOf(ui, 'write-stdin')).toBe('Same as #')
+  await ui.unmount()
+})
+
+test("giving an issue back takes it out of 'Mir zugewiesen' at once (R7-INT-5)", { options: { assignedToMe: true } }, async ($, on) => {
+  const search = JSON.stringify([{ repository: { name: 'widgets', nameWithOwner: 'acme/widgets' }, number: 7, title: 'Dark mode for the settings page', url: 'https://github.com/acme/widgets/issues/7', updatedAt: '2026-11-01T09:00:00Z', createdAt: '2026-10-01T10:00:00Z', commentsCount: 2, labels: [], isPullRequest: false }])
+  let isGivenBack = false
+  project(on, {
+    gh: args => {
+      if (args[0] === 'search' && args[1] === 'issues') return ran(search)
+      if (args[0] === 'api' && args[1] === 'user') return ran('steffen\n')
+      if (args[0] === 'issue' && args[1] === 'edit') {
+        isGivenBack = true
+
+        return ran('https://github.com/acme/widgets/issues/7\n')
+      }
+      if (isFullView(args, 7)) return fullView(7, { updatedAt: '2026-11-06T12:00:05Z', assignees: isGivenBack ? [] : [{ login: 'steffen' }] })
+
+      return undefined
+    },
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: 'section:inbox' })
+  expect(await ui.find({ key: `inbox-row:${ROW_7}` })).toBeDefined()
+  await ui.press({ key: `row-title:${ROW_7}` })
+  await ui.press({ key: `act-assign:${ROW_7}` })
+  await clock.advance(1_000)
+  await ui.press({ key: 'confirm-write' })
+  expect(await textOf(ui, `outcome:${ROW_7}`)).toContain(DE.doneUnassign)
+  expect(await ui.find({ key: `inbox-row:${ROW_7}` })).toBeUndefined()
+  await ui.unmount()
+})
+
+test("no link is offered while the app names the session's pull request (R7-INT-7)", async ($, on) => {
+  const base = linkSetup()
+  project(on, {
+    ...base,
+    mcp: (call: McpCall): McpAnswer => (call.tool === 'get_status' ? mcpText(JSON.stringify({ pr: { number: 57, url: 'https://github.com/acme/widgets/pull/57', state: 'OPEN' } })) : (base.mcp?.(call) as McpAnswer)),
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  expect(await ui.find({ key: `prs:${ROW_42}` })).toBeDefined()
+  expect(await ui.find({ key: `session-row:${ROW_42}` })).toBeDefined()
+  expect(await ui.find({ key: `act-link:${ROW_42}` })).toBeUndefined()
+  await ui.unmount()
 })

@@ -210,6 +210,8 @@ export type SessionPr = {
   at: number
   /** The session the app answered for: the row draws it only while its mapping names that session. */
   sessionId?: string
+  /** E19-2: when this pane first read it MERGED; stands for its merge time while GraphQL has not said it. */
+  mergedSeenAt?: number
 }
 
 export type IssueComment = { author: string; createdAt: string; body: string }
@@ -664,8 +666,8 @@ export type PendingWrite = {
   secrets: string[]
   warnings: string[]
   notes: string[]
-  /** E15: the branch the link names, and the tip of the base branch when the card was made (E15-1). */
-  expect?: { branch?: string; base?: string; baseSha?: string }
+  /** E15: the branch the link names, the tip of the base branch when the card was made (E15-1), and the session whose branch it is (E15-2). */
+  expect?: { branch?: string; base?: string; baseSha?: string; sessionId?: string }
   createdAt: number
   phase: 'confirm' | 'running'
 }

@@ -472,8 +472,10 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const mayClose = (section: Section, item: IssueRow): boolean => canTriage(section.info) || isSameName(item.author, loginOf(section))
   /** An Input's seed: drawn with it only when there is one (a Cancel of the card, a close-out, a draft). */
   const seed = (text: string | undefined): { value?: string } => (text === undefined ? {} : { value: clean(text) })
-  /** The repositories a new issue may go to: those that list (no filter, not archived). */
-  const draftTargets = state.sections.filter(section => section.info !== null && section.state.kind === 'ok' && section.query === undefined && !section.info.isArchived)
+  /** The repositories a new issue may go to: those that list and are not archived, whatever filter the list shows (R7-INT-1). */
+  const draftTargets = state.sections.filter(section => section.info !== null && section.state.kind === 'ok' && !section.info.isArchived)
+  /** A draft field's seed (X-1 (1)): drawn only when there is text, so an empty seed never draws over what is typed. */
+  const draftSeed = (text: string): { value?: string } => (text === '' ? {} : { value: clean(text) })
   const canDraft = canWrite && draftTargets.length > 0
 
   /** F0's outcome line under its row (or its section, for a new issue), for two minutes. */
@@ -1037,13 +1039,13 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     if (open.phase === 'drafting') parts.push(note(S.drafting, INK.muted))
     if (open.phase === 'edit' && card !== null) parts.push(confirmCard(card))
     if (open.phase === 'edit' && card === null && Input !== undefined) {
-      parts.push(<Input key="draft-title" label={S.draftTitleHint} value={clean(open.title)} submitLabel={S.formNoteKeep} onInput={value => actions.typeDraft(open.id, 'title', value)} onSubmit={value => actions.typeDraft(open.id, 'title', value)} />)
+      parts.push(<Input key="draft-title" label={S.draftTitleHint} {...draftSeed(open.title)} submitLabel={S.formNoteKeep} onInput={value => actions.typeDraft(open.id, 'title', value)} onSubmit={value => actions.typeDraft(open.id, 'title', value)} />)
       parts.push(
         <Input
           key="draft-body"
           rows={isRich ? 6 : 4}
           placeholder={S.draftBodyHint}
-          value={clean(open.body)}
+          {...draftSeed(open.body)}
           submitLabel={S.review}
           onInput={value => actions.typeDraft(open.id, 'body', value)}
           onSubmit={value => actions.reviewDraft({ id: open.id, value })}
@@ -1678,6 +1680,9 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     // E15: the session's branch, linked on GitHub by the pane that started it, on the desktop, once the branch is known
     // (the app named it, or the slug of an own worktree finds it) and while GitHub does not have it yet (E15-1).
     const isBranchKnown = (live !== undefined && live.sessionId === mapping.sessionId && live.branch !== null && live.branch !== '') || (mapping.branch !== undefined && (mapping.place ?? 'worktree') === 'worktree')
+    // R7-INT-7: a pull request of the session (E3, the app's word) means its branch is on GitHub already (E15-1).
+    const sessionPr = state.sessionPrs[key]
+    const hasSessionPr = sessionPr !== undefined && sessionPr.sessionId === mapping.sessionId && sessionPr.number > 0
     const offerLink =
       options.writes &&
       state.surface === 'desktop' &&
@@ -1691,6 +1696,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       section.info !== null &&
       section.info.host === checkoutInfo.host &&
       canPush(checkoutInfo) &&
+      !hasSessionPr &&
       isBranchKnown
 
     return (
