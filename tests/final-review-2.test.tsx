@@ -4,12 +4,12 @@
 // issues, the records of sessions a row knows as others, the permission prompt
 // in an issue session, and the reads a gh read, an attach or a collapsed
 // section no longer cause. Asserted on keys, argv and the store.
-import { expect, test } from 'claude-code/testing'
+import { expect } from 'claude-code/testing'
 
 import { strings } from '../hooks/i18n'
 import type { Mapping, PhaseRecord } from '../types'
 import type { Ran } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, count, graphAnswer, graphQuery, op, ops, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, count, graphAnswer, graphQuery, op, ops, project, ran, started, test, tick } from './harness'
 
 const DE = strings('de')
 const SETTINGS = `settings:${SECTION}`

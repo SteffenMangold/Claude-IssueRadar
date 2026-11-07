@@ -2,7 +2,7 @@
 // the background gate, mappings read per refresh and per click, GraphQL's
 // core, the missing-scope state, drawn text made safe, and two V1 fixes.
 import type { EngineInterface } from 'claude-code'
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock } from 'claude-code/testing'
 
 import { renderBrief } from '../hooks/brief'
 import { classify, scopeIn } from '../hooks/github'
@@ -14,7 +14,7 @@ import { clean, cleanLine } from '../hooks/text'
 import { prLine, prRefOf } from '../hooks/prs'
 import { offerToast, takeToast } from '../hooks/toasts'
 import type { McpAnswer } from './harness'
-import { ISSUES, NOW, PANE, REPO, ROW_42, SECTION, command, count, issueView, mcpText, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, REPO, ROW_42, SECTION, command, count, issueView, mcpText, project, ran, started, test, tick } from './harness'
 
 const MAPPED = { [`session:${ROW_42}`]: { sessionId: 'local_abc123', title: '#42 Export fails', startedAt: 1, startedFrom: 'local_pane', detached: true } }
 const DE = strings('de')

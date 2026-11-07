@@ -5,7 +5,7 @@
 // earlier attempts named in the brief, the adoption of a start without an id,
 // and E22-b's session line on a closed row. Asserted on keys and argv.
 import type { RenderSurface } from 'claude-code'
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock } from 'claude-code/testing'
 
 import { GO_LINE, renderBackground, renderBrief, spikeBrief } from '../hooks/brief'
 import { strings } from '../hooks/i18n'
@@ -14,7 +14,7 @@ import { entryOf, parseSessions, pressConsent, readOpenAnswer } from '../hooks/s
 import { asAttempts, rowBadge, stateFamily, withAttempt } from '../hooks/tracking'
 import type { IssueRow, Mapping, PhaseRecord, PreviousAttempt, RepoInfo, SeenRecord, SessionLive } from '../types'
 import type { Engine, McpAnswer, McpCall } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, mcpText, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, mcpText, project, ran, started, test, tick } from './harness'
 
 const DE = strings('de')
 const ROWS = JSON.parse(ISSUES) as Array<Record<string, unknown>>

@@ -3,7 +3,7 @@
 // GraphQL request per repository, the status strip, the opened row, the issue
 // session's pull request through the app), and E17's relations (chips, the
 // opened row, the brief's issue tree, the fallback when the fields fail).
-import { expect, test } from 'claude-code/testing'
+import { expect } from 'claude-code/testing'
 
 import { TREE_BLOCKED, TREE_EPIC, renderBrief, renderTree, treeTitle } from '../hooks/brief'
 import { LIST_FIELDS, LIST_RELATIONS, TREE_FIELDS, VIEW_FIELDS, parseGraphDetails, parseGraphRow, parseRelations, refOf, repoOfUrl } from '../hooks/github'
@@ -15,7 +15,7 @@ import { parsePrStatus } from '../hooks/session'
 import { planFromProbe, probeEngaged } from '../hooks/tiers'
 import type { IssueDetails, IssueRow, IssueTree, PrRecord, RepoInfo, SessionPr } from '../types'
 import type { Ran } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, TICK_MS, count, graphAnswer, graphQuery, issueView, mcpText, op, ops, pairs, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, TICK_MS, count, graphAnswer, graphQuery, issueView, mcpText, op, ops, pairs, project, ran, started, test, tick } from './harness'
 
 const DE = strings('de')
 const LARGE = { options: { maxIssues: 2 } }

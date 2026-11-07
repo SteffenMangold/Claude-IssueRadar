@@ -5,7 +5,7 @@
 // the attached record and its resets). Asserted on keys, argv and the texts
 // the model reads, never on the pane's incidental words.
 import type { PromptSubmitInput } from 'claude-code'
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock } from 'claude-code/testing'
 
 import { renderBrief } from '../hooks/brief'
 import { MENTION_LIMITS, TOOL_LIMITS, neutralizeTags, quoteData, quoteLine, renderIssueText } from '../hooks/context'
@@ -15,7 +15,7 @@ import { briefIssueKey, findMentions, isRecentlyAttached, keyOfRemote, matchesRe
 import type { KnownIssue } from '../hooks/mentions'
 import type { IssueDetails, IssueRow, RepoInfo } from '../types'
 import type { CheckVerdict, Engine, Ran } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, count, issueView, project, ran, started } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, count, issueView, project, ran, started, test } from './harness'
 
 const ROWS = JSON.parse(ISSUES) as Array<Record<string, unknown>>
 const SETTINGS = 'settings:github.com/acme/widgets'

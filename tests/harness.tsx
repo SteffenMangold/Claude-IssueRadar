@@ -4,8 +4,24 @@
 // what the plugin asked of them, so tests assert on keys and argv, not on
 // incidental text.
 import type { ModelForkResult, ProcessRunInit, PromptAutocompleteSuggestion, PromptSubmitInput, RegisteredToolSpec, RenderSurface, UiOpenResult } from 'claude-code'
-import { mock } from 'claude-code/testing'
-import type { MockClock, TestBody } from 'claude-code/testing'
+import { mock, test as kitTest } from 'claude-code/testing'
+import type { MockClock, TestBody, TestOptions } from 'claude-code/testing'
+
+/**
+ * How long one test may run. The kit's default is 5,000 ms, and most of a test's
+ * time goes into the kit compiling the whole hooks graph again for it (0.3 to
+ * 1.4 s when the machine is quiet). The kit runs one file per logical CPU at once,
+ * so on a busy four-core laptop the same test takes 3 to 6 s. The test bodies
+ * take well under a second, so this ceiling only gives a loaded machine room.
+ * It does not loosen any check.
+ */
+export const TEST_TIMEOUT_MS = 20_000
+
+/** The kit's `test` with {@link TEST_TIMEOUT_MS} as its time, unless a test says otherwise. */
+export function test(name: string, ...rest: readonly [body: TestBody] | readonly [options: TestOptions, body: TestBody]): void {
+  if (rest.length === 1) kitTest(name, { timeoutMs: TEST_TIMEOUT_MS }, rest[0])
+  else kitTest(name, { timeoutMs: TEST_TIMEOUT_MS, ...rest[0] }, rest[1])
+}
 
 export const PANE = {
   plugin: 'issue-radar',

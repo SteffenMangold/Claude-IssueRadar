@@ -3,7 +3,7 @@
 // E19's quick actions in the opened row and the close-out after a merge, E16's
 // new issue drafted from this conversation, a TODO or nothing, and E15's link of
 // the issue session's branch. Asserted on keys and argv.
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock } from 'claude-code/testing'
 
 import { DRAFT_SYSTEM, parseDraft, parseTodos, sourceLine, touchedFiles, transcriptExcerpt } from '../hooks/draft'
 import { TOOL_VIEW_FIELDS } from '../hooks/github'
@@ -33,7 +33,7 @@ import {
 } from '../hooks/writes'
 import type { Mapping, PrRecord, RepoSettings, SeenRecord } from '../types'
 import type { McpAnswer, McpCall, Project, Ran, Setup } from './harness'
-import { ISSUES, NOW, PANE, REPO, ROW_42, ROW_7, SECTION, TICK_MS, USAGE, command, count, graphAnswer, mcpText, op, project, ran, started } from './harness'
+import { ISSUES, NOW, PANE, REPO, ROW_42, ROW_7, SECTION, TICK_MS, USAGE, command, count, graphAnswer, mcpText, op, project, ran, started, test } from './harness'
 
 const DE = strings('de')
 const SETTINGS = `settings:${SECTION}`

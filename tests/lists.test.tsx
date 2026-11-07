@@ -1,7 +1,7 @@
 // Batch 2, the lists: E14's filter, search, saved views, sort and grouping
 // (and E17-4's sub-issue search), E18's board status, E11's "assigned to me"
 // section and E22's recently closed part. Asserted on keys and argv.
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock } from 'claude-code/testing'
 
 import { boardItemFor, boardOptions, boardValue, matchesBoard, parseBoardItems } from '../hooks/boards'
 import { CLOSED_FIELDS, asClosedCache, closedCountLabel, closedRecord, isClosedDue, parseClosed, sinceDate } from '../hooks/closed'
@@ -25,7 +25,7 @@ import { strings } from '../hooks/i18n'
 import { asInboxCache, failedInbox, inboxPeriod, isInboxDue, parseInbox, searchArgs } from '../hooks/inbox'
 import type { ClosedCache, Filter, InboxCache, IssueMeta, IssueRow } from '../types'
 import type { Ran } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, count, graphAnswer, graphQuery, issueView, op, ops, pairs, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, count, graphAnswer, graphQuery, issueView, op, ops, pairs, project, ran, started, test, tick } from './harness'
 
 const DE = strings('de')
 const SETTINGS = 'settings:github.com/acme/widgets'

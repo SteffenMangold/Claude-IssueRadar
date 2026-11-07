@@ -1,10 +1,10 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock } from 'claude-code/testing'
 
 import { branchName, renderBrief, sessionName, sessionTitle } from '../hooks/brief'
 import { classify, excerptOf, isRepoSpec } from '../hooks/github'
 import { trimRecap } from '../hooks/recap'
 import { parseSessionId } from '../hooks/session'
-import { PANE, REPO, ROW_42, ROW_7, SECTION, project, ran, started } from './harness'
+import { PANE, REPO, ROW_42, ROW_7, SECTION, project, ran, started, test } from './harness'
 
 test('the pane lists the open issues with their excerpt and actions, on desktop and terminal', async ($, on) => {
   const { store } = project(on)

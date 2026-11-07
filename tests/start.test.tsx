@@ -3,7 +3,7 @@
 // fork of this conversation, offered only from a session in its own worktree;
 // E8's open beside; E13's sidebar, asked once in the pane and done only by the
 // issue session itself, with every guard. Asserted on keys and argv.
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock } from 'claude-code/testing'
 
 import { FIX_LINE, FORK_SETTLED, GO_LINE, PUSH_LINE, renderBackground, renderBrief } from '../hooks/brief'
 import { neutralizeTags } from '../hooks/context'
@@ -17,7 +17,7 @@ import { asSidebarChoice, groupFor, isOffScreen, parseGroupId, parseGroups, pars
 import { asksOptions, canShareBranch, cleanGuidance, cleanNote, effortChoices, forkState, looksSecret, modelChoices, noteOf, optionsHeld, parseGitFacts } from '../hooks/startform'
 import type { IssueRow, Mapping, PhaseRecord, RepoInfo, RepoSettings, Section } from '../types'
 import type { Engine, McpAnswer, McpCall } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, count, issueView, linkedWorktree, mcpText, plainCheckout, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, count, issueView, linkedWorktree, mcpText, plainCheckout, project, ran, started, test, tick } from './harness'
 
 const DE = strings('de')
 const SETTINGS = 'settings:github.com/acme/widgets'

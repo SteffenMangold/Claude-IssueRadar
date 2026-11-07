@@ -2165,7 +2165,7 @@ async function startIssueSession($: EngineInterface, options: Options, sectionKe
     ...(held === '' ? {} : { checkoutKey: held }),
   }
   await saveMapping($, rowKey, started)
-  // E8: beside this session, before the detach (whether a detach ends the right to split is S15), only for a press from
+  // E8: beside this session, before the detach (whether a detach ends the right to split is S25), only for a press from
   // the desktop. A refusal is told, never retried: the app says it changed nothing (A-F1, A-F17).
   if (choice.beside && surface === 'desktop') {
     const shown = await openBeside($, outcome.sessionId, consent)
@@ -5330,7 +5330,7 @@ async function sayInDraft($: EngineInterface, id: string, message: string): Prom
 
 /**
  * E16 (X-1 (1)): what the owner typed into the title and the body, folded into the draft's seeds by every handler that
- * writes the draft while the fields are drawn, so a redraw draws the text as typed, whatever S16 turns out to be.
+ * writes the draft while the fields are drawn, so a redraw draws the text as typed, whatever S26 turns out to be.
  */
 function foldDraftTyped(current: IssueDraft): IssueDraft {
   if (draftTyped.id !== current.id) return current

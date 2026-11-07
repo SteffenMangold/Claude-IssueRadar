@@ -344,7 +344,7 @@ export type StartMode = 'understand' | 'fix'
 /** E20/E21: where it works: its own worktree, this checkout shared (B-E20-2), or a fork of this conversation (E21). */
 export type StartPlace = 'worktree' | 'shared' | 'fork'
 
-/** E20: the model the form asks for: the pane session's own, or an alias of a cheaper one (S16 measures the alias). */
+/** E20: the model the form asks for: the pane session's own, or an alias of a cheaper one (S23 measures the alias). */
 export type StartModel = 'inherit' | 'sonnet' | 'haiku'
 
 /** E20: the effort the form asks for: the pane session's own, or one at or below it. */

@@ -5,7 +5,7 @@
 // The kit never paints, so a card's reveal on hover, its opacity and clipping
 // are not exercised here (spike S15); its structure and content are.
 import type { EngineInterface } from 'claude-code'
-import { expect, test } from 'claude-code/testing'
+import { expect } from 'claude-code/testing'
 
 import { DATA_NOTE, DATA_NOTE_DERIVED, INTERVIEW_START, INTERVIEW_START_GAPS, INTERVIEW_STOP, renderBrief, renderTriage } from '../hooks/brief'
 import { LIST_FIELDS, reactionsOf } from '../hooks/github'
@@ -38,7 +38,7 @@ import { GAP_CHARS, asTriage, labelSays, parseRecapAnswer } from '../hooks/triag
 import { reactionsText } from '../hooks/view'
 import type { Boards, IssueDetails, IssueRow, PrRecord, Recap, RepoInfo, SeenRecord, Section } from '../types'
 import type { Ran } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, USAGE, command, count, graphAnswer, graphQuery, issueView, op, ops, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, USAGE, command, count, graphAnswer, graphQuery, issueView, op, ops, project, ran, started, test, tick } from './harness'
 
 const DE = strings('de')
 const SEEN = `seen:${SECTION}`

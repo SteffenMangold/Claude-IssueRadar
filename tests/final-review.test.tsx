@@ -5,7 +5,7 @@
 // desktop attach that identifies a session the start could not. Asserted on keys,
 // argv and the texts sent.
 import type { EngineInterface } from 'claude-code'
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock } from 'claude-code/testing'
 
 import { DATA_NOTE, HEADER_NOTE, renderBackground, renderBrief } from '../hooks/brief'
 import { quoteData } from '../hooks/context'
@@ -16,7 +16,7 @@ import { commandConsent } from '../hooks/session'
 import { looksSecret } from '../hooks/startform'
 import type { IssueDetails, IssueRow, Mapping, RepoInfo } from '../types'
 import type { McpCall, Ran } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, SECTION, count, graphAnswer, issueView, mcpText, op, ops, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, SECTION, count, graphAnswer, issueView, mcpText, op, ops, project, ran, started, test, tick } from './harness'
 
 const DE = strings('de')
 const SETTINGS = `settings:${SECTION}`
