@@ -313,6 +313,92 @@ export type Mapping = {
    * issue session reads the project's lists and settings without gh (E2, R4-INT-2). Absent in mappings written before.
    */
   checkoutKey?: string
+  /** E1: the branch slug the pane asked for (the app adds its prefix and a suffix); absent in mappings written before. */
+  branch?: string
+}
+
+/** E1: an earlier issue session of an issue, kept once its mapping was released because the session was archived or gone. */
+export type PreviousAttempt = {
+  sessionId: string
+  title: string
+  startedAt: number
+  endedAs: 'archived' | 'gone'
+  /** When the pane released it. */
+  at: number
+  /** The branch the app named, or the slug the pane asked for (`isSlug`). */
+  branch?: string
+  /** The branch is only the slug the pane asked for: the app added a prefix and a suffix (A-F18). */
+  isSlug?: boolean
+}
+
+/** E22-b: the session of an issue that closed, kept so the closed row can still lead to it (pruned after 14 days). */
+export type DoneMapping = {
+  v: 1
+  sessionId: string
+  title: string
+  startedAt: number
+  startedFrom: string
+  /** When the pane saw the issue closed. */
+  closedAt: number
+}
+
+/** E12: what an issue session's main loop is doing, as its own record says. */
+export type PhaseActivity = 'working' | 'waiting' | 'error'
+
+/** E12/E10: what the issue session's last finished turn asked of the owner: the closing "Go?", another question, nothing. */
+export type PhaseAsk = 'proposal' | 'question' | 'none'
+
+/**
+ * The issue session's own record, the store's `phase:<rowKey>` (plan 4.5): written only by that issue session through
+ * one write point; panes read it. No conversation text, ever.
+ */
+export type PhaseRecord = {
+  v: 1
+  /** The session's id as it knows it: the desktop's when get_session 'self' answered, else `$.session.id()`. */
+  sessionId: string
+  /** `$.session.id()` when it differs from `sessionId` (S4: the two id spaces may differ). */
+  engineId?: string
+  activity: PhaseActivity
+  ask: PhaseAsk
+  at: number
+  /** Main-loop turns finished since the record began. */
+  turns: number
+  /** E13 (batch 6): the session's title as the mod set it, where it filed itself, and how often it tried. */
+  title?: string
+  filedGroupId?: string
+  filedAt?: number
+  fileTries?: number
+}
+
+/** E12: which issue this session works on, the only answer to "which issue am I" inside an issue session. */
+export type SelfIssue = {
+  /** `host/owner/name#n`, lowercased as rowKeyOf makes it; `spike` for the spike's throw-away session. */
+  rowKey: string
+  number: number
+  /** `owner/name`. */
+  repo: string
+  isSpike: boolean
+  /** How it was found (plan 4.5): a mapping naming this session's id, or the marker as its first user message. */
+  via: 'mapping' | 'marker'
+}
+
+/** E1: what the app's session list (or one get_session) said of a mapped session at the last tracking pass. */
+export type SessionLive = {
+  sessionId: string
+  /** Listed (active), missing from a complete list but found (archived), not found (gone), or not known. */
+  presence: 'active' | 'archived' | 'gone' | 'unknown'
+  /** The app's own state word, mapped by the exact table; null when it gave none the mod knows (S20). */
+  state: 'working' | 'waiting' | 'idle' | 'failed' | 'starting' | null
+  /** The app's word as it came, at most 32 characters; empty for none. */
+  raw: string
+  /** The app's link to the session (https only drawn). */
+  link: string | null
+  /** The branch the app names for it. */
+  branch: string | null
+  /** Whether its list row names a pull request: `unknown` when the row has no such field (E3 then asks get_status). */
+  pr: 'yes' | 'no' | 'unknown'
+  /** When the pass that said this ran. */
+  at: number
 }
 
 /** Per-repository choices, kept in the store under the checkout's resolved repository. */
@@ -526,6 +612,26 @@ declare module 'claude-code' {
       listed: Shaped<Record<string, ListedNumbers>>
       /** E2: the issues this conversation already carries (context blocks, E6 answers, a brief), the newest 100. */
       attached: Shaped<AttachedRecord>
+      /** E12: which issue this session works on, when it is an issue session by strong evidence (plan 4.5); null otherwise. */
+      selfIssue: Shaped<SelfIssue | null>
+      /** E12: the last record this issue session wrote (dedupes writes, survives a hot reload). */
+      ownPhase: Shaped<PhaseRecord | null>
+      /** E12/E1: this session's id as the desktop app names it (get_session 'self'); empty until read (S4). */
+      desktopId: string
+      /** E12/E21: the main-loop turn running now, and since when; null between turns. */
+      turnRunning: Shaped<{ turnId: string; since: number } | null>
+      /** E10: the accepted issue-session record per mapped row, read from the store (`phase:`). */
+      phases: Shaped<Record<string, PhaseRecord>>
+      /** E10: when this session began, and the `at` of the last proposal toasted per row (each toasted once). */
+      phaseSeen: Shaped<{ since: number; seen: Record<string, number> }>
+      /** E1: what the app said of each mapped session at the last tracking pass, by row key; never in the store. */
+      sessionLive: Shaped<Record<string, SessionLive>>
+      /** E1: the earlier attempts per row key, mirrored from the store's `attempts:`. */
+      attempts: Shaped<Record<string, PreviousAttempt[]>>
+      /** E1: the row whose "Neu starten" waits for its confirmation; empty for none. */
+      freshAsk: string
+      /** E22-b: the sessions of issues that closed, by row key, mirrored from the store's `done:`. */
+      done: Shaped<Record<string, DoneMapping>>
     }
   }
 }

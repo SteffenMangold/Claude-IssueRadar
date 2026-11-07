@@ -3,9 +3,9 @@
 // the pane, the commands, the refresh pipeline, the hand-off. `$.ui.status`
 // has one owner, the issue session's status line (E12); nothing else sets it.
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, PromptAutocompleteSuggestion, PromptSubmitInput, Register, Timer } from 'claude-code'
+import type { EngineInterface, PluginOptions, PromptAutocompleteSuggestion, PromptSubmitInput, Register, RenderSurface, Timer, TurnCompleteReason } from 'claude-code'
 
-import type { Attached, AttachedRecord, Boards, ClosedCache, Filter, Glimpse, Inbox, IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, PrRecord, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section, SeenRecord, Triage } from '../types'
+import type { Attached, AttachedRecord, Boards, ClosedCache, DoneMapping, Filter, Glimpse, Inbox, IssueDetails, IssueMeta, IssueRow, Language, Mapping, Options, PhaseActivity, PhaseAsk, PhaseRecord, PrRecord, PreviousAttempt, Recap, RepoCache, RepoInfo, RepoSettings, RepoState, Section, SeenRecord, SelfIssue, SessionLive, Triage } from '../types'
 import { MARKER, branchName, renderBackground, renderBrief, sessionName, sessionTitle, spikeBrief } from './brief'
 import { asClosedCache, closedRecord, isClosedDue, listClosed, sinceDate } from './closed'
 import type { ClosedReason } from './closed'
@@ -22,19 +22,43 @@ import { ARRIVAL_TOAST_MS, LOOK_THROTTLE_MS, MARK_HOLD_MS, SEEN_KEEP_FACTOR, arr
 import type { PaneLike, RowTop } from './marks'
 import { briefIssueKey, describeIssue, findMentions, infoFromIssueUrl, isRecentlyAttached, keyOfRemote, mentionRef, parseMentionToken, resolveMentions, suggestIssues, withAttached } from './mentions'
 import type { KnownIssue } from './mentions'
+import { askOf, parseMarker, phaseFor, proposalsDue, readPhase, samePhases, statusText, toastRef } from './phase'
+import type { Marker } from './phase'
 import { asRecord, isPrsDue, mergeLinks, recordOf } from './prs'
 import { RECAP_VERSION, asRecap, isBetterRecap, isRecapCurrent, isRecapFor, isRecapUsable, recapIssue } from './recap'
-import { commandConsent, detachSession, focusSession, lookUpSession, parseObject, pressConsent, quietDesktop, readPrStatus, routeInUse, startDesktopSession } from './session'
+import { commandConsent, detachQuietly, detachSession, listSessions, lookUpSession, openSessionIn, parseObject, peekSession, pressConsent, quietDesktop, readPrStatus, readSelfId, routeInUse, startDesktopSession, unarchiveSession } from './session'
+import type { Listing, Peek, SessionEntry } from './session'
 import { clean } from './text'
 import { probeEngaged, runTiers } from './tiers'
 import { offerToast, takeToast } from './toasts'
+import { asAttempts, asDone, goneLive, isOwnSession, liveOf, withAttempt } from './tracking'
 import { renderPane, shortAgo } from './view'
 
 const PLUGIN = 'issue-radar'
 const PANE = 'issue-radar'
 const PANE_COLUMNS = 46
 const DETAILS_CONCURRENCY = 2
-const STORE_PREFIXES = ['cache:', 'recaps:', 'session:', 'settings:', 'debug:', 'prs:', 'inbox:', 'closed:', 'seen:'] as const
+const STORE_PREFIXES = ['cache:', 'recaps:', 'session:', 'settings:', 'debug:', 'prs:', 'inbox:', 'closed:', 'seen:', 'phase:', 'attempts:', 'done:'] as const
+/** E10: how often a shown pane re-reads its mapped rows' issue-session records from the store (no gh, no model, no desktop call). */
+const PHASE_SYNC_MS = 15_000
+/** E12: a record without a mapping is swept once it is this old (the pane's hygiene at a session's start). */
+const PHASE_KEEP_MS = 24 * 60 * 60_000
+/** E22-b: how long the session of a closed issue stays reachable from its closed row. */
+const DONE_KEEP_MS = 14 * 24 * 60 * 60_000
+/** E1: the shortest gap between two tracking passes the mod asks for itself (a refresh's pass always runs). */
+const TRACK_GAP_MS = 10_000
+/** E1: how many sessions a pass reads one by one (get_session) beyond the listing, rotating. */
+const PEEK_BUDGET = 3
+/** E1: re-reads after the pane's own actions: a start, a reopen, a turn of the pane's session while its child is linked. */
+const TRACK_AFTER_START_MS = 8_000
+const TRACK_AFTER_REOPEN_MS = 3_000
+const TRACK_AFTER_TURN_MS = 1_500
+/** E1 (A-F12): how long a start whose answer carried no readable id is looked for in the listing, and no second start is made. */
+const UNPARSED_MS = 10 * 60_000
+/** E12: at how many of its first main-loop turns a session not yet identified asks whether it is an issue session. */
+const IDENTIFY_TURNS = 3
+/** E12: how long a failed read of this session's desktop id waits before it is tried again. */
+const SELF_RETRY_MS = 60_000
 /** E9: how many recaps of an older version (or language) a refresh redoes at most, the rows drawn first (C-E9-2). */
 const BACKFILL_PER_REFRESH = 5
 /** E9: how long a row whose recap redo failed waits before the backfill (or its opened row) asks again (B3-BEH-4). */
@@ -119,6 +143,16 @@ const seenBase = atom({ plugin: 'issue-radar', key: 'seenBase' } as const, {}, {
 const glimpsed = atom({ plugin: 'issue-radar', key: 'glimpsed' } as const, {}, { shape: 'glimpsed-1' })
 const listed = atom({ plugin: 'issue-radar', key: 'listed' } as const, {}, { shape: 'listed-1' })
 const attached = atom({ plugin: 'issue-radar', key: 'attached' } as const, NO_ATTACHED, { shape: 'attached-1' })
+const selfIssue = atom({ plugin: 'issue-radar', key: 'selfIssue' } as const, null, { shape: 'self-issue-1' })
+const ownPhase = atom({ plugin: 'issue-radar', key: 'ownPhase' } as const, null, { shape: 'own-phase-1' })
+const desktopId = atom({ plugin: 'issue-radar', key: 'desktopId' } as const, '')
+const turnRunning = atom({ plugin: 'issue-radar', key: 'turnRunning' } as const, null, { shape: 'turn-running-1' })
+const phases = atom({ plugin: 'issue-radar', key: 'phases' } as const, {}, { shape: 'phases-1' })
+const phaseSeen = atom({ plugin: 'issue-radar', key: 'phaseSeen' } as const, { since: 0, seen: {} }, { shape: 'phase-seen-1' })
+const sessionLive = atom({ plugin: 'issue-radar', key: 'sessionLive' } as const, {}, { shape: 'session-live-1' })
+const attempts = atom({ plugin: 'issue-radar', key: 'attempts' } as const, {}, { shape: 'attempts-1' })
+const freshAsk = atom({ plugin: 'issue-radar', key: 'freshAsk' } as const, '')
+const done = atom({ plugin: 'issue-radar', key: 'done' } as const, {}, { shape: 'done-1' })
 
 // Module state: lost on a hot reload, which is fine, since the next refresh rebuilds it.
 let timer: Timer | undefined
@@ -158,8 +192,29 @@ const prsOffHosts = new Set<string>()
 const prFailuresLogged = new Set<string>()
 /** E3: when each mapped session's pull request may be read from the app again (per session, never the whole layer, E3-1). */
 const sessionPrNext = new Map<string, number>()
-let isReadingSessionPrs = false
 let hasLoggedStatusRaw = false
+/** E10: the store-only sync of the mapped rows' issue-session records while the pane is shown. */
+let phaseTimer: Timer | undefined
+/** E1: a tracking pass in flight (one at a time), when the last one ran, and a re-read the mod asked for. */
+let isTracking = false
+let lastTrackAt = Number.NEGATIVE_INFINITY
+let trackDelayed: Timer | undefined
+/** E1: where the rotating get_session reads of a full listing go on. */
+let peekCursor = 0
+/** E1: the session ids the last listing that answered held, and when: a start without a readable id is adopted only by a new one (A-F12). */
+let lastListed: { at: number; ids: Set<string> } | null = null
+/**
+ * E1 (A-F12): starts whose answer carried no readable session id, by row key: looked for by name or title in the next
+ * listings for ten minutes, and no second start meanwhile. Module memory: a reload forgets them (the toast said so).
+ */
+const unparsed = new Map<string, { title: string; name: string; branch: string; at: number; before: Set<string> | null }>()
+/** E12: the identification by the desktop's id in flight (the start refresh waits for it before it decides about the pane). */
+let identifying: Promise<boolean> | null = null
+/** E12: how many main-loop turns of an unidentified session asked; when a failed read of the desktop id may be tried again. */
+let identifyTurns = 0
+let selfRetryAt = 0
+/** E12: the status line as last set, so an unchanged line is not set again. */
+let statusShown: string | undefined
 /**
  * E3 for filtered sections (E14): their rows' pull-request states, read as the default list's are but kept in this
  * module only, per section and query. `prs:<repoKey>` serves the default list and is never written from a filter.
@@ -339,11 +394,27 @@ function asMapping(value: unknown): Mapping | undefined {
 async function loadMappings($: EngineInterface): Promise<Record<string, Mapping>> {
   const keys = await $.store.keys().catch(() => [] as string[])
   const found: Record<string, Mapping> = {}
+  // E1: the earlier attempts, and E22-b: the sessions of closed issues, come along (another pane may have written them).
+  const tries: Record<string, PreviousAttempt[]> = {}
+  const finished: Record<string, DoneMapping> = {}
   for (const key of keys) {
+    if (key.startsWith('attempts:')) {
+      const list = asAttempts(await readStore<unknown>($, key))
+      if (list.length > 0) tries[key.slice('attempts:'.length)] = list
+      continue
+    }
+    if (key.startsWith('done:')) {
+      const record = asDone(await readStore<unknown>($, key))
+      if (record !== undefined) finished[key.slice('done:'.length)] = record
+      continue
+    }
     if (!key.startsWith('session:')) continue
     const value = asMapping(await readStore<unknown>($, key))
     if (value !== undefined) found[key.slice('session:'.length)] = value
   }
+  // Written only on a change: every atom write redraws the pane.
+  if (JSON.stringify(await read($, attempts)) !== JSON.stringify(tries)) await update($, attempts, () => tries)
+  if (JSON.stringify(await read($, done)) !== JSON.stringify(finished)) await update($, done, () => finished)
   // A mapping the store refused stays this pane's, and is written again, until the store holds one for its row.
   for (const [rowKey, mapping] of unsaved) {
     if (found[rowKey] === undefined) {
@@ -406,6 +477,51 @@ async function saveMapping($: EngineInterface, rowKey: string, mapping: Mapping 
 
     return next
   })
+  // So do the app's word on the old session (E1, A-F11) and its own record (E10); a released row's record leaves the
+  // store too: the pane's only write to a key the issue session owns, and hygiene (B crossCutting 5).
+  const isOld = (sessionId: string | undefined) => sessionId !== undefined && (mapping === null || sessionId !== mapping.sessionId)
+  if (isOld((await read($, sessionLive))[rowKey]?.sessionId)) await update($, sessionLive, current => withoutKey(current, rowKey))
+  const record = (await read($, phases))[rowKey]
+  if (record !== undefined && (mapping === null || phaseFor(record, mapping) === null)) await update($, phases, current => withoutKey(current, rowKey))
+  if (mapping === null) await $.store.delete(storeKeyOf('phase:', rowKey)).catch(() => undefined)
+}
+
+/** `record` without `key`; the same object when it has none (an unchanged atom write still redraws). */
+function withoutKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in record)) return record
+  const next = { ...record }
+  delete next[key]
+
+  return next
+}
+
+/**
+ * E1: releases a mapping whose session the app reports archived or gone, keeping it as an attempt of the issue (at most
+ * three, the newest first): the next brief names it, so the new session looks for its branch and pull request.
+ */
+async function releaseMapping($: EngineInterface, rowKey: string, mapping: Mapping, endedAs: PreviousAttempt['endedAs'], branch: string | null): Promise<void> {
+  const now = await $.clock.now()
+  const known = branch ?? mapping.branch ?? null
+  const attempt: PreviousAttempt = { sessionId: mapping.sessionId, title: mapping.title, startedAt: mapping.startedAt, endedAs, at: now }
+  if (known !== null && known !== '') {
+    attempt.branch = known
+    // The slug the pane asked for is only the middle of the branch's name (A-F18); the app's own word is the name.
+    if (branch === null) attempt.isSlug = true
+  }
+  const key = storeKeyOf('attempts:', rowKey)
+  const list = withAttempt(asAttempts(await readStore<unknown>($, key)), attempt)
+  await writeStore($, key, list)
+  await update($, attempts, current => ({ ...current, [rowKey]: list }))
+  await saveMapping($, rowKey, null)
+}
+
+/** E22-b: a mapping whose issue closed is kept as the closed row's session for two weeks, then released as before. */
+async function retireMapping($: EngineInterface, rowKey: string, mapping: Mapping | undefined): Promise<void> {
+  if (mapping !== undefined) {
+    const record: DoneMapping = { v: 1, sessionId: mapping.sessionId, title: mapping.title, startedAt: mapping.startedAt, startedFrom: mapping.startedFrom, closedAt: await $.clock.now() }
+    if (await writeStore($, storeKeyOf('done:', rowKey), record)) await update($, done, current => ({ ...current, [rowKey]: record }))
+  }
+  await saveMapping($, rowKey, null)
 }
 
 /** Applies a change to the stored settings, read fresh so another pane's writes on the same repository survive, and mirrors the result into the state. */
@@ -436,6 +552,7 @@ async function paneState($: EngineInterface, options: Options): Promise<PaneLike
     recaps: await read($, recaps),
     details: await read($, details),
     mappings: await read($, mappings),
+    attempts: await read($, attempts),
     isFilterOpen: await read($, isFilterOpen),
     isSettingsOpen: await read($, isSettingsOpen),
     columns: viewport.columns,
@@ -530,6 +647,7 @@ async function surfacesAllowPane($: EngineInterface): Promise<boolean> {
 }
 
 function armTimer($: EngineInterface, options: Options): void {
+  armPhaseSync($, options)
   if (timer !== undefined && timerMinutes === options.refreshMinutes) return
   timer?.cancel()
   timer = undefined
@@ -539,6 +657,19 @@ function armTimer($: EngineInterface, options: Options): void {
     void (async () => {
       if ((await mayRunInBackground($)) && !(await isEditing($))) await refresh($, options, 'timer')
     })()
+  })
+}
+
+/**
+ * E10: while the pane is shown and a row is mapped, the mapped rows' issue-session records are read from the store every
+ * 15 s (plan 4.5's cheap store-only sync: no gh, no model, no desktop call), whatever the refresh interval says.
+ */
+function armPhaseSync($: EngineInterface, options: Options): void {
+  if (phaseTimer !== undefined) return
+  phaseTimer = $.clock.every(PHASE_SYNC_MS, () => {
+    void (async () => {
+      if (Object.keys(await read($, mappings)).length > 0 && (await mayRunInBackground($))) await syncPhases($, options)
+    })().catch(() => undefined)
   })
 }
 
@@ -552,6 +683,10 @@ function standDown(): void {
   timer?.cancel()
   timer = undefined
   timerMinutes = 0
+  phaseTimer?.cancel()
+  phaseTimer = undefined
+  trackDelayed?.cancel()
+  trackDelayed = undefined
 }
 
 /** Runs a refresh after `delayMs`; a refresh already pending is replaced, and the new one keeps the stronger reason of both. */
@@ -635,7 +770,8 @@ async function probeSection($: EngineInterface, options: Options, target: Resolv
     .slice(0, MAPPED_MAX)
   const hasPrFields = !prsOffHosts.has(info.host)
   const outcome = await runTiers($, { info, first: Math.min(PROBE_MAX, options.maxIssues), cache, mapped, withLinks, hasPrFields, now })
-  for (const number of outcome.released) await saveMapping($, rowKeyOf(sectionKey, number), null)
+  // E22-b: their sessions stay reachable from the closed rows for a while.
+  for (const number of outcome.released) await retireMapping($, rowKeyOf(sectionKey, number), all[rowKeyOf(sectionKey, number)])
   // A probe that asked the pull requests and did not bring them counts as a failed try of them (E3-2).
   if (withLinks && outcome.kind !== 'done') prTriedAt.set(sectionKey, now)
   if (outcome.kind === 'paused') {
@@ -773,20 +909,173 @@ async function refreshPrs($: EngineInterface, current: readonly Section[], reaso
 }
 
 /**
- * E3's optional layer: the pull request the app binds to each mapped issue session (`ccd_pr` `get_status`), read
- * quietly (never a card), at most once a minute per session, each session backing off on its own for ten minutes
- * after a failure (E3-1). Runs after the refresh as its own task, never awaited by it (A-F4), and only while the pane
- * is shown (D X-1). The app's cache costs no GitHub budget.
+ * E1: one pass over the mapped rows' sessions, after a refresh as its own task (never awaited by it, A-F4), only while
+ * the pane is shown (D X-1), one at a time. One quiet list_sessions (no `linked`, no `include_archived`, A-F3): a mapped
+ * id it lists is active; one it misses while it lists fewer than its limit is read once (get_session): found means
+ * archived, the app's "not found" gone; a full listing's misses are read three at a time, rotating. Every call is quiet
+ * (never a card) and raced against a timeout; a failed listing keeps the last word. The pass only feeds the badge: it
+ * never releases a mapping (the click validates, as in V1). Nothing of the listing reaches the store but the spike's
+ * note in `debug:sessions` (counts, keys and state words, never a title). Then E3's pull-request reads, folded in here.
  */
-async function readSessionPrs($: EngineInterface, current: readonly Section[]): Promise<void> {
-  if (isReadingSessionPrs) return
-  isReadingSessionPrs = true
+async function trackSessions($: EngineInterface, options: Options, current: readonly Section[], isForced: boolean): Promise<void> {
+  if (isTracking) return
+  isTracking = true
   try {
     if (!(await mayRunInBackground($))) return
-    const live = new Set(current.flatMap(section => section.rows.map(row => rowKeyOf(section.key, row.number))))
+    const now = await $.clock.now()
+    if (!isForced && now - lastTrackAt < TRACK_GAP_MS) return
+    lastTrackAt = now
+    const shown = new Set(current.flatMap(section => section.rows.map(row => rowKeyOf(section.key, row.number))))
     const all = await read($, mappings)
-    for (const [rowKey, mapping] of Object.entries(all)) {
-      if (!live.has(rowKey)) continue
+    const ids = await ownIds($)
+    const wanted = Object.entries(all).filter(([rowKey]) => shown.has(rowKey))
+    const pending = [...unparsed.values()].some(start => now - start.at < UNPARSED_MS)
+    if (wanted.length === 0 && !pending) {
+      if (Object.keys(await read($, sessionLive)).length > 0) await update($, sessionLive, () => ({}))
+      if (Object.keys(await read($, sessionPrs)).length > 0) await update($, sessionPrs, () => ({}))
+
+      return
+    }
+    const listing = await listSessions($)
+    const previous = await read($, sessionLive)
+    const found: Record<string, SessionLive> = {}
+    const toPeek: Array<{ rowKey: string; mapping: Mapping; isComplete: boolean }> = []
+    const keep = (rowKey: string, mapping: Mapping) => {
+      const had = previous[rowKey]
+      if (had?.sessionId === mapping.sessionId) found[rowKey] = had
+    }
+    for (const [rowKey, mapping] of wanted) {
+      // The pane drawn inside its own issue session: the view draws `this session`; the app never lists the current one.
+      if (isOwnSession(mapping, ids)) continue
+      const entry = listing.ok ? listing.entries.find(item => item.id === mapping.sessionId) : undefined
+      if (entry !== undefined) found[rowKey] = liveOf(entry, entry.archived === true ? 'archived' : 'active', now)
+      else if (!listing.ok) keep(rowKey, mapping)
+      else {
+        // Unlisted again after a read said archived or gone: that stands (a restored session is listed again); no read.
+        const had = previous[rowKey]
+        if (had?.sessionId === mapping.sessionId && (had.presence === 'gone' || had.presence === 'archived')) found[rowKey] = had
+        else toPeek.push({ rowKey, mapping, isComplete: !listing.isFull })
+      }
+    }
+    // Missing from a complete listing first (each says archived or gone); then a full listing's misses; each rotating.
+    const rotate = <T,>(list: readonly T[]): T[] => (list.length === 0 ? [] : [...list.slice(peekCursor % list.length), ...list.slice(0, peekCursor % list.length)])
+    const order = [...rotate(toPeek.filter(item => item.isComplete)), ...rotate(toPeek.filter(item => !item.isComplete))]
+    peekCursor += PEEK_BUDGET
+    const peeks: string[] = []
+    for (const [index, item] of order.entries()) {
+      if (index >= PEEK_BUDGET) {
+        keep(item.rowKey, item.mapping)
+        continue
+      }
+      const peek = await peekSession($, item.mapping.sessionId)
+      peeks.push(peek.kind)
+      if (peek.kind === 'gone') found[item.rowKey] = goneLive(item.mapping.sessionId, now)
+      else if (peek.kind === 'found') {
+        // Found but not listed: archived, when the listing was complete or the app says so; an explicit "not archived" is active.
+        const flag = peek.entry.archived
+        const presence: SessionLive['presence'] = flag === true || (flag === null && item.isComplete) ? 'archived' : flag === false ? 'active' : 'unknown'
+        found[item.rowKey] = { ...liveOf(peek.entry, presence, now), sessionId: item.mapping.sessionId }
+      } else keep(item.rowKey, item.mapping)
+    }
+    // Row by row against the store's mappings as they stand now: a release or a new start during the pass never gets
+    // the old session's word back (A-F11).
+    const latest = await read($, mappings)
+    await update($, sessionLive, () => Object.fromEntries(Object.entries(found).filter(([rowKey, live]) => latest[rowKey]?.sessionId === live.sessionId)))
+    if (listing.ok) {
+      await adoptUnparsed($, options, listing.entries, now)
+      lastListed = { at: now, ids: new Set(listing.entries.map(entry => entry.id)) }
+    }
+    await noteSessions($, listing, peeks, now)
+    await readSessionPrs($, wanted, found)
+  } catch (error) {
+    $.ui.log(`${PLUGIN}: tracking the sessions failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
+  } finally {
+    isTracking = false
+  }
+}
+
+/** The spike's note on the last pass (S20): how the listing went, the keys of its first entry, the state words met; no title. */
+async function noteSessions($: EngineInterface, listing: Listing, peeks: readonly string[], now: number): Promise<void> {
+  const words = listing.ok ? [...new Set(listing.entries.map(entry => entry.state).filter(word => word !== ''))].slice(0, 24) : []
+  await writeStore($, 'debug:sessions', {
+    at: now,
+    list: listing.ok ? { ok: true, count: listing.entries.length, isFull: listing.isFull, keys: listing.entries[0]?.keys ?? [] } : { ok: false, reason: listing.reason.slice(0, 200) },
+    words,
+    peeks,
+  })
+}
+
+/** This session's ids: its engine id, and its desktop id once known (S4: the two may differ). */
+async function ownIds($: EngineInterface): Promise<string[]> {
+  return [myId, await read($, desktopId)].filter(id => id !== '')
+}
+
+/** Runs a tracking pass after `delayMs` (one pending at a time): the re-read after a start, a reopen, a turn of the pane's session. */
+function scheduleTrack($: EngineInterface, options: Options, delayMs: number, isForced = true): void {
+  trackDelayed?.cancel()
+  trackDelayed = $.clock.after(delayMs, () => {
+    trackDelayed = undefined
+    void (async () => trackSessions($, options, await read($, sections), isForced))().catch(() => undefined)
+  })
+}
+
+/**
+ * E1 (A-F12): a start whose answer carried no readable id is looked for in the listing for ten minutes: exactly one
+ * entry named as the start named it (its short name or title), mapped to no row, no earlier attempt of the issue, not
+ * archived, and new: started by this session where the app says who started it (a linked session carries `startedBy`),
+ * else absent from the listing before the start. It is adopted (mapping, detach, toast), so the duplicate-start guard is
+ * back; anything else waits, and nothing is guessed.
+ */
+async function adoptUnparsed($: EngineInterface, options: Options, entries: readonly SessionEntry[], now: number): Promise<void> {
+  if (unparsed.size === 0) return
+  const S = strings(options.language)
+  for (const [rowKey, start] of [...unparsed]) {
+    if (now - start.at >= UNPARSED_MS) {
+      unparsed.delete(rowKey)
+      continue
+    }
+    const all = await read($, mappings)
+    if (all[rowKey] !== undefined) {
+      unparsed.delete(rowKey)
+      continue
+    }
+    const mappedIds = new Set(Object.values(all).map(mapping => mapping.sessionId))
+    const earlier = new Set(((await read($, attempts))[rowKey] ?? []).map(attempt => attempt.sessionId))
+    const named = entries.filter(entry => (entry.name === start.name || entry.title === start.title) && !mappedIds.has(entry.id) && !earlier.has(entry.id) && entry.archived !== true)
+    const ids = named.some(entry => entry.startedBy !== null) ? await knownOwnIds($) : await ownIds($)
+    const matches = named.filter(entry => (entry.startedBy !== null ? ids.includes(entry.startedBy) : start.before !== null && !start.before.has(entry.id)))
+    const entry = matches[0]
+    if (matches.length !== 1 || entry === undefined) continue
+    unparsed.delete(rowKey)
+    const held = await read($, checkoutKey)
+    const adopted: Mapping = { sessionId: entry.id, title: start.title, startedAt: start.at, startedFrom: myId, detached: entry.detached === true, branch: start.branch, ...(held === '' ? {} : { checkoutKey: held }) }
+    await saveMapping($, rowKey, adopted)
+    if (entry.detached !== true && (await detachQuietly($, entry.id))) await saveMapping($, rowKey, { ...adopted, detached: true })
+    $.ui.toast(clean(S.adopted(start.title)), { timeoutMs: 6_000 })
+  }
+}
+
+/** This session's ids with the desktop's read first where it is not known yet (one quiet read per process at most a minute). */
+async function knownOwnIds($: EngineInterface): Promise<string[]> {
+  await resolveDesktopId($)
+
+  return ownIds($)
+}
+
+/**
+ * E3's optional layer, folded into E1's pass: the pull request the app binds to each mapped issue session (`ccd_pr`
+ * `get_status`), read quietly (never a card), at most once a minute per session, each session backing off on its own
+ * for ten minutes after a failure (E3-1). A session whose list row says it names no pull request, or that is archived or
+ * gone, is not asked; one whose row has no such field is (the field is not documented, S20). The app's cache costs no
+ * GitHub budget.
+ */
+async function readSessionPrs($: EngineInterface, wanted: ReadonlyArray<[string, Mapping]>, found: Readonly<Record<string, SessionLive>>): Promise<void> {
+  try {
+    const live = new Set(wanted.map(([rowKey]) => rowKey))
+    const all = Object.fromEntries(wanted)
+    for (const [rowKey, mapping] of wanted) {
+      const word = found[rowKey]
+      if (word !== undefined && (word.pr === 'no' || word.presence === 'gone' || word.presence === 'archived')) continue
       const now = await $.clock.now()
       if (now < (sessionPrNext.get(mapping.sessionId) ?? 0)) continue
       const look = await readPrStatus($, mapping.sessionId, now)
@@ -802,8 +1091,8 @@ async function readSessionPrs($: EngineInterface, current: readonly Section[]): 
         }
         sessionPrNext.set(mapping.sessionId, now + SESSION_PR_EVERY_MS)
       }
-      await update($, sessionPrs, found => {
-        const next = { ...found }
+      await update($, sessionPrs, had => {
+        const next = { ...had }
         // The session it was read for goes with it: the row draws it only while its mapping still names that session.
         if (look.kind === 'pr') next[rowKey] = { ...look.pr, sessionId: mapping.sessionId }
         else delete next[rowKey]
@@ -811,11 +1100,9 @@ async function readSessionPrs($: EngineInterface, current: readonly Section[]): 
         return next
       })
     }
-    await update($, sessionPrs, found => Object.fromEntries(Object.entries(found).filter(([rowKey, pr]) => live.has(rowKey) && all[rowKey] !== undefined && all[rowKey]?.sessionId === pr.sessionId)))
+    await update($, sessionPrs, had => Object.fromEntries(Object.entries(had).filter(([rowKey, pr]) => live.has(rowKey) && all[rowKey] !== undefined && all[rowKey]?.sessionId === pr.sessionId)))
   } catch (error) {
     $.ui.log(`${PLUGIN}: reading the sessions' pull requests failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
-  } finally {
-    isReadingSessionPrs = false
   }
 }
 
@@ -854,6 +1141,16 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     const root = await $.session.root()
     // Another pane, or an issue session of this project, may have started or released a session since the last refresh.
     await loadMappings($)
+    // E12 (B-E12-1): before the first refresh decides about the pane, this session asks whether it is an issue session
+    // (its desktop id in a mapping); one that is stands down here, before any gh call.
+    if (!paneDecided) {
+      if (identifying !== null) await identifying
+      if (await read($, isIssueSession)) {
+        standDown()
+
+        return
+      }
+    }
     forgetOtherRoot(root)
     // After a hot reload the pane is still up while this module's memory is fresh.
     if (!wantsPane && (await isPaneOpen($))) wantsPane = true
@@ -1074,14 +1371,17 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     // E4: the comments of the rows near the window, for their hover cards (two per refresh, while shown on the desktop).
     await warmCards($, options, now)
     await pruneMappings($, options, nextSections)
+    // E10: the mapped rows' issue-session records, from the store only (plan 4.5); its proposal toast joins this refresh's.
+    await syncPhases($, options)
     // E22 after the details: the expanded closed lists that are due, fetched only while the pane is shown (D X-1); the
     // store's lists are drawn either way (B2-BEH-4).
     await refreshClosed($, options, nextSections, reason, now, isShown)
     // E5: the title's count as the refresh left it, and the next fade (a reload's lost timer is armed again here).
     await syncTitle($, options)
     armFade($, options, await read($, glimpsed), await $.clock.now())
-    // The desktop's part comes last and is not awaited: no desktop call holds up the GitHub part (A-F4).
-    void readSessionPrs($, nextSections)
+    // The desktop's part comes last and is not awaited: no desktop call holds up the GitHub part (A-F4). E1's pass
+    // (the listing, a few reads) and E3's pull-request reads of the issue sessions.
+    void trackSessions($, options, nextSections, true)
   } catch (error) {
     $.ui.log(`${PLUGIN}: refresh failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
   } finally {
@@ -1252,11 +1552,19 @@ function isComplete(section: Section, options: Options): boolean {
  */
 async function pruneMappings($: EngineInterface, options: Options, current: readonly Section[]): Promise<void> {
   const all = await read($, mappings)
+  const tries = await read($, attempts)
   for (const section of current) {
     if (section.state.kind !== 'ok' || section.query !== undefined || !isComplete(section, options)) continue
     const open = new Set(section.rows.map(row => rowKeyOf(section.key, row.number)))
-    for (const rowKey of Object.keys(all)) {
-      if (rowKey.startsWith(`${section.key}#`) && !open.has(rowKey)) await saveMapping($, rowKey, null)
+    // E22-b: the session of an issue that closed stays reachable from its closed row for a while.
+    for (const [rowKey, mapping] of Object.entries(all)) {
+      if (rowKey.startsWith(`${section.key}#`) && !open.has(rowKey)) await retireMapping($, rowKey, mapping)
+    }
+    // E1: the earlier attempts of an issue that closed go with it.
+    for (const rowKey of Object.keys(tries)) {
+      if (!rowKey.startsWith(`${section.key}#`) || open.has(rowKey)) continue
+      await $.store.delete(storeKeyOf('attempts:', rowKey)).catch(() => undefined)
+      await update($, attempts, had => withoutKey(had, rowKey))
     }
   }
 }
@@ -1323,7 +1631,7 @@ async function freshDetails($: EngineInterface, options: Options, section: Secti
   if (settled.state.toUpperCase() !== 'OPEN') {
     $.ui.toast(S.closedMeanwhile(row.number))
     await update($, sections, current => current.map(found => (found.key === section.key ? { ...found, rows: found.rows.filter(item => item.number !== row.number) } : found)))
-    await saveMapping($, rowKey, null)
+    await retireMapping($, rowKey, (await read($, mappings))[rowKey])
     // E22: the repository's closed list, when expanded, is read again on the next refresh (once it is 30 s old).
     closedNudge.add(section.key)
 
@@ -1333,8 +1641,12 @@ async function freshDetails($: EngineInterface, options: Options, section: Secti
   return settled
 }
 
-/** "Work on it" (or "Open session", as `label` says): opens the issue's session, or starts one. */
-async function workOn($: EngineInterface, options: Options, sectionKey: string, number: number, label: string): Promise<void> {
+/**
+ * "Bearbeiten" / "Zur Session" (as `label` says): the issue's session, opened after the click validated it (E1), or a
+ * new one started. The store, not this pane's copy, says whether the issue has a session: another pane may have
+ * started one. `surface` is where the press came from: only a desktop press opens a session in the window.
+ */
+async function workOn($: EngineInterface, options: Options, sectionKey: string, number: number, label: string, surface: RenderSurface): Promise<void> {
   const S = strings(options.language)
   const rowKey = rowKeyOf(sectionKey, number)
   if (inFlight.has(rowKey)) return
@@ -1345,74 +1657,268 @@ async function workOn($: EngineInterface, options: Options, sectionKey: string, 
     await acknowledgeRow($, options, rowKey)
     // What the owner pressed, in the words they saw, for a desktop call that has to take the typed route.
     const consent = pressConsent(label, `issue ${rowKey}`)
-    // The store, not this pane's copy, says whether the issue has a session: another pane may have started one.
     const mapping = await reloadMapping($, rowKey)
     if (mapping !== undefined) {
-      await openExisting($, options, rowKey, mapping, number, consent)
+      await reEnter($, options, rowKey, mapping, number, consent, surface)
 
       return
     }
-    const found = findRow(await read($, sections), sectionKey, number)
-    if (found === null || found.section.info === null) return
-    const now = await $.clock.now()
-    const fresh = await freshDetails($, options, found.section, found.row, now)
-    if (fresh === null) return
-    const input = { issueRepo: found.section.info, codeRepo: checkout?.info ?? null, row: found.row, details: fresh, fetchedAt: new Date(now).toISOString(), triage: await triageFor($, options, rowKey, fresh) }
-    // E6: Phase 1 names the issue tool where this session's model can call it (the issue session's own is not known here).
-    const prompt = renderBrief(input, { issueTool: await issueToolOf($) })
-    const background = renderBackground(input, checkout?.root ?? (await $.session.root()))
-    const title = sessionTitle(found.row)
-    const outcome = await startDesktopSession(
-      $,
-      {
-        title,
-        name: sessionName(found.row, found.section.info.name),
-        prompt,
-        background,
-        branch_name: branchName(found.row),
-        use_worktree: true,
-      },
-      consent,
-    )
-    await update($, route, () => outcome.route)
-    if (outcome.route === 'none') {
-      await fillPrompt($, options, prompt)
-      $.ui.toast(clean(S.sessionNotStarted(outcome.reason ?? '?')), { timeoutMs: 8_000 })
+    // A start whose answer carried no id is looked for first: no second session meanwhile (A-F12).
+    const pending = unparsed.get(rowKey)
+    if (pending !== undefined && (await $.clock.now()) - pending.at < UNPARSED_MS) {
+      $.ui.toast(S.startPending(number), { timeoutMs: 6_000 })
+      scheduleTrack($, options, 0)
 
       return
     }
-    if (outcome.sessionId === null) {
-      $.ui.toast(S.noIdParsed, { timeoutMs: 8_000 })
-
-      return
-    }
-    // The checkout's key as this pane resolved it travels along: the issue session finds the project's lists under it
-    // without gh, where its git remote names another (a fork's origin; R4-INT-2).
-    const held = await read($, checkoutKey)
-    const started: Mapping = { sessionId: outcome.sessionId, title, startedAt: now, startedFrom: myId, detached: false, ...(held === '' ? {} : { checkoutKey: held }) }
-    await saveMapping($, rowKey, started)
-    $.ui.toast(clean(S.sessionStarted(title)))
-    const detached = await detachSession($, outcome.sessionId, consent)
-    if (detached.ok) await saveMapping($, rowKey, { ...started, detached: true })
-    else $.ui.toast(S.stayLinked, { timeoutMs: 6_000 })
+    await startIssueSession($, options, sectionKey, number, consent)
   } finally {
     inFlight.delete(rowKey)
     await setStarting($, rowKey, false)
   }
 }
 
-async function openExisting($: EngineInterface, options: Options, rowKey: string, mapping: Mapping, number: number, consent: string): Promise<void> {
+/**
+ * Starts the issue's session (V1's start): the brief names the earlier attempts (E1) and the pane's id (E12), the
+ * mapping keeps the branch slug; a start without a readable id is looked for in the listing (A-F12). The tracking pass
+ * reads the new session 8 s later.
+ */
+async function startIssueSession($: EngineInterface, options: Options, sectionKey: string, number: number, consent: string): Promise<void> {
   const S = strings(options.language)
-  const focused = await focusSession($, mapping.sessionId, consent)
-  if (focused.ok) return
-  const look = await lookUpSession($, mapping.sessionId, consent)
-  if (look.exists && !look.isArchived) {
-    $.ui.toast(clean(S.openElsewhere(look.title || mapping.title)), { timeoutMs: 6_000 })
+  const rowKey = rowKeyOf(sectionKey, number)
+  const found = findRow(await read($, sections), sectionKey, number)
+  if (found === null || found.section.info === null) return
+  const now = await $.clock.now()
+  const fresh = await freshDetails($, options, found.section, found.row, now)
+  if (fresh === null) return
+  const input = { issueRepo: found.section.info, codeRepo: checkout?.info ?? null, row: found.row, details: fresh, fetchedAt: new Date(now).toISOString(), triage: await triageFor($, options, rowKey, fresh) }
+  const previous = (await read($, attempts))[rowKey] ?? []
+  // E6: Phase 1 names the issue tool where this session's model can call it (the issue session's own is not known here).
+  const briefing = { issueTool: await issueToolOf($), fromId: myId, previous }
+  const prompt = renderBrief(input, briefing)
+  const background = renderBackground(input, checkout?.root ?? (await $.session.root()), briefing)
+  const title = sessionTitle(found.row)
+  const name = sessionName(found.row, found.section.info.name)
+  const branch = branchName(found.row)
+  const before = lastListed !== null && now - lastListed.at < UNPARSED_MS ? lastListed.ids : null
+  const outcome = await startDesktopSession($, { title, name, prompt, background, branch_name: branch, use_worktree: true }, consent)
+  await update($, route, () => outcome.route)
+  if (outcome.route === 'none') {
+    await fillPrompt($, options, prompt)
+    $.ui.toast(clean(S.sessionNotStarted(outcome.reason ?? '?')), { timeoutMs: 8_000 })
 
     return
   }
-  await saveMapping($, rowKey, null)
-  $.ui.toast(S.released(number))
+  if (outcome.sessionId === null) {
+    $.ui.toast(S.noIdParsed, { timeoutMs: 8_000 })
+    unparsed.set(rowKey, { title, name, branch, at: now, before })
+    scheduleTrack($, options, TRACK_AFTER_START_MS)
+
+    return
+  }
+  // The checkout's key as this pane resolved it travels along: the issue session finds the project's lists under it
+  // without gh, where its git remote names another (a fork's origin; R4-INT-2).
+  const held = await read($, checkoutKey)
+  const started: Mapping = { sessionId: outcome.sessionId, title, startedAt: now, startedFrom: myId, detached: false, branch, ...(held === '' ? {} : { checkoutKey: held }) }
+  await saveMapping($, rowKey, started)
+  $.ui.toast(clean(S.sessionStarted(title)))
+  const detached = await detachSession($, outcome.sessionId, consent)
+  const settled: Mapping = detached.ok ? { ...started, detached: true } : started
+  if (detached.ok) await saveMapping($, rowKey, settled)
+  else $.ui.toast(S.stayLinked, { timeoutMs: 6_000 })
+  // B-X-1: issue sessions now write the shared store at every turn, and whether two processes' writes of different keys
+  // both survive is not measured yet: the mapping that keeps the issue from a second session is read back once.
+  if (!unsaved.has(rowKey) && asMapping(await readStore<unknown>($, storeKeyOf('session:', rowKey)))?.sessionId !== settled.sessionId) {
+    $.ui.log(`${PLUGIN}: the mapping of ${rowKey} was lost from the store after the start; written again`, { to: 'debug' })
+    await saveMapping($, rowKey, settled)
+  }
+  scheduleTrack($, options, TRACK_AFTER_START_MS)
+}
+
+/** Whether a session reads as archived: the app's own flag, or the last pass found it missing from a complete listing. */
+async function isArchivedNow($: EngineInterface, rowKey: string, mapping: Mapping, peek: Peek): Promise<boolean> {
+  if (peek.kind !== 'found') return false
+  if (peek.entry.archived !== null) return peek.entry.archived
+  const live = (await read($, sessionLive))[rowKey]
+
+  return live?.sessionId === mapping.sessionId && live.presence === 'archived'
+}
+
+/**
+ * E1's click on a mapped row: the session is validated by one quiet read (A-F13: never a card), and only the acting call
+ * goes through callDesktop with the press's words. The app's own "not found" releases the mapping as an attempt; an
+ * archived session is offered again (Wieder öffnen / Neu starten) and nothing is released; anything else is opened.
+ */
+async function reEnter($: EngineInterface, options: Options, rowKey: string, mapping: Mapping, number: number, consent: string, surface: RenderSurface): Promise<void> {
+  const S = strings(options.language)
+  // The pane drawn inside the issue session itself: there is nothing to open.
+  if (isOwnSession(mapping, await ownIds($))) return
+  const peek = await peekSession($, mapping.sessionId)
+  if (peek.kind === 'gone') {
+    await releaseMapping($, rowKey, mapping, 'gone', null)
+    $.ui.toast(S.released(number))
+
+    return
+  }
+  if (await isArchivedNow($, rowKey, mapping, peek)) {
+    await markArchived($, rowKey, mapping, peek)
+    $.ui.toast(S.archivedChoose(number), { timeoutMs: 6_000 })
+
+    return
+  }
+  await openMapped($, options, mapping, peek, consent, surface)
+}
+
+/** Notes a session the click found archived, so the row offers Wieder öffnen and Neu starten at once. */
+async function markArchived($: EngineInterface, rowKey: string, mapping: Mapping, peek: Peek): Promise<void> {
+  const now = await $.clock.now()
+  const live: SessionLive =
+    peek.kind === 'found' ? liveOf(peek.entry, 'archived', now) : { sessionId: mapping.sessionId, presence: 'archived', state: null, raw: '', link: null, branch: null, pr: 'no', at: now }
+  await update($, sessionLive, current => ({ ...current, [rowKey]: live }))
+}
+
+/**
+ * Opens a mapped session in the window, for a press from the desktop by the pane that started it (open_session_in
+ * acts only on a session this session started). Who started it: the app's `parentSessionId` against this session's
+ * desktop id where the app names a parent (A-F14), else the mapping's `startedFrom`. Any other pane, or a refusal of the
+ * app (not on screen, a text field holds the cursor), says where to find the session.
+ */
+async function openMapped($: EngineInterface, options: Options, mapping: Mapping, peek: Peek, consent: string, surface: RenderSurface): Promise<boolean> {
+  const S = strings(options.language)
+  const title = (peek.kind === 'found' ? peek.entry.title : '') || mapping.title
+  const parent = peek.kind === 'found' ? (peek.entry.parentSessionId ?? peek.entry.startedBy) : null
+  const isStarter = parent !== null && parent !== '' ? (await knownOwnIds($)).includes(parent) || mapping.startedFrom === myId : mapping.startedFrom === myId
+  if (!isStarter || surface !== 'desktop') {
+    $.ui.toast(clean(S.openElsewhere(title)), { timeoutMs: 6_000 })
+
+    return false
+  }
+  const opened = await openSessionIn($, mapping.sessionId, 'focus', consent)
+  if (opened.outcome !== 'refused') return true
+  $.ui.log(`${PLUGIN}: open_session_in ${mapping.sessionId} refused: ${opened.reason}`, { to: 'debug' })
+  $.ui.toast(clean(S.openElsewhere(title)), { timeoutMs: 6_000 })
+
+  return false
+}
+
+/** "Wieder öffnen" on an archived row: the session is restored (unarchive_session, the press's words), then opened. */
+async function reopen($: EngineInterface, options: Options, sectionKey: string, number: number, label: string, surface: RenderSurface): Promise<void> {
+  const S = strings(options.language)
+  const rowKey = rowKeyOf(sectionKey, number)
+  if (inFlight.has(rowKey)) return
+  inFlight.add(rowKey)
+  await setStarting($, rowKey, true)
+  try {
+    const consent = pressConsent(label, `issue ${rowKey}`)
+    const mapping = await reloadMapping($, rowKey)
+    if (mapping === undefined) return
+    const peek = await peekSession($, mapping.sessionId)
+    if (peek.kind === 'gone') {
+      await releaseMapping($, rowKey, mapping, 'gone', null)
+      $.ui.toast(S.released(number))
+
+      return
+    }
+    if (peek.kind === 'unknown') {
+      $.ui.toast(clean(S.reopenFailed(peek.reason)), { timeoutMs: 6_000 })
+
+      return
+    }
+    if (await isArchivedNow($, rowKey, mapping, peek)) {
+      const restored = await unarchiveSession($, mapping.sessionId, consent)
+      if (!restored.ok) {
+        $.ui.toast(clean(S.reopenFailed(restored.reason)), { timeoutMs: 6_000 })
+
+        return
+      }
+      const now = await $.clock.now()
+      await update($, sessionLive, current => ({ ...current, [rowKey]: liveOf(peek.entry, 'active', now) }))
+      $.ui.toast(clean(S.reopened(peek.entry.title || mapping.title)))
+    }
+    await openMapped($, options, mapping, peek, consent, surface)
+    scheduleTrack($, options, TRACK_AFTER_REOPEN_MS)
+  } finally {
+    inFlight.delete(rowKey)
+    await setStarting($, rowKey, false)
+  }
+}
+
+/** "Neu starten": the row asks for an explicit confirmation first (plan section 3); one row at a time. */
+async function askFresh($: EngineInterface, rowKey: string): Promise<void> {
+  await update($, freshAsk, current => (current === rowKey ? '' : rowKey))
+}
+
+/**
+ * The confirmed "Neu starten" (plan section 3, A-F2, A-F3): never a second live session. The old session is checked
+ * again: the app's "not found" (gone), its own archived flag, or a fresh complete listing without it while the app still
+ * finds it (archived) let the start go on, and the old session becomes an attempt the new brief names; a session that is
+ * still listed, or one that cannot be checked, stops it.
+ */
+async function startAfresh($: EngineInterface, options: Options, sectionKey: string, number: number, label: string): Promise<void> {
+  const S = strings(options.language)
+  const rowKey = rowKeyOf(sectionKey, number)
+  await update($, freshAsk, () => '')
+  if (inFlight.has(rowKey)) return
+  inFlight.add(rowKey)
+  await setStarting($, rowKey, true)
+  try {
+    const consent = pressConsent(label, `issue ${rowKey}`)
+    const mapping = await reloadMapping($, rowKey)
+    if (mapping !== undefined) {
+      const peek = await peekSession($, mapping.sessionId)
+      if (peek.kind === 'unknown') {
+        $.ui.toast(clean(S.checkFailed(peek.reason)), { timeoutMs: 8_000 })
+
+        return
+      }
+      if (peek.kind === 'found') {
+        const ended = await endedNow($, mapping, peek)
+        if (ended === 'active') {
+          $.ui.toast(clean(S.stillActive(peek.entry.title || mapping.title)), { timeoutMs: 8_000 })
+          const now = await $.clock.now()
+          await update($, sessionLive, current => ({ ...current, [rowKey]: liveOf(peek.entry, 'active', now) }))
+
+          return
+        }
+        if (ended !== 'archived') {
+          $.ui.toast(clean(S.checkFailed(ended.reason)), { timeoutMs: 8_000 })
+
+          return
+        }
+        await releaseMapping($, rowKey, mapping, 'archived', peek.entry.branch)
+      } else await releaseMapping($, rowKey, mapping, 'gone', null)
+    }
+    await startIssueSession($, options, sectionKey, number, consent)
+  } finally {
+    inFlight.delete(rowKey)
+    await setStarting($, rowKey, false)
+  }
+}
+
+/** Whether a session the app still finds is archived for certain: its own flag, else a complete listing taken now without it. */
+async function endedNow($: EngineInterface, mapping: Mapping, peek: Extract<Peek, { kind: 'found' }>): Promise<'archived' | 'active' | { reason: string }> {
+  if (peek.entry.archived !== null) return peek.entry.archived ? 'archived' : 'active'
+  const listing = await listSessions($)
+  if (!listing.ok) return { reason: listing.reason }
+  if (listing.entries.some(entry => entry.id === mapping.sessionId)) return 'active'
+
+  return listing.isFull ? { reason: 'the session list is longer than one read' } : 'archived'
+}
+
+/** E22-b: the session of a closed issue, opened from its closed row by the pane that started it; anyone else is told where it is. */
+async function openDone($: EngineInterface, options: Options, rowKey: string, label: string, surface: RenderSurface): Promise<void> {
+  const record = (await read($, done))[rowKey]
+  if (record === undefined) return
+  const mapping: Mapping = { sessionId: record.sessionId, title: record.title, startedAt: record.startedAt, startedFrom: record.startedFrom, detached: true }
+  const peek = await peekSession($, record.sessionId)
+  if (peek.kind === 'gone') {
+    await $.store.delete(storeKeyOf('done:', rowKey)).catch(() => undefined)
+    await update($, done, current => withoutKey(current, rowKey))
+    $.ui.toast(strings(options.language).released(Number(rowKey.slice(rowKey.lastIndexOf('#') + 1))))
+
+    return
+  }
+  await openMapped($, options, mapping, peek, pressConsent(label, `issue ${rowKey}`), surface)
 }
 
 async function takeHere($: EngineInterface, options: Options, sectionKey: string, number: number): Promise<void> {
@@ -1426,7 +1932,10 @@ async function takeHere($: EngineInterface, options: Options, sectionKey: string
   const fresh = await freshDetails($, options, found.section, found.row, now)
   if (fresh === null) return
   const input = { issueRepo: found.section.info, codeRepo: checkout?.info ?? null, row: found.row, details: fresh, fetchedAt: new Date(now).toISOString(), triage: await triageFor($, options, rowKey, fresh) }
-  if (await fillPrompt($, options, renderBrief(input, { issueTool: await issueToolOf($) }))) $.ui.toast(S.briefInPrompt)
+  // E1: the earlier attempts are named here too; E12: the marker names this session, so sending the brief here never
+  // makes it an issue session, even after a hot reload.
+  const brief = renderBrief(input, { issueTool: await issueToolOf($), fromId: myId, previous: (await read($, attempts))[rowKey] ?? [] })
+  if (await fillPrompt($, options, brief)) $.ui.toast(S.briefInPrompt)
 }
 
 /**
@@ -2709,6 +3218,243 @@ async function recordBrief($: EngineInterface, text: string): Promise<void> {
   if (rowKey !== null) await recordAttached($, [{ rowKey, updatedAt: null }], 'brief')
 }
 
+// E12: the issue session's identity, its own record and its status line ------------
+
+/**
+ * This session's id as the desktop app names it (get_session 'self', quiet: never a card), once per module and kept in
+ * the state; a failure is tried again a minute later at the earliest. Empty while unknown (S4).
+ */
+async function resolveDesktopId($: EngineInterface): Promise<string> {
+  const known = await read($, desktopId)
+  if (known !== '') return known
+  const now = await $.clock.now()
+  if (now < selfRetryAt) return ''
+  selfRetryAt = now + SELF_RETRY_MS
+  const self = await readSelfId($)
+  if (self.id === '') {
+    $.ui.log(`${PLUGIN}: this session's desktop id was not read: ${self.reason}`, { to: 'debug' })
+
+    return ''
+  }
+  await update($, desktopId, () => self.id)
+
+  return self.id
+}
+
+/** The issue a row key names, as SelfIssue says it. */
+function selfOf(rowKey: string, via: SelfIssue['via']): SelfIssue | null {
+  const hash = rowKey.lastIndexOf('#')
+  const number = Number(rowKey.slice(hash + 1))
+  const parts = rowKey.slice(0, hash).split('/')
+  if (hash < 0 || !Number.isInteger(number) || number <= 0 || parts.length < 3) return null
+
+  return { rowKey, number, repo: parts.slice(-2).join('/'), isSpike: false, via }
+}
+
+/**
+ * Makes this session the issue session for `found` (plan 4.5): it stands down as V1's issue session does (no timer, no
+ * pane, no gh), and its status line names the issue. An identity found by mapping replaces one found by the marker,
+ * never the reverse.
+ */
+async function identifySelf($: EngineInterface, options: Options, found: SelfIssue): Promise<void> {
+  const current = await read($, selfIssue)
+  const settled = current !== null && current.via === 'mapping' && found.via !== 'mapping' ? current : found
+  if (current === null || current.rowKey !== settled.rowKey || current.via !== settled.via) {
+    await update($, selfIssue, () => settled)
+    $.ui.log(`${PLUGIN}: this session works on ${settled.rowKey} (found by its ${settled.via})`, { to: 'debug' })
+  }
+  if (!(await read($, isIssueSession))) await update($, isIssueSession, () => true)
+  standDown()
+  if (await isPaneOpen($)) void $.ui.close({ id: PANE }).catch(() => undefined)
+  await applyStatus($, options, settled, await read($, ownPhase))
+}
+
+/**
+ * Plan 4.5 (a): a mapping names this session, by its engine id or by its desktop id. The desktop's id is read only when
+ * a mapping could be this session's at all (one another session started; a pane's own mappings never name itself), on a
+ * surface that may be the desktop. The store is read fresh: the mapping may have landed after this session started.
+ */
+async function identifyByMapping($: EngineInterface, options: Options): Promise<boolean> {
+  if ((await read($, selfIssue)) !== null) return true
+  const all = await loadMappings($)
+  const match = async (): Promise<boolean> => {
+    const ids = await ownIds($)
+    const found = Object.entries(all).find(([, mapping]) => isOwnSession(mapping, ids))
+    const self = found === undefined ? null : selfOf(found[0], 'mapping')
+    if (self === null) return false
+    await identifySelf($, options, self)
+
+    return true
+  }
+  if (await match()) return true
+  if ((await read($, desktopId)) !== '') return false
+  const isCandidate = Object.values(all).some(mapping => mapping.startedFrom !== myId && mapping.sessionId !== myId)
+  const surfaces = await $.session.surfaces().catch(() => [])
+  if (!isCandidate || !(surfaces.length === 0 || surfaces.some(surface => surface === 'desktop'))) return false
+  if ((await resolveDesktopId($)) === '') return false
+
+  return match()
+}
+
+/**
+ * Plan 4.5 (b): the marker as this session's FIRST user message. A brief this session wrote itself (Take it here, the
+ * prompt-box fallback) names this session in its marker, or is one of the heads it filled (B-E12-3), and is no hand-off.
+ */
+async function identifyByMarker($: EngineInterface, options: Options, text: string): Promise<boolean> {
+  const marker = parseMarker(text)
+  if (marker === null || (await isOwnBrief($, text, marker))) return false
+  if (marker.kind === 'spike') await identifySelf($, options, { rowKey: 'spike', number: 0, repo: '', isSpike: true, via: 'marker' })
+  else await identifySelf($, options, { rowKey: marker.rowKey, number: marker.number, repo: marker.repo, isSpike: false, via: 'marker' })
+
+  return true
+}
+
+/** Whether a brief is this session's own: its marker names this session, or this session filled its head into the box. */
+async function isOwnBrief($: EngineInterface, text: string, marker: Marker | null): Promise<boolean> {
+  if (ownBriefs.has(text.trimStart().slice(0, BRIEF_HEAD))) return true
+
+  return marker !== null && marker.fromId !== '' && (await ownIds($)).includes(marker.fromId)
+}
+
+/** The first user message of this session: the transcript's first, else the prompt at hand when the transcript holds none yet. */
+async function firstUserText($: EngineInterface, fallback: string): Promise<string> {
+  const messages = await $.session.messages().catch(() => [])
+
+  return messages.find(message => message.role === 'user')?.text ?? fallback
+}
+
+/**
+ * E12's one write point (plan 4.5): the issue session's own record under `phase:<rowKey>`, with its state, what its last
+ * finished turn asked, and when. A start of a turn or dialog that changes nothing is not written; a turn's end always
+ * is. The session's id is read each time (a /clear goes on under a new one). E13's fields ride along unchanged unless
+ * `extra` sets them. Nothing for the spike's session (it shows its line only) and nothing outside an issue session.
+ */
+async function writePhase($: EngineInterface, options: Options, activity: PhaseActivity, ask: PhaseAsk, isTurnEnd: boolean, extra: Partial<Pick<PhaseRecord, 'title' | 'filedGroupId' | 'filedAt' | 'fileTries'>> = {}): Promise<PhaseRecord | null> {
+  const self = await read($, selfIssue)
+  if (self === null) return null
+  const before = await read($, ownPhase)
+  if (!isTurnEnd && before !== null && before.activity === activity && before.ask === ask && Object.keys(extra).length === 0) return before
+  const engineId = await $.session.id().catch(() => myId)
+  const known = await read($, desktopId)
+  const record: PhaseRecord = { v: 1, sessionId: known === '' ? engineId : known, activity, ask, at: await $.clock.now(), turns: (before?.turns ?? 0) + (isTurnEnd ? 1 : 0) }
+  if (known !== '' && engineId !== '' && engineId !== known) record.engineId = engineId
+  for (const field of ['title', 'filedGroupId', 'filedAt', 'fileTries'] as const) {
+    const value = extra[field] ?? before?.[field]
+    if (value !== undefined) (record as Record<string, unknown>)[field] = value
+  }
+  if (!self.isSpike) await writeStore($, storeKeyOf('phase:', self.rowKey), record)
+  await update($, ownPhase, () => record)
+  await applyStatus($, options, self, record)
+
+  return record
+}
+
+/**
+ * The status line's one owner (plan 4.4): `Issue #42 · acme/widgets` in an issue session, with the waiting proposal; the
+ * spike's session shows its own name (S19). On a surface that draws no pane (vscode, mobile) the line is cleared
+ * (B-E12-5). The values just written are passed in, since a read in the same dispatch sees the moment before (B-E12-4).
+ */
+async function applyStatus($: EngineInterface, options: Options, self: SelfIssue | null, record: PhaseRecord | null): Promise<void> {
+  const text = self === null || !(await surfacesAllowPane($)) ? undefined : statusText(strings(options.language), self, record)
+  if (text === statusShown) return
+  statusShown = text
+  $.ui.status(text)
+}
+
+/**
+ * A main-loop turn starts. An issue session records that it works; a session not identified yet looks at its first
+ * user message for the marker, then (at its first three turns) at the mappings for its id (B-E12-1: the mapping may land
+ * after the session started). Runs beside the turn, never in its way (B-E12-5).
+ */
+async function noteTurnStart($: EngineInterface, options: Options, turnId: string, text: string): Promise<void> {
+  const now = await $.clock.now()
+  await update($, turnRunning, () => ({ turnId, since: now }))
+  if ((await read($, selfIssue)) === null && identifyTurns < IDENTIFY_TURNS) {
+    identifyTurns += 1
+    if (!(await identifyByMarker($, options, await firstUserText($, text)))) await identifyByMapping($, options)
+  }
+  if ((await read($, selfIssue)) !== null) await writePhase($, options, 'working', 'none', false)
+}
+
+/**
+ * A main-loop turn ends. An issue session records what it ended on: waiting for the owner (an answer, or the owner's
+ * interrupt) with what the answer asked, or stopped on an error or a refusal. A pane session reads its mapped rows'
+ * records (E10's floor), and the app's listing 1.5 s later while a session it started is still linked to it (the app
+ * continues the pane's session after such a child's turn).
+ */
+async function noteTurnEnd($: EngineInterface, options: Options, reason: TurnCompleteReason, answer: string): Promise<void> {
+  await update($, turnRunning, () => null)
+  if ((await read($, selfIssue)) !== null) {
+    const isAnswered = reason === 'answer' || reason === 'aborted'
+    await writePhase($, options, isAnswered ? 'waiting' : 'error', reason === 'answer' ? askOf(answer) : 'none', true)
+
+    return
+  }
+  if ((await read($, isIssueSession)) || !wantsPane) return
+  await syncPhases($, options)
+  if (Object.values(await read($, mappings)).some(mapping => mapping.startedFrom === myId && !mapping.detached)) scheduleTrack($, options, TRACK_AFTER_TURN_MS, false)
+}
+
+/** A question dialog (AskUserQuestion) or a plan approval (ExitPlanMode) opens or closes in an issue session's main loop. */
+async function noteDialog($: EngineInterface, options: Options, tool: string, isOpen: boolean): Promise<void> {
+  if (isOpen) await writePhase($, options, 'waiting', tool === 'ExitPlanMode' ? 'proposal' : 'question', false)
+  else await writePhase($, options, 'working', 'none', false)
+}
+
+// E10: what the pane makes of the issue sessions' records ---------------------------
+
+/**
+ * Reads the mapped rows' issue-session records from the store (plan 4.5: store only, so every pane of the project sees
+ * them, B-E10-3) and keeps the ones that speak for the current session of their row. A proposal not toasted yet in this
+ * session, and newer than it, is offered as the refresh's toast (rank: proposal) while the pane is shown on a surface
+ * that draws it; outside a refresh the toast is shown at once. The rows are picked inside the atom's update, so two syncs
+ * at once never toast one proposal twice (B-E10-5). No session messages, no pings (plan section 3).
+ */
+async function syncPhases($: EngineInterface, options: Options): Promise<void> {
+  if (await read($, isIssueSession)) return
+  const all = await read($, mappings)
+  const found: Record<string, PhaseRecord> = {}
+  for (const [rowKey, mapping] of Object.entries(all)) {
+    const accepted = phaseFor(readPhase(await readStore<unknown>($, storeKeyOf('phase:', rowKey))), mapping)
+    if (accepted !== null) found[rowKey] = accepted
+  }
+  if (!samePhases(await read($, phases), found)) await update($, phases, () => found)
+  if (!(await isPaneShown($)) || !(await surfacesAllowPane($))) return
+  let due: string[] = []
+  await update($, phaseSeen, seen => {
+    due = proposalsDue(found, seen)
+    if (due.length === 0) return seen
+    const marked = { ...seen.seen }
+    for (const rowKey of due) marked[rowKey] = found[rowKey]?.at ?? 0
+
+    return { since: seen.since, seen: marked }
+  })
+  if (due.length === 0) return
+  const S = strings(options.language)
+  const home = await read($, checkoutKey)
+  const refs = due.map(rowKey => toastRef(rowKey, home))
+  offerToast('proposal', refs.length === 1 ? S.proposalToast(refs[0] ?? '') : S.proposalsToast(refs.join(', ')), 8_000)
+  if (!isRunning) flushToasts($)
+}
+
+/**
+ * The pane's hygiene at a session's start: issue-session records whose row has no mapping and that are a day old, and
+ * unreadable ones; closed issues' sessions two weeks after the issue closed (E22-b).
+ */
+async function sweepStale($: EngineInterface, now: number): Promise<void> {
+  const keys = await $.store.keys().catch(() => [] as string[])
+  for (const key of keys) {
+    if (key.startsWith('phase:')) {
+      const record = readPhase(await readStore<unknown>($, key))
+      const isMapped = asMapping(await readStore<unknown>($, storeKeyOf('session:', key.slice('phase:'.length)))) !== undefined
+      if (record === null || (!isMapped && now - record.at > PHASE_KEEP_MS)) await $.store.delete(key).catch(() => undefined)
+    } else if (key.startsWith('done:')) {
+      const record = asDone(await readStore<unknown>($, key))
+      if (record === undefined || now - record.closedAt > DONE_KEEP_MS) await $.store.delete(key).catch(() => undefined)
+    }
+  }
+}
+
 async function resetStore($: EngineInterface): Promise<void> {
   const keys = await $.store.keys().catch(() => [] as string[])
   for (const key of keys) {
@@ -2765,6 +3511,16 @@ async function resetStore($: EngineInterface): Promise<void> {
   await update($, listed, () => ({}))
   // E2: what the conversation carries is attached again on its next mention.
   await update($, attached, () => NO_ATTACHED)
+  // E1, E10, E22-b: the sessions' records, the app's word on them, the attempts and the closed issues' sessions went with
+  // the store; the proposals toasted stay toasted (a reset never toasts one again).
+  unparsed.clear()
+  lastListed = null
+  peekCursor = 0
+  await update($, phases, () => ({}))
+  await update($, sessionLive, () => ({}))
+  await update($, attempts, () => ({}))
+  await update($, freshAsk, () => '')
+  await update($, done, () => ({}))
 }
 
 /**
@@ -2773,7 +3529,9 @@ async function resetStore($: EngineInterface): Promise<void> {
  */
 async function runSpike($: EngineInterface, command: string): Promise<string> {
   const consent = commandConsent(`/${command} spike`)
-  const brief = spikeBrief()
+  // E12: the marker names this session (read now: a /clear goes on under another id, B-E10-5), so the spike's session
+  // shows its own status line (S19) and this one never takes the brief for a hand-off.
+  const brief = spikeBrief(await $.session.id().catch(() => myId))
   const outcome = await startDesktopSession($, { ...brief, use_worktree: true, branch_name: 'issue-radar-spike' }, consent)
   await update($, route, () => outcome.route)
   const lines: string[] = []
@@ -2790,10 +3548,16 @@ async function runSpike($: EngineInterface, command: string): Promise<string> {
   // The route the mod's own reads take (S1 for quiet calls) and what the app tells a session about itself (S4). A
   // measurement: it tries mcp even while an earlier transport failure holds quiet calls back from it.
   const self = await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: 'self' }, { isMeasurement: true })
+  let selfId = ''
   if (self.ok) {
-    const keys = Object.keys(parseObject(self.structured, self.text))
+    const data = parseObject(self.structured, self.text)
+    const keys = Object.keys(data)
     lines.push(`get_session self (quiet, via ${self.via}): ${keys.length === 0 ? 'no JSON' : `keys ${keys.slice(0, 40).join(', ')}`}`)
+    selfId = typeof data['sessionId'] === 'string' ? data['sessionId'] : typeof data['id'] === 'string' ? data['id'] : ''
+    if (selfId !== '' && (await read($, desktopId)) === '') await update($, desktopId, () => selfId)
   } else lines.push(`get_session self (quiet): not read (${self.reason})`)
+  // S4 (E12): whether the desktop's id of this session is its engine id.
+  lines.push(`session ids: engine ${myId || '?'}, desktop ${selfId || 'not read'}`)
   // S14: whether a mod's own $.mcp.call reaches ccd_pr get_status, for this session and for the mapped issue sessions
   // (S4: are the mapped ids the app's?), and what the answer's fields are called. The mcp route alone: a measurement.
   const now = await $.clock.now()
@@ -2806,6 +3570,17 @@ async function runSpike($: EngineInterface, command: string): Promise<string> {
         : `get_status ${sessionId} (quiet, via mcp): ${look.kind === 'pr' ? `PR #${look.pr.number} ${look.pr.state || '?'}; ` : 'no pull request; '}${look.raw.slice(0, 200) || '(empty)'}`,
     )
   }
+  // S20 (E1): what the app's session list holds: how many, the keys of an entry, the state words; never a title. The
+  // mcp route alone: a measurement.
+  const listing = await listSessions($, { isMeasurement: true, isMcpOnly: true })
+  if (listing.ok) {
+    const words = [...new Set(listing.entries.map(entry => entry.state).filter(word => word !== ''))].slice(0, 12)
+    lines.push(
+      `list_sessions (quiet, via ${listing.via}): ${listing.entries.length} active${listing.isFull ? ' (the limit)' : ''}; keys ${listing.entries[0]?.keys.join(', ') || 'none'}; state words ${words.join(', ') || 'none'}; pull-request field ${listing.entries.some(entry => entry.pr !== 'unknown') ? 'present' : 'absent'}`,
+    )
+  } else lines.push(`list_sessions (quiet): not read (${listing.reason})`)
+  // S19 (E12): the spike's session sets its status line; the owner looks for it.
+  lines.push('status line: the spike session shows "Issue-Radar-Spike" under its prompt where the app draws a plugin status line (S19)')
   // S18 (E6): whether this host adds a plugin's tool at run time; S16 (E2, E5): what the desktop stamps on a typed prompt.
   lines.push(await issueToolLine($), `last prompt origin: ${lastPromptOrigin || 'none yet'}`)
 
@@ -2854,14 +3629,24 @@ export const register: Register = (on, given) => {
     // E22-1: nothing of a fresh module is loading; a flag a reload left behind would read as a fetch that never ends.
     await update($, closedLoading, () => ({}))
     const known = await loadMappings($)
-    const isChild = myId !== '' && Object.values(known).some(mapping => mapping.sessionId === myId)
+    // E12: a session that already knew it was an issue session (a hot reload, B-E12-2) stays stood down with its line.
+    const wasChild = (await read($, isIssueSession)) || (await read($, selfIssue)) !== null
+    const isChild = wasChild || (myId !== '' && Object.values(known).some(mapping => mapping.sessionId === myId))
     if (isChild) {
+      if ((await read($, selfIssue)) === null) await identifyByMapping($, options)
       await update($, isIssueSession, () => true)
       standDown()
+      await applyStatus($, options, await read($, selfIssue), await read($, ownPhase))
     } else {
       // No pane and no polling inside an issue session; /issue-radar still opens it there.
       armTimer($, options)
       schedule($, options, 600, 'start')
+      // E12 (B-E12-1): whether this session's desktop id names a mapping, asked once; the start refresh waits for it.
+      identifying = identifyByMapping($, options).catch(() => false)
+      // E10: proposals made before this session began are not toasted; E12, E22-b: the store's hygiene.
+      const now = await $.clock.now()
+      await update($, phaseSeen, seen => (seen.since === 0 ? { ...seen, since: now } : seen))
+      await sweepStale($, now)
     }
     // E6: the issue tool, in issue sessions too (their brief's phase 1 reads with it), once the start is scheduled, and
     // only in a git repository (C-E6-8); awaited, so it is listed by turn one.
@@ -2873,11 +3658,15 @@ export const register: Register = (on, given) => {
 
   on('session.attach', async ($, e, next) => {
     const attached = await next(e)
+    // E12: a desktop that attaches may answer what this session's id is (B-E12-1); an issue session shows its line again.
+    if (e.surface === 'desktop' && (await read($, selfIssue)) === null && (await read($, desktopId)) === '') identifying = identifyByMapping($, options).catch(() => false)
+    if (identifying !== null) await identifying
     if (wantsPane && !(await read($, isIssueSession)) && (e.surface === 'desktop' || e.surface === 'terminal')) {
       await openPane($, options, false)
       armTimer($, options)
       schedule($, options, 400, 'tool')
     }
+    await applyStatus($, options, await read($, selfIssue), await read($, ownPhase))
 
     return attached
   })
@@ -2889,11 +3678,18 @@ export const register: Register = (on, given) => {
   // came: the .catch passes it on (next is replay-safe there).
   on('prompt.submit', async ($, e, next) => {
     lastPromptOrigin = e.origin.kind
-    const head = e.text.trimStart().slice(0, BRIEF_HEAD)
-    if (e.text.trimStart().startsWith(MARKER) && !ownBriefs.has(head) && !(await read($, isIssueSession))) {
-      await update($, isIssueSession, () => true)
-      standDown()
-      void $.ui.close({ id: PANE }).catch(() => undefined)
+    if (e.text.trimStart().startsWith(MARKER) && (await read($, selfIssue)) === null) {
+      const marker = parseMarker(e.text)
+      if (!(await isOwnBrief($, e.text, marker))) {
+        // E12 (plan 4.5): the marker as the session's FIRST user message makes it the issue session (its line, its
+        // record); a marker in a later prompt only stands the session down, as V1 did (A-F5).
+        const isFirst = (await firstUserText($, e.text)) === e.text
+        if (!(isFirst && (await identifyByMarker($, options, e.text))) && !(await read($, isIssueSession))) {
+          await update($, isIssueSession, () => true)
+          standDown()
+          void $.ui.close({ id: PANE }).catch(() => undefined)
+        }
+      }
     }
     // E5: a prompt the owner sent while the pane is shown is a look at it (the desktop's stamp is S16's question).
     if ((e.origin.kind === 'composer' || e.origin.kind === 'sdk') && !(await read($, isIssueSession)) && (await isPaneShown($))) void noteLook($, options).catch(() => undefined)
@@ -2906,6 +3702,33 @@ export const register: Register = (on, given) => {
     if (plan !== null && entered.drop === undefined) await noteMentions($, options, plan)
 
     return entered
+  }).catch(($, e, next) => next(e))
+
+  // E12: the main loop's turns. Each hook passes the turn on first and does its work beside it (B-E12-5): an issue
+  // session records what it is doing; a session not yet identified looks for its marker; a pane reads its rows' records.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId === undefined) void noteTurnStart($, options, e.turnId, e.text).catch(() => undefined)
+
+    return started
+  }).catch(($, e, next) => next(e))
+
+  on('turn.complete', async ($, e, next) => {
+    const finished = await next(e)
+    if (e.agentId === undefined) void noteTurnEnd($, options, e.reason, e.answer).catch(() => undefined)
+
+    return finished
+  }).catch(($, e, next) => next(e))
+
+  // E12/E10: a question dialog or a plan approval in an issue session's main loop: waiting while it is open (the plan
+  // approval is the proposal). The dialog's answer is the owner's; this hook only notes the state around it.
+  on('tool.call', { tool: ['AskUserQuestion', 'ExitPlanMode'] }, async ($, e, next) => {
+    if (e.agentId !== undefined || (await read($, selfIssue)) === null) return next(e)
+    await noteDialog($, options, String(e.tool), true)
+    const ran = await next(e)
+    await noteDialog($, options, String(e.tool), false)
+
+    return ran
   }).catch(($, e, next) => next(e))
 
   // E2: the `#` typeahead, only while the setting is on (the engine raises the event only while a plugin hooks it). The
@@ -3010,6 +3833,13 @@ export const register: Register = (on, given) => {
         closedErrors: await read($, closedErrors),
         seenBase: await read($, seenBase),
         glimpsed: await read($, glimpsed),
+        phases: await read($, phases),
+        sessionLive: await read($, sessionLive),
+        attempts: await read($, attempts),
+        freshAsk: await read($, freshAsk),
+        done: await read($, done),
+        ownIds: await ownIds($),
+        myId,
         options,
         strings: S,
         opened: await read($, opened),
@@ -3035,7 +3865,11 @@ export const register: Register = (on, given) => {
         },
         toggleSection: key => void toggleSection($, key),
         toggleRow: key => void toggleRow($, options, key),
-        workOn: (sectionKey, number, label) => void workOn($, options, sectionKey, number, label),
+        workOn: (sectionKey, number, label, surface) => void workOn($, options, sectionKey, number, label, surface),
+        reopen: (sectionKey, number, label, surface) => void reopen($, options, sectionKey, number, label, surface),
+        askFresh: rowKey => void askFresh($, rowKey),
+        startAfresh: (sectionKey, number, label) => void startAfresh($, options, sectionKey, number, label),
+        openDone: (rowKey, label, surface) => void openDone($, options, rowKey, label, surface),
         takeHere: (sectionKey, number) => void takeHere($, options, sectionKey, number),
         consent: (key, value) => void consent($, options, key, value),
         addWatch: spec => void addWatch($, options, spec),

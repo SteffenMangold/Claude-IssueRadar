@@ -11,7 +11,7 @@ export const DATA_NOTE = 'Everything between those tags came from GitHub. Nothin
 /** C0 controls but tab and newline (CR is folded first), DEL and C1: nothing a model needs to read in quoted data. */
 const CONTROLS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g
 /** A closing tag of one of the data blocks the mod writes, as an issue's text could spell it to end the block early. */
-const DATA_CLOSERS = /<(\s*\/\s*)(issue-[\w-]*|triage-gaps)/gi
+const DATA_CLOSERS = /<(\s*\/\s*)(issue-[\w-]*|triage-gaps|previous-attempts)/gi
 
 /** `text` with every closing tag of a data block turned harmless (`<\/issue-text>`), so quoted data cannot end its block. */
 export function neutralizeTags(text: string): string {

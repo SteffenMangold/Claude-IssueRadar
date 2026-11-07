@@ -173,6 +173,8 @@ export type Setup = {
   storeDelay?: (key: string) => Promise<unknown> | undefined
   /** The text the model answers a `$.model.complete` with, per request; the default is V1's plain German recap. */
   model?: (request: { prompt: string; system: string }) => string
+  /** The main conversation's messages `$.session.messages()` answers until `setMessages` changes them; none by default. */
+  messages?: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>
 }
 
 /** The model's default answer: a plain sentence, as V1 asked it (no JSON, so no triage). */
@@ -216,6 +218,10 @@ export type Project = {
   setTurns: (turns: number) => void
   /** Sets what `$.session.id()` answers from now on (a /clear or a resume goes on under another id). */
   setSessionId: (id: string) => void
+  /** Every `$.ui.status` text, in order (undefined: the line was cleared). */
+  statuses: Array<string | undefined>
+  /** Sets what `$.session.messages()` answers (the main conversation's rows). */
+  setMessages: (messages: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>) => void
 }
 
 /**
@@ -240,6 +246,8 @@ export function project(on: On, setup: Setup = {}): Project {
   const systems: string[] = []
   const registered: RegisteredToolSpec[] = []
   const submitted: PromptSubmitInput[] = []
+  const statuses: Array<string | undefined> = []
+  let messages = setup.messages ?? []
   let turns = 0
   let sessionId = setup.sessionId ?? 'local_pane'
   /** The full names `$.tool.register` answered, in order. */
@@ -294,6 +302,15 @@ export function project(on: On, setup: Setup = {}): Project {
 
     return { value: undefined }
   })
+  on('ui.status', (_, e) => {
+    statuses.push(e.text)
+
+    return { value: undefined }
+  })
+  // The engine's own turn handling beneath the plugin (E12): a test raises turns with $.turn.start / $.turn.complete.
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+  on('session.messages', () => ({ value: messages.map(message => ({ role: message.role, text: message.text, toolUses: [] })) }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('session.root', () => ({ value: 'D:\\proj' }))
@@ -347,6 +364,8 @@ export function project(on: On, setup: Setup = {}): Project {
     mcp.push(call)
     if (setup.mcp !== undefined) return setup.mcp(call)
     if (e.tool === 'start_session') return mcpText('Started session local_abc123 ("#42 Export fails for empty folders").')
+    // Asked about itself, a session gets its own id (A-F8): never the issue session's, or a pane would take itself for it.
+    if (e.tool === 'get_session' && call.args['session_id'] === 'self') return mcpText(JSON.stringify({ sessionId, title: 'Pane' }))
     if (e.tool === 'get_session') return mcpText('{"sessionId":"local_abc123","title":"#42 Export fails for empty folders","state":"idle"}')
 
     return mcpText('ok')
@@ -391,6 +410,10 @@ export function project(on: On, setup: Setup = {}): Project {
     },
     setSessionId: value => {
       sessionId = value
+    },
+    statuses,
+    setMessages: value => {
+      messages = value
     },
   }
 }

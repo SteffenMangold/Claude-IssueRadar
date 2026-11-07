@@ -114,6 +114,8 @@ export type LayoutInput = {
   recaps: Readonly<Record<string, Recap>>
   details: Readonly<Record<string, IssueDetails>>
   mappings: Readonly<Record<string, Mapping>>
+  /** E1: rows without a mapping draw a line naming their last earlier attempt. */
+  attempts?: Readonly<Record<string, readonly unknown[]>>
   /** Sections that draw the consent block above their rows. */
   asking: ReadonlySet<string>
 }
@@ -150,7 +152,8 @@ export function rowTops(plan: DrawnPlan, layout: LayoutInput): RowTop[] {
         tops.push({ key, sectionKey: section.key, row, top })
         const recap = layout.recaps[key]
         const text = recap !== undefined && recap.error === undefined ? recap.text.length : (layout.details[key]?.excerpt.length ?? 40)
-        const extra = (layout.mappings[key] !== undefined ? 1 : 0) + (layout.opened === key ? 16 : 0)
+        const hasSessionLine = layout.mappings[key] !== undefined || (layout.attempts?.[key]?.length ?? 0) > 0
+        const extra = (hasSessionLine ? 1 : 0) + (layout.opened === key ? 16 : 0)
         top += 3 + lines(row.title.length + 6, width) + lines(text, width) + extra
       }
     }
@@ -189,6 +192,8 @@ export type PaneLike = Omit<DrawnInput, 'closedDays'> & {
   recaps: Readonly<Record<string, Recap>>
   details: Readonly<Record<string, IssueDetails>>
   mappings: Readonly<Record<string, Mapping>>
+  /** E1: the earlier attempts per row (their line counts in the layout). */
+  attempts?: Readonly<Record<string, readonly unknown[]>>
   isFilterOpen: boolean
   isSettingsOpen: boolean
   columns: number
@@ -200,7 +205,7 @@ export function paneLayout(pane: PaneLike): { plan: DrawnPlan; tops: RowTop[] } 
   const facet = pane.settings.boards === true ? pane.filter.board : ''
   const asking = new Set(pane.sections.filter(section => pane.options.recaps && section.info !== null && section.state.kind === 'ok' && pane.settings.consent[section.key] === undefined).map(section => section.key))
   const head = headRows(!isDefaultFilter({ ...pane.filter, board: facet }), pane.isFilterOpen, pane.isSettingsOpen)
-  const tops = rowTops(plan, { columns: pane.columns, head, opened: pane.opened, recaps: pane.recaps, details: pane.details, mappings: pane.mappings, asking })
+  const tops = rowTops(plan, { columns: pane.columns, head, opened: pane.opened, recaps: pane.recaps, details: pane.details, mappings: pane.mappings, ...(pane.attempts === undefined ? {} : { attempts: pane.attempts }), asking })
 
   return { plan, tops }
 }

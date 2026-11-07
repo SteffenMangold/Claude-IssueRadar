@@ -7,7 +7,7 @@
 // mark would get the whole tree refused.
 import type { Elements, RenderElement, RenderSurface, Space } from 'claude-code'
 
-import type { Boards, ClosedCache, ClosedRow, Facets, Filter, FilterGroup, FilterSort, Glimpse, Inbox, InboxRow, IssueDetails, IssueRef, IssueRow, Mapping, Mark, Options, PrRecord, Reactions, Recap, RepoSettings, RepoState, SeenRecord, Section, SessionPr, StartRoute, Triage } from '../types'
+import type { Boards, ClosedCache, ClosedRow, DoneMapping, Facets, Filter, FilterGroup, FilterSort, Glimpse, Inbox, InboxRow, IssueDetails, IssueRef, IssueRow, Mapping, Mark, Options, PhaseRecord, PrRecord, PreviousAttempt, Reactions, Recap, RepoSettings, RepoState, SeenRecord, Section, SessionLive, SessionPr, StartRoute, Triage } from '../types'
 import { BOARD_STATUS_CHARS, boardItemFor, boardOptions } from './boards'
 import { CLOSED_LOADING_MS, closedCountLabel, sinceDate } from './closed'
 import { ANY, GROUPS, SORTS, VIEWS, cutText, isBuiltInView, isDefaultFilter, matchesUrl, sanitizeQuery } from './filter'
@@ -18,6 +18,8 @@ import { cardRowsOf, isFilteredList, paneLayout, rowKeyOf, unreadCount, visibleM
 import { linksOf, prCardLine, prChip, prLine, prRefOf } from './prs'
 import type { PrTone, ShownPr } from './prs'
 import { clean, cleanLine } from './text'
+import { isOwnSession, rowBadge } from './tracking'
+import type { Badge, BadgeKind } from './tracking'
 import { labelSays } from './triage'
 
 export { rowKeyOf }
@@ -54,6 +56,18 @@ export type ViewState = {
   /** E5's baselines per repository key and the glimpses per row key: what the marks are drawn from. */
   seenBase: Record<string, SeenRecord>
   glimpsed: Record<string, Glimpse>
+  /** E10: the issue sessions' records per mapped row; E1: the app's word on each mapped session at the last pass. */
+  phases: Record<string, PhaseRecord>
+  sessionLive: Record<string, SessionLive>
+  /** E1: the earlier attempts per row, and the row whose "Neu starten" waits for its confirmation. */
+  attempts: Record<string, PreviousAttempt[]>
+  freshAsk: string
+  /** E22-b: the sessions of issues that closed, by row key. */
+  done: Record<string, DoneMapping>
+  /** This session's ids (engine, and desktop once known): a mapping naming one is this very session. */
+  ownIds: string[]
+  /** This session's engine id: the pane that started a session may open it. */
+  myId: string
   options: Options
   strings: Strings
   opened: string
@@ -81,8 +95,18 @@ export type ViewActions = {
   close: () => void
   toggleSection: (key: string) => void
   toggleRow: (rowKey: string) => void
-  /** `label` is the button's label as drawn: the owner's own words for the press, which a typed desktop call carries. */
-  workOn: (sectionKey: string, number: number, label: string) => void
+  /**
+   * `label` is the button's label as drawn: the owner's own words for the press, which a typed desktop call carries;
+   * `surface` is where the press came from (only a desktop press opens a session in the window).
+   */
+  workOn: (sectionKey: string, number: number, label: string, surface: RenderSurface) => void
+  /** E1: an archived session's "Wieder öffnen". */
+  reopen: (sectionKey: string, number: number, label: string, surface: RenderSurface) => void
+  /** E1: "Neu starten" asks for its confirmation; the confirmation starts afresh. */
+  askFresh: (rowKey: string) => void
+  startAfresh: (sectionKey: string, number: number, label: string) => void
+  /** E22-b: a closed row's "Zur Session". */
+  openDone: (rowKey: string, label: string, surface: RenderSurface) => void
   takeHere: (sectionKey: string, number: number) => void
   consent: (repoKey: string, value: boolean) => void
   addWatch: (spec: string) => void
@@ -172,6 +196,22 @@ const CARD_PRS = 2
 const REACTION_GLYPH: Record<string, string> = { THUMBS_UP: '👍', THUMBS_DOWN: '👎', LAUGH: '😄', HOORAY: '🎉', CONFUSED: '😕', HEART: '❤️', ROCKET: '🚀', EYES: '👀' }
 /** E9: the kind chip's hue. */
 const KIND_HUE: Record<Triage['kind'], string> = { bug: HUE.red, feature: HUE.blue, question: HUE.amber, other: HUE.gray }
+/** E1/E10: each badge's glyph on the terminal, its ink and its hue. */
+const BADGE_LOOK: Record<BadgeKind, { dot: string; ink: string; hue: string }> = {
+  self: { dot: '◎', ink: INK.brand, hue: HUE.brand },
+  gone: { dot: '×', ink: INK.muted, hue: HUE.gray },
+  archived: { dot: '○', ink: INK.muted, hue: HUE.gray },
+  starting: { dot: '○', ink: INK.muted, hue: HUE.gray },
+  working: { dot: '●', ink: INK.accent, hue: HUE.blue },
+  question: { dot: '●', ink: INK.warning, hue: HUE.amber },
+  waiting: { dot: '●', ink: INK.secondary, hue: HUE.gray },
+  proposal: { dot: '●', ink: INK.brand, hue: HUE.brand },
+  error: { dot: '●', ink: INK.error, hue: HUE.red },
+  idle: { dot: '○', ink: INK.secondary, hue: HUE.gray },
+  active: { dot: '○', ink: INK.secondary, hue: HUE.gray },
+}
+/** E1: how old the app's word may be before a badge resting on it is drawn subdued: two refresh periods, ten minutes at least. */
+const STALE_MIN_MS = 10 * 60_000
 
 /** E4: `👍 3 😄 1`, the most first (GitHub's order between equals), at most `max`; empty without reactions. */
 export function reactionsText(reactions: Reactions | undefined, max = 4): string {
@@ -1102,6 +1142,86 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     )
   }
 
+  /** E1/E10: the row's one badge (tracking.ts rowBadge): the app's word on the session merged with its own record. */
+  const badgeOf = (key: string, mapping: Mapping): Badge | null =>
+    rowBadge({
+      mapping,
+      live: state.sessionLive[key],
+      record: state.phases[key],
+      isSelf: isOwnSession(mapping, state.ownIds),
+      now: state.now,
+      staleMs: Math.max(STALE_MIN_MS, 2 * options.refreshMinutes * 60_000),
+    })
+
+  /** `vor 3m`, `gerade eben`: how long ago, for the session line. */
+  const agoOf = (at: number): string => {
+    const age = shortAgo(new Date(at).toISOString(), state.now, S.ago)
+
+    return S.sessionAge(age === S.ago.now ? null : age)
+  }
+
+  /** The badge itself: a tinted pill on a graphical surface, `● label` in its ink on the terminal. */
+  const badgePill = (kind: BadgeKind, isStale: boolean) => {
+    const look = BADGE_LOOK[kind]
+    const ink = isStale ? INK.muted : look.ink
+
+    return isRich ? pill(S.badges[kind], ink, look.hue, true) : <Text color={ink}>{`${look.dot} ${S.badges[kind]}`}</Text>
+  }
+
+  /**
+   * The session line (plan 4.6, line 4), for a row with a mapping or an earlier attempt: the badge, since when its state
+   * holds (else the session's age), whether the session is still linked, the app's link for a pane that did not start it,
+   * and an archived session's "Neu starten" with its confirmation. A row with only attempts names the last one.
+   */
+  const sessionBlock = (section: Section, item: IssueRow, mapping: Mapping | undefined, badge: Badge | null) => {
+    const key = rowKeyOf(section.key, item.number)
+    if (mapping === undefined) {
+      const last = state.attempts[key]?.[0]
+      if (last === undefined) return null
+
+      return (
+        <Box key={`attempt:${key}`} flexDirection="row">
+          <Text size="caption" color={INK.muted} wrap="truncate-end">
+            {S.earlierAttempt(S.badges[last.endedAs], agoOf(last.at))}
+          </Text>
+        </Box>
+      )
+    }
+    const live = state.sessionLive[key]
+    const link = live !== undefined && live.sessionId === mapping.sessionId && live.link !== null && live.link.startsWith('https://') && mapping.startedFrom !== state.myId ? live.link : null
+    const facts = [agoOf(badge?.since ?? mapping.startedAt), ...(mapping.detached ? [] : [S.sessionLinked])].join(' · ')
+    const isAsking = state.freshAsk === key && (badge?.kind === 'archived' || badge?.kind === 'gone')
+    const ended = badge?.kind === 'gone' ? S.badges.gone : S.badges.archived
+
+    return (
+      <Box key={`session-row:${key}`} flexDirection="column" rowGap={step('xs', 0)}>
+        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} rowGap={step('xs', 0)}>
+          {badge !== null && (
+            <Box key={`badge:${key}`} flexShrink={0}>
+              {badgePill(badge.kind, badge.isStale)}
+            </Box>
+          )}
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Text size="caption" color={INK.muted} wrap="truncate-end">
+              {facts}
+            </Text>
+          </Box>
+          {link !== null && <Link href={clean(link)} label={S.sessionLink} />}
+          {badge?.kind === 'archived' && !isAsking && <Button key={`fresh:${key}`} plain dimColor label={S.startAfresh} onPress={() => actions.askFresh(key)} />}
+        </Box>
+        {isAsking && (
+          <Box key={`fresh-ask:${key}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
+            <Text size="caption" color={INK.warning} wrap="wrap">
+              {S.freshAsk(item.number, ended)}
+            </Text>
+            <Button key={`fresh-confirm:${key}`} label={S.freshConfirm} variant="primary" onPress={() => actions.startAfresh(section.key, item.number, S.freshConfirm)} />
+            <Button key={`fresh-cancel:${key}`} plain label={S.freshCancel} onPress={() => actions.askFresh(key)} />
+          </Box>
+        )}
+      </Box>
+    )
+  }
+
   const row = (section: Section, item: IssueRow) => {
     const key = rowKeyOf(section.key, item.number)
     const details = state.details[key]
@@ -1109,7 +1229,20 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     const mapping = state.mappings[key]
     const isOpen = state.opened === key
     const isStarting = state.starting[key] === true
-    const workLabel = isStarting ? S.starting : mapping !== undefined ? S.openSession : S.workOnIt
+    const badge = mapping === undefined ? null : badgeOf(key, mapping)
+    // E1's ladder on the primary button: open a session that is there, reopen an archived one, start afresh once it is gone.
+    const workLabel = isStarting
+      ? S.starting
+      : mapping === undefined
+        ? S.workOnIt
+        : badge?.kind === 'self'
+          ? S.thisSession
+          : badge?.kind === 'archived'
+            ? S.reopen
+            : badge?.kind === 'gone'
+              ? S.startAfresh
+              : S.openSession
+    const isPrimary = !isStarting && (mapping === undefined || badge?.kind === 'archived' || badge?.kind === 'gone')
     // E4: the card goes before the row's own text in the tree, so it is drawn while the text before it stays well
     // under the tree's budget (E4-4); the row's visible text counts toward that too, by a rough measure.
     const card = cardKeys.has(key) && !isOpen && textSoFar < CARD_TEXT_STOP ? cardOf(section, item, details, recap) : null
@@ -1149,12 +1282,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
             {recapLine(section, item, details, recap)}
           </Box>
         )}
-        {mapping !== undefined && (
-          <Text size="caption" color={INK.muted} wrap="truncate-end">
-            {S.sessionLine(clean(mapping.title), fmtTime(mapping.startedAt))}
-            {mapping.detached ? '' : ` · ${S.sessionLinked}`}
-          </Text>
-        )}
+        {sessionBlock(section, item, mapping, badge)}
         {statusStrip(section, item, details)}
         <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
           <Box flexGrow={1} flexShrink={1} minWidth={0}>
@@ -1163,10 +1291,13 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           <Button
             key={`work:${key}`}
             label={workLabel}
-            variant={mapping === undefined && !isStarting ? 'primary' : undefined}
-            dimColor={isStarting}
-            onPress={() => {
-              if (!isStarting) actions.workOn(section.key, item.number, workLabel)
+            variant={isPrimary ? 'primary' : undefined}
+            dimColor={isStarting || badge?.kind === 'self'}
+            onPress={press => {
+              if (isStarting || badge?.kind === 'self') return
+              if (badge?.kind === 'archived') actions.reopen(section.key, item.number, workLabel, press.surface)
+              else if (badge?.kind === 'gone') actions.askFresh(key)
+              else actions.workOn(section.key, item.number, workLabel, press.surface)
             }}
           />
           <Button key={`here:${key}`} plain label={S.takeHere} onPress={() => actions.takeHere(section.key, item.number)} />
@@ -1222,6 +1353,9 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     const glyph = reason === 'COMPLETED' ? '✓' : reason === 'NOT_PLANNED' || reason === 'DUPLICATE' ? '⊘' : '•'
     const word = reason === 'COMPLETED' ? S.closedCompleted : reason === 'NOT_PLANNED' ? S.closedNotPlanned : reason === 'DUPLICATE' ? S.closedDuplicate : S.closedPlain
     const first = item.prs[0]
+    // E22-b: the session that worked on the issue, while the pane keeps it (two weeks after the issue closed).
+    const rowKey = rowKeyOf(section.key, item.number)
+    const finished = state.done[rowKey]
 
     return (
       <Box key={`closed-row:${section.key}#${item.number}`} flexDirection="column">
@@ -1245,6 +1379,16 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           )}
           <Link href={clean(item.url)} label={S.github} />
         </Box>
+        {finished !== undefined && (
+          <Box key={`closed-session-line:${rowKey}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)}>
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Text size="caption" color={INK.muted} wrap="truncate-end">
+                {S.sessionLine(clean(finished.title), fmtTime(finished.startedAt))}
+              </Text>
+            </Box>
+            <Button key={`closed-session:${rowKey}`} plain label={S.openSession} onPress={press => actions.openDone(rowKey, S.openSession, press.surface)} />
+          </Box>
+        )}
       </Box>
     )
   }

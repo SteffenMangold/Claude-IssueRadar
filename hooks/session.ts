@@ -344,11 +344,197 @@ export async function lookUpSession($: EngineInterface, sessionId: string, conse
   return { exists: true, isArchived: archived, title: str('title'), link: str('link') || null, state: str('state') }
 }
 
-/** Focuses a session the pane started, for a press; false when the app refused (not started by this session, not on screen, a text field holds the cursor). */
-export async function focusSession($: EngineInterface, sessionId: string, consent?: string): Promise<{ ok: boolean; reason?: string }> {
-  const answer = await callDesktop($, 'ccd_window', 'open_session_in', { session_id: sessionId, target: 'focus' }, consent)
+// The app's sessions as E1 and E12 read them -------------------------------------
 
-  return answer.ok ? { ok: true } : { ok: false, reason: answer.reason }
+/**
+ * One session as the app lists it (list_sessions) or describes it (get_session). The documented fields are the id,
+ * `name` and `startedBy` (linked sessions), `group`, `pinned`, `link`; `title`, a branch and a pull request the schema
+ * names as searchable; `parentSessionId` and `detached` (get_session). A state word and an archived flag are not
+ * documented (A-F3): the mod reads them only where they appear, and the spike records what does (S20).
+ */
+export type SessionEntry = {
+  id: string
+  title: string
+  /** The app's state word, lowercased, at most 32 characters; empty for none. */
+  state: string
+  /** An explicit archived flag or state word; null when the answer says nothing either way. */
+  archived: boolean | null
+  /** Explicit running / needs-input flags. */
+  isRunning: boolean | null
+  needsInput: boolean | null
+  name: string | null
+  link: string | null
+  branch: string | null
+  parentSessionId: string | null
+  startedBy: string | null
+  detached: boolean | null
+  /** Whether the entry names a pull request: `unknown` when it carries no such field at all. */
+  pr: 'yes' | 'no' | 'unknown'
+  /** The entry's keys, for the spike (S20). */
+  keys: string[]
+}
+
+const PR_KEYS = ['pr', 'pullRequest', 'pull_request', 'prNumber', 'pr_number', 'prUrl', 'pr_url', 'boundPr', 'bound_pr']
+
+/** One entry of an answer, every field read defensively; null without an id. */
+export function entryOf(data: Record<string, unknown>): SessionEntry | null {
+  const text = (keys: readonly string[]): string => {
+    for (const key of keys) {
+      const value = data[key]
+      if (typeof value === 'string' && value !== '') return value
+    }
+
+    return ''
+  }
+  const flag = (keys: readonly string[]): boolean | null => {
+    for (const key of keys) if (typeof data[key] === 'boolean') return data[key] as boolean
+
+    return null
+  }
+  const id = text(['sessionId', 'session_id', 'id'])
+  if (id === '') return null
+  const state = text(['state', 'status', 'activity', 'phase']).toLowerCase().slice(0, 32)
+  const worktree = typeof data['worktree'] === 'object' && data['worktree'] !== null ? (data['worktree'] as Record<string, unknown>) : {}
+  const branch = text(['branch', 'branchName', 'branch_name', 'gitBranch']) || (typeof worktree['branch'] === 'string' ? worktree['branch'] : '')
+  const archivedFlag = flag(['archived', 'isArchived', 'is_archived'])
+  const hasPrKey = PR_KEYS.some(key => key in data)
+  const prValue = PR_KEYS.map(key => data[key]).find(value => value !== undefined && value !== null && value !== false && value !== '' && value !== 0)
+
+  return {
+    id,
+    title: text(['title']),
+    state,
+    archived: archivedFlag ?? (state === 'archived' ? true : null),
+    isRunning: flag(['isRunning', 'running']),
+    needsInput: flag(['needsInput', 'needs_input', 'awaitingInput', 'awaiting_input']),
+    name: text(['name']) || null,
+    link: text(['link', 'url']) || null,
+    branch: branch === '' ? null : branch,
+    parentSessionId: text(['parentSessionId', 'parent_session_id']) || null,
+    startedBy: text(['startedBy', 'started_by']) || null,
+    detached: flag(['detached']),
+    pr: prValue !== undefined ? 'yes' : hasPrKey ? 'no' : 'unknown',
+    keys: Object.keys(data).slice(0, 40),
+  }
+}
+
+/**
+ * The entries of a list_sessions answer: an array, `{ sessions: [...] }`, or the JSON array in its text (prose around
+ * it allowed). Null when the answer holds none: a listing that could not be read, never an empty one.
+ */
+export function parseSessions(structured: unknown, text: string): SessionEntry[] | null {
+  const fromValue = (value: unknown): SessionEntry[] | null => {
+    const list = Array.isArray(value) ? value : typeof value === 'object' && value !== null && Array.isArray((value as Record<string, unknown>)['sessions']) ? ((value as Record<string, unknown>)['sessions'] as unknown[]) : null
+    if (list === null) return null
+
+    return list.flatMap(item => {
+      const entry = typeof item === 'object' && item !== null && !Array.isArray(item) ? entryOf(item as Record<string, unknown>) : null
+
+      return entry === null ? [] : [entry]
+    })
+  }
+  const given = fromValue(structured)
+  if (given !== null) return given
+  const start = text.indexOf('[')
+  const end = text.lastIndexOf(']')
+  if (start >= 0 && end > start) {
+    try {
+      const parsed = fromValue(JSON.parse(text.slice(start, end + 1)) as unknown)
+      if (parsed !== null) return parsed
+    } catch {
+      // Not the array: try the object below.
+    }
+  }
+  const object = parseObject(undefined, text)
+
+  return Array.isArray(object['sessions']) ? fromValue(object) : null
+}
+
+/** How many sessions one tracking pass lists at most (most recent first). */
+export const LIST_LIMIT = 50
+
+export type Listing = { ok: true; entries: SessionEntry[]; isFull: boolean; via: DesktopRoute } | { ok: false; reason: string; isTransport: boolean }
+
+/**
+ * The app's active sessions, read quietly (never a card): one list_sessions WITHOUT `include_archived` and without
+ * `linked` (A-F3, S3): an id it lists is active; an id it misses while it lists fewer than its limit is not active.
+ */
+export async function listSessions($: EngineInterface, options: QuietOptions = {}): Promise<Listing> {
+  const answer = await quietDesktop($, 'ccd_session_mgmt', 'list_sessions', { limit: LIST_LIMIT }, options)
+  if (!answer.ok) return { ok: false, reason: answer.reason, isTransport: answer.isTransport }
+  const entries = parseSessions(answer.structured, answer.text)
+  if (entries === null) return { ok: false, reason: `no session list in the answer: ${answer.text.replace(/\s+/g, ' ').slice(0, 80)}`, isTransport: false }
+
+  return { ok: true, entries, isFull: entries.length >= LIST_LIMIT, via: answer.via }
+}
+
+/** What one quiet get_session said of a session: found (with what it said), gone (the app's own words), or not known. */
+export type Peek = { kind: 'found'; entry: SessionEntry } | { kind: 'gone' } | { kind: 'unknown'; reason: string }
+
+/**
+ * One session read quietly (never a card): `gone` only when the app's own answer says this session does not exist
+ * (saysSessionGone); a transport failure, a timeout or any other error is `unknown`, never gone (A-F2). An answer
+ * without a readable entry is found, with what it said.
+ */
+export async function peekSession($: EngineInterface, sessionId: string, options: QuietOptions = {}): Promise<Peek> {
+  const answer = await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: sessionId }, options)
+  if (!answer.ok) {
+    if (!answer.isTransport && saysSessionGone(answer.text === '' ? answer.reason : answer.text, sessionId)) return { kind: 'gone' }
+
+    return { kind: 'unknown', reason: answer.reason }
+  }
+  const data = parseObject(answer.structured, answer.text)
+  const entry = entryOf(data) ?? entryOf({ ...data, sessionId })
+  if (entry === null) return { kind: 'unknown', reason: 'no readable answer' }
+  // Only fall back to the prose when the answer carried no JSON: a parsed reply's `"archived": false` must not count.
+  const prose = Object.keys(data).length === 0 && /\barchived\b/i.test(answer.text) && !/\b(?:not|un)archived\b/i.test(answer.text)
+
+  return { kind: 'found', entry: prose ? { ...entry, archived: true } : entry }
+}
+
+/** This session's own id as the desktop app names it (get_session 'self', quiet); empty when it did not answer (S4). */
+export async function readSelfId($: EngineInterface): Promise<{ id: string; reason: string }> {
+  const answer = await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: 'self' })
+  if (!answer.ok) return { id: '', reason: answer.reason }
+  const entry = entryOf(parseObject(answer.structured, answer.text))
+
+  return entry === null ? { id: '', reason: 'no session id in the answer' } : { id: entry.id, reason: '' }
+}
+
+/** Restores an archived session for a press (`consent` says which); the app's refusal is the result. */
+export async function unarchiveSession($: EngineInterface, sessionId: string, consent?: string): Promise<{ ok: boolean; reason: string }> {
+  const answer = await callDesktop($, 'ccd_session_mgmt', 'unarchive_session', { session_id: sessionId }, consent)
+
+  return answer.ok ? { ok: true, reason: '' } : { ok: false, reason: answer.reason }
+}
+
+export type OpenOutcome = { outcome: 'shown' | 'already' | 'refused'; reason: string }
+
+/**
+ * What open_session_in answered: refused on an error, a structured `ok: false` or `changed: false`, or prose that says
+ * nothing changed (the app "changes nothing and says so"); already when it says the target was visible; shown else.
+ */
+export function readOpenAnswer(answer: DesktopCall): OpenOutcome {
+  if (!answer.ok) return { outcome: 'refused', reason: answer.reason }
+  const data = parseObject(answer.structured, answer.text)
+  const first = answer.text.split('\n')[0]?.slice(0, 120) ?? ''
+  if (data['ok'] === false || data['changed'] === false) return { outcome: 'refused', reason: first }
+  if (data['noop'] === true || data['alreadyVisible'] === true || /\balready (?:visible|open|shown)\b|\bno-?op\b/i.test(answer.text)) return { outcome: 'already', reason: first }
+  if (/not on screen|changes? nothing|nothing changed|did(?:n'?t| not) change|refus|looking at another|text field|not started by|cannot|can'?t/i.test(answer.text)) {
+    return { outcome: 'refused', reason: first }
+  }
+
+  return { outcome: 'shown', reason: '' }
+}
+
+/** Shows a session the pane started, for a press; the app's refusal (not started by this session, not on screen, a text field holds the cursor) is the result. */
+export async function openSessionIn($: EngineInterface, sessionId: string, target: 'split' | 'focus', consent?: string): Promise<OpenOutcome> {
+  return readOpenAnswer(await callDesktop($, 'ccd_window', 'open_session_in', { session_id: sessionId, target }, consent))
+}
+
+/** Detaches a session the mod adopted on its own (no press, so never a card): the quiet route. */
+export async function detachQuietly($: EngineInterface, sessionId: string): Promise<boolean> {
+  return (await quietDesktop($, 'ccd_session_mgmt', 'detach_session', { session_id: sessionId })).ok
 }
 
 // The pull request the app binds to an issue session (E3) -------------------
