@@ -1191,7 +1191,6 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     const link = live !== undefined && live.sessionId === mapping.sessionId && live.link !== null && live.link.startsWith('https://') && mapping.startedFrom !== state.myId ? live.link : null
     const facts = [agoOf(badge?.since ?? mapping.startedAt), ...(mapping.detached ? [] : [S.sessionLinked])].join(' · ')
     const isAsking = state.freshAsk === key && (badge?.kind === 'archived' || badge?.kind === 'gone')
-    const ended = badge?.kind === 'gone' ? S.badges.gone : S.badges.archived
 
     return (
       <Box key={`session-row:${key}`} flexDirection="column" rowGap={step('xs', 0)}>
@@ -1212,7 +1211,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
         {isAsking && (
           <Box key={`fresh-ask:${key}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>
             <Text size="caption" color={INK.warning} wrap="wrap">
-              {S.freshAsk(item.number, ended)}
+              {S.freshAsk(item.number, badge?.kind === 'gone')}
             </Text>
             <Button key={`fresh-confirm:${key}`} label={S.freshConfirm} variant="primary" onPress={() => actions.startAfresh(section.key, item.number, S.freshConfirm)} />
             <Button key={`fresh-cancel:${key}`} plain label={S.freshCancel} onPress={() => actions.askFresh(key)} />

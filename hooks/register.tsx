@@ -26,7 +26,7 @@ import { askOf, parseMarker, phaseFor, proposalsDue, readPhase, samePhases, stat
 import type { Marker } from './phase'
 import { asRecord, isPrsDue, mergeLinks, recordOf } from './prs'
 import { RECAP_VERSION, asRecap, isBetterRecap, isRecapCurrent, isRecapFor, isRecapUsable, recapIssue } from './recap'
-import { commandConsent, detachQuietly, detachSession, listSessions, lookUpSession, openSessionIn, parseObject, peekSession, pressConsent, quietDesktop, readPrStatus, readSelfId, routeInUse, startDesktopSession, unarchiveSession } from './session'
+import { commandConsent, detachQuietly, detachSession, listSessions, lookUpSession, openSessionIn, parseObject, peekForPress, peekSession, pressConsent, quietDesktop, readPrStatus, readSelfId, routeInUse, settleWithin, startDesktopSession, unarchiveSession } from './session'
 import type { Listing, Peek, SessionEntry } from './session'
 import { clean } from './text'
 import { probeEngaged, runTiers } from './tiers'
@@ -59,6 +59,11 @@ const UNPARSED_MS = 10 * 60_000
 const IDENTIFY_TURNS = 3
 /** E12: how long a failed read of this session's desktop id waits before it is tried again. */
 const SELF_RETRY_MS = 60_000
+/**
+ * E12 (B-E12-1 within plan 4.2, B5-BEH-1): how long the first refresh and a desktop attach wait for the desktop-id
+ * identification before they go on; one that lands later still stands the session down and closes the pane.
+ */
+const IDENTIFY_WAIT_MS = 1_500
 /** E9: how many recaps of an older version (or language) a refresh redoes at most, the rows drawn first (C-E9-2). */
 const BACKFILL_PER_REFRESH = 5
 /** E9: how long a row whose recap redo failed waits before the backfill (or its opened row) asks again (B3-BEH-4). */
@@ -213,6 +218,17 @@ let identifying: Promise<boolean> | null = null
 /** E12: how many main-loop turns of an unidentified session asked; when a failed read of the desktop id may be tried again. */
 let identifyTurns = 0
 let selfRetryAt = 0
+/** E12: the read of this session's desktop id in flight, shared by every caller, so a second caller waits for it (R5-RT-1). */
+let selfRead: Promise<string> | null = null
+/**
+ * E12: this module found that it is an issue session (identifySelf). Every state read of one hook dispatch sees one moment,
+ * so a dispatch that waited for an identification another task finished reads the moment before it: it asks this instead.
+ */
+let isSelfFound = false
+/** E12/E10: the turn hooks' and the dialog hook's work, one after another in hook order, so a turn's end never lands after the next turn's start (R5-RT-2). */
+let phaseChain: Promise<void> = Promise.resolve()
+/** E1: a re-read the mod asked for while a pass ran: it runs once that pass ends, instead of being dropped (R5-RT-3). */
+let trackAgain = false
 /** E12: the status line as last set, so an unchanged line is not set again. */
 let statusShown: string | undefined
 /**
@@ -553,6 +569,7 @@ async function paneState($: EngineInterface, options: Options): Promise<PaneLike
     details: await read($, details),
     mappings: await read($, mappings),
     attempts: await read($, attempts),
+    done: await read($, done),
     isFilterOpen: await read($, isFilterOpen),
     isSettingsOpen: await read($, isSettingsOpen),
     columns: viewport.columns,
@@ -917,8 +934,13 @@ async function refreshPrs($: EngineInterface, current: readonly Section[], reaso
  * never releases a mapping (the click validates, as in V1). Nothing of the listing reaches the store but the spike's
  * note in `debug:sessions` (counts, keys and state words, never a title). Then E3's pull-request reads, folded in here.
  */
-async function trackSessions($: EngineInterface, options: Options, current: readonly Section[], isForced: boolean): Promise<void> {
-  if (isTracking) return
+async function trackSessions($: EngineInterface, options: Options, current: readonly Section[], isForced: boolean, isReRead = false): Promise<void> {
+  if (isTracking) {
+    // A re-read the mod asked for (after a start, a reopen) runs once the pass in flight ends (R5-RT-3).
+    if (isReRead) trackAgain = true
+
+    return
+  }
   isTracking = true
   try {
     if (!(await mayRunInBackground($))) return
@@ -978,9 +1000,15 @@ async function trackSessions($: EngineInterface, options: Options, current: read
       } else keep(item.rowKey, item.mapping)
     }
     // Row by row against the store's mappings as they stand now: a release or a new start during the pass never gets
-    // the old session's word back (A-F11).
+    // the old session's word back (A-F11); a word a press wrote after the pass began is newer than the pass's (R5-RT-3).
     const latest = await read($, mappings)
-    await update($, sessionLive, () => Object.fromEntries(Object.entries(found).filter(([rowKey, live]) => latest[rowKey]?.sessionId === live.sessionId)))
+    await update($, sessionLive, had => {
+      const next: Record<string, SessionLive> = {}
+      for (const [rowKey, live] of Object.entries(found)) if (latest[rowKey]?.sessionId === live.sessionId) next[rowKey] = live
+      for (const [rowKey, live] of Object.entries(had)) if (live.at > now && latest[rowKey]?.sessionId === live.sessionId) next[rowKey] = live
+
+      return next
+    })
     if (listing.ok) {
       await adoptUnparsed($, options, listing.entries, now)
       lastListed = { at: now, ids: new Set(listing.entries.map(entry => entry.id)) }
@@ -991,6 +1019,10 @@ async function trackSessions($: EngineInterface, options: Options, current: read
     $.ui.log(`${PLUGIN}: tracking the sessions failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
   } finally {
     isTracking = false
+    if (trackAgain) {
+      trackAgain = false
+      scheduleTrack($, options, 0)
+    }
   }
 }
 
@@ -1015,7 +1047,7 @@ function scheduleTrack($: EngineInterface, options: Options, delayMs: number, is
   trackDelayed?.cancel()
   trackDelayed = $.clock.after(delayMs, () => {
     trackDelayed = undefined
-    void (async () => trackSessions($, options, await read($, sections), isForced))().catch(() => undefined)
+    void (async () => trackSessions($, options, await read($, sections), isForced, true))().catch(() => undefined)
   })
 }
 
@@ -1135,6 +1167,8 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     return
   }
   isRunning = true
+  /** Whether this refresh decides about the pane (the first one): an identification that lands during it stops it (B5-BEH-1). */
+  const isFirst = !paneDecided
   try {
     await update($, isRefreshing, () => true)
     const now = await $.clock.now()
@@ -1142,10 +1176,10 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     // Another pane, or an issue session of this project, may have started or released a session since the last refresh.
     await loadMappings($)
     // E12 (B-E12-1): before the first refresh decides about the pane, this session asks whether it is an issue session
-    // (its desktop id in a mapping); one that is stands down here, before any gh call.
+    // (its desktop id in a mapping); one that is stands down here, before any gh call. The wait is bounded (plan 4.2: no
+    // desktop call blocks the GitHub part, B5-BEH-1): an answer that comes later still stands the session down.
     if (!paneDecided) {
-      if (identifying !== null) await identifying
-      if (await read($, isIssueSession)) {
+      if ((await identifiedSoon($)) || isSelfFound || (await read($, isIssueSession))) {
         standDown()
 
         return
@@ -1365,6 +1399,14 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
       inbox: inboxLog,
     })
 
+    // E12 (B5-BEH-1): an identification that landed during the first refresh stood the session down: no details, no
+    // recaps, and the pane this refresh may have opened after it closed goes again.
+    if (isFirst && (isSelfFound || (await read($, isIssueSession)))) {
+      standDown()
+      if (await isPaneOpen($)) void $.ui.close({ id: PANE }).catch(() => undefined)
+
+      return
+    }
     await hydrate($, options, nextSections, now, isShown)
     // E5-c: an update the owner made by their own comment is no news to them.
     await acknowledgeOwnComments($, options, nextSections)
@@ -1745,15 +1787,16 @@ async function isArchivedNow($: EngineInterface, rowKey: string, mapping: Mappin
 }
 
 /**
- * E1's click on a mapped row: the session is validated by one quiet read (A-F13: never a card), and only the acting call
- * goes through callDesktop with the press's words. The app's own "not found" releases the mapping as an attempt; an
- * archived session is offered again (Wieder öffnen / Neu starten) and nothing is released; anything else is opened.
+ * E1's click on a mapped row: the session is validated by one quiet read (A-F13: never a card), asked once more through
+ * callDesktop with the press's words only where the mod's own route cannot reach the app (R5-INT-1, plan 4.2), and the
+ * acting call goes through callDesktop. The app's own "not found" releases the mapping as an attempt; an archived session
+ * is offered again (Wieder öffnen / Neu starten) and nothing is released; anything else is opened.
  */
 async function reEnter($: EngineInterface, options: Options, rowKey: string, mapping: Mapping, number: number, consent: string, surface: RenderSurface): Promise<void> {
   const S = strings(options.language)
   // The pane drawn inside the issue session itself: there is nothing to open.
   if (isOwnSession(mapping, await ownIds($))) return
-  const peek = await peekSession($, mapping.sessionId)
+  const peek = await peekForPress($, mapping.sessionId, consent)
   if (peek.kind === 'gone') {
     await releaseMapping($, rowKey, mapping, 'gone', null)
     $.ui.toast(S.released(number))
@@ -1801,7 +1844,12 @@ async function openMapped($: EngineInterface, options: Options, mapping: Mapping
   return false
 }
 
-/** "Wieder öffnen" on an archived row: the session is restored (unarchive_session, the press's words), then opened. */
+/**
+ * "Wieder öffnen" on an archived row: the session is restored (unarchive_session, the press's words), then opened. The
+ * pass's word may be old (the owner restored it from the sidebar meanwhile, R5-RT-3): the app's own flag decides, else a
+ * listing taken now, and the pass's word only when neither answers. A refusal to restore a session no flag of the app
+ * called archived still opens it; the listing is read again 3 s later whatever happened.
+ */
 async function reopen($: EngineInterface, options: Options, sectionKey: string, number: number, label: string, surface: RenderSurface): Promise<void> {
   const S = strings(options.language)
   const rowKey = rowKeyOf(sectionKey, number)
@@ -1809,10 +1857,12 @@ async function reopen($: EngineInterface, options: Options, sectionKey: string, 
   inFlight.add(rowKey)
   await setStarting($, rowKey, true)
   try {
+    // E5: going back to the issue's session acknowledges the row, as Work on it does (R5-INT-2).
+    await acknowledgeRow($, options, rowKey)
     const consent = pressConsent(label, `issue ${rowKey}`)
     const mapping = await reloadMapping($, rowKey)
     if (mapping === undefined) return
-    const peek = await peekSession($, mapping.sessionId)
+    const peek = await peekForPress($, mapping.sessionId, consent)
     if (peek.kind === 'gone') {
       await releaseMapping($, rowKey, mapping, 'gone', null)
       $.ui.toast(S.released(number))
@@ -1824,22 +1874,30 @@ async function reopen($: EngineInterface, options: Options, sectionKey: string, 
 
       return
     }
-    if (await isArchivedNow($, rowKey, mapping, peek)) {
+    const ended = await endedNow($, mapping, peek)
+    const isArchived = ended === 'archived' || (typeof ended !== 'string' && (await isArchivedNow($, rowKey, mapping, peek)))
+    let isActive = !isArchived
+    if (isArchived) {
       const restored = await unarchiveSession($, mapping.sessionId, consent)
-      if (!restored.ok) {
+      if (restored.ok) {
+        isActive = true
+        $.ui.toast(clean(S.reopened(peek.entry.title || mapping.title)))
+      } else if (peek.entry.archived === true) {
+        // The app itself calls it archived and would not restore it: nothing to open.
         $.ui.toast(clean(S.reopenFailed(restored.reason)), { timeoutMs: 6_000 })
 
         return
-      }
+      } else $.ui.log(`${PLUGIN}: unarchive_session ${mapping.sessionId} refused (${restored.reason}); opening it as it is`, { to: 'debug' })
+    }
+    if (isActive) {
       const now = await $.clock.now()
       await update($, sessionLive, current => ({ ...current, [rowKey]: liveOf(peek.entry, 'active', now) }))
-      $.ui.toast(clean(S.reopened(peek.entry.title || mapping.title)))
     }
     await openMapped($, options, mapping, peek, consent, surface)
-    scheduleTrack($, options, TRACK_AFTER_REOPEN_MS)
   } finally {
     inFlight.delete(rowKey)
     await setStarting($, rowKey, false)
+    scheduleTrack($, options, TRACK_AFTER_REOPEN_MS)
   }
 }
 
@@ -1862,10 +1920,12 @@ async function startAfresh($: EngineInterface, options: Options, sectionKey: str
   inFlight.add(rowKey)
   await setStarting($, rowKey, true)
   try {
+    // E5: starting the issue afresh acknowledges the row, as Work on it does (R5-INT-2).
+    await acknowledgeRow($, options, rowKey)
     const consent = pressConsent(label, `issue ${rowKey}`)
     const mapping = await reloadMapping($, rowKey)
     if (mapping !== undefined) {
-      const peek = await peekSession($, mapping.sessionId)
+      const peek = await peekForPress($, mapping.sessionId, consent)
       if (peek.kind === 'unknown') {
         $.ui.toast(clean(S.checkFailed(peek.reason)), { timeoutMs: 8_000 })
 
@@ -1905,20 +1965,40 @@ async function endedNow($: EngineInterface, mapping: Mapping, peek: Extract<Peek
   return listing.isFull ? { reason: 'the session list is longer than one read' } : 'archived'
 }
 
-/** E22-b: the session of a closed issue, opened from its closed row by the pane that started it; anyone else is told where it is. */
+/**
+ * E22-b: the session of a closed issue, opened from its closed row by the pane that started it; anyone else is told where
+ * it is. The ladder's rules (B5-BEH-2): gone drops the record; archived (the app's flag, else a complete listing taken now
+ * without it) is restored first with the press's words, as Wieder öffnen does, so no toast says an archived session runs.
+ */
 async function openDone($: EngineInterface, options: Options, rowKey: string, label: string, surface: RenderSurface): Promise<void> {
+  const S = strings(options.language)
   const record = (await read($, done))[rowKey]
-  if (record === undefined) return
-  const mapping: Mapping = { sessionId: record.sessionId, title: record.title, startedAt: record.startedAt, startedFrom: record.startedFrom, detached: true }
-  const peek = await peekSession($, record.sessionId)
-  if (peek.kind === 'gone') {
-    await $.store.delete(storeKeyOf('done:', rowKey)).catch(() => undefined)
-    await update($, done, current => withoutKey(current, rowKey))
-    $.ui.toast(strings(options.language).released(Number(rowKey.slice(rowKey.lastIndexOf('#') + 1))))
+  if (record === undefined || inFlight.has(rowKey)) return
+  inFlight.add(rowKey)
+  try {
+    const consent = pressConsent(label, `issue ${rowKey}`)
+    const mapping: Mapping = { sessionId: record.sessionId, title: record.title, startedAt: record.startedAt, startedFrom: record.startedFrom, detached: true }
+    const peek = await peekForPress($, record.sessionId, consent)
+    if (peek.kind === 'gone') {
+      await $.store.delete(storeKeyOf('done:', rowKey)).catch(() => undefined)
+      await update($, done, current => withoutKey(current, rowKey))
+      $.ui.toast(S.released(Number(rowKey.slice(rowKey.lastIndexOf('#') + 1))))
 
-    return
+      return
+    }
+    if (peek.kind === 'found' && (await endedNow($, mapping, peek)) === 'archived') {
+      const restored = await unarchiveSession($, record.sessionId, consent)
+      if (!restored.ok) {
+        $.ui.toast(clean(S.reopenFailed(restored.reason)), { timeoutMs: 6_000 })
+
+        return
+      }
+      $.ui.toast(clean(S.reopened(peek.entry.title || record.title)))
+    }
+    await openMapped($, options, mapping, peek, consent, surface)
+  } finally {
+    inFlight.delete(rowKey)
   }
-  await openMapped($, options, mapping, peek, pressConsent(label, `issue ${rowKey}`), surface)
 }
 
 async function takeHere($: EngineInterface, options: Options, sectionKey: string, number: number): Promise<void> {
@@ -3227,18 +3307,47 @@ async function recordBrief($: EngineInterface, text: string): Promise<void> {
 async function resolveDesktopId($: EngineInterface): Promise<string> {
   const known = await read($, desktopId)
   if (known !== '') return known
-  const now = await $.clock.now()
-  if (now < selfRetryAt) return ''
-  selfRetryAt = now + SELF_RETRY_MS
-  const self = await readSelfId($)
-  if (self.id === '') {
-    $.ui.log(`${PLUGIN}: this session's desktop id was not read: ${self.reason}`, { to: 'debug' })
+  // A read in flight is shared, never counted as a failed one (R5-RT-1): the check and the claim run without a wait between.
+  if (selfRead === null) selfRead = readDesktopId($)
+  const pending = selfRead
+  const id = await pending
+  if (selfRead === pending) selfRead = null
 
+  return id
+}
+
+/** One read of this session's desktop id (resolveDesktopId shares it); only a failed read holds the next back a minute. */
+async function readDesktopId($: EngineInterface): Promise<string> {
+  try {
+    if ((await $.clock.now()) < selfRetryAt) return ''
+    const self = await readSelfId($)
+    if (self.id === '') {
+      selfRetryAt = (await $.clock.now()) + SELF_RETRY_MS
+      $.ui.log(`${PLUGIN}: this session's desktop id was not read: ${self.reason}`, { to: 'debug' })
+
+      return ''
+    }
+    await update($, desktopId, () => self.id)
+
+    return self.id
+  } catch {
     return ''
   }
-  await update($, desktopId, () => self.id)
+}
 
-  return self.id
+/**
+ * E12 at a desktop attach (R5-RT-1): an identification already running is waited for, never replaced, and only one that
+ * found nothing is asked again.
+ */
+async function identifyAfter($: EngineInterface, options: Options, prior: Promise<boolean> | null): Promise<boolean> {
+  if (prior !== null && (await prior)) return true
+
+  return identifyByMapping($, options)
+}
+
+/** E12 (B5-BEH-1, plan 4.2): waits for the identification in flight, at most IDENTIFY_WAIT_MS; false when none ran or it did not answer in time. */
+async function identifiedSoon($: EngineInterface): Promise<boolean> {
+  return identifying === null ? false : settleWithin($, identifying, IDENTIFY_WAIT_MS, false)
 }
 
 /** The issue a row key names, as SelfIssue says it. */
@@ -3264,6 +3373,7 @@ async function identifySelf($: EngineInterface, options: Options, found: SelfIss
     $.ui.log(`${PLUGIN}: this session works on ${settled.rowKey} (found by its ${settled.via})`, { to: 'debug' })
   }
   if (!(await read($, isIssueSession))) await update($, isIssueSession, () => true)
+  isSelfFound = true
   standDown()
   if (await isPaneOpen($)) void $.ui.close({ id: PANE }).catch(() => undefined)
   await applyStatus($, options, settled, await read($, ownPhase))
@@ -3393,6 +3503,17 @@ async function noteTurnEnd($: EngineInterface, options: Options, reason: TurnCom
   if ((await read($, isIssueSession)) || !wantsPane) return
   await syncPhases($, options)
   if (Object.values(await read($, mappings)).some(mapping => mapping.startedFrom === myId && !mapping.detached)) scheduleTrack($, options, TRACK_AFTER_TURN_MS, false)
+}
+
+/**
+ * Runs `work` once every earlier turn or dialog step has finished (R5-RT-2: the hooks start them as their own tasks, so
+ * without the chain a turn's end could land after the next turn's start and leave its record behind). Never rejects.
+ */
+function inOrder(work: () => Promise<void>): Promise<void> {
+  const next = phaseChain.then(work).catch(() => undefined)
+  phaseChain = next
+
+  return next
 }
 
 /** A question dialog (AskUserQuestion) or a plan approval (ExitPlanMode) opens or closes in an issue session's main loop. */
@@ -3641,7 +3762,8 @@ export const register: Register = (on, given) => {
       // No pane and no polling inside an issue session; /issue-radar still opens it there.
       armTimer($, options)
       schedule($, options, 600, 'start')
-      // E12 (B-E12-1): whether this session's desktop id names a mapping, asked once; the start refresh waits for it.
+      // E12 (B-E12-1): whether this session's desktop id names a mapping, asked once; the start refresh waits for it a
+      // moment (IDENTIFY_WAIT_MS, B5-BEH-1).
       identifying = identifyByMapping($, options).catch(() => false)
       // E10: proposals made before this session began are not toasted; E12, E22-b: the store's hygiene.
       const now = await $.clock.now()
@@ -3658,15 +3780,19 @@ export const register: Register = (on, given) => {
 
   on('session.attach', async ($, e, next) => {
     const attached = await next(e)
-    // E12: a desktop that attaches may answer what this session's id is (B-E12-1); an issue session shows its line again.
-    if (e.surface === 'desktop' && (await read($, selfIssue)) === null && (await read($, desktopId)) === '') identifying = identifyByMapping($, options).catch(() => false)
-    if (identifying !== null) await identifying
-    if (wantsPane && !(await read($, isIssueSession)) && (e.surface === 'desktop' || e.surface === 'terminal')) {
+    // E12: a desktop that attaches may answer what this session's id is (B-E12-1); an identification still running is
+    // waited for, never replaced (R5-RT-1), at most IDENTIFY_WAIT_MS (B5-BEH-1). An issue session shows its line again.
+    if (e.surface === 'desktop' && (await read($, selfIssue)) === null && (await read($, desktopId)) === '') identifying = identifyAfter($, options, identifying).catch(() => false)
+    // This dispatch's reads see the moment it began: an identification that landed while it waited is known by the
+    // answer and the module flag only, and it has set the line itself.
+    const isFound = (await identifiedSoon($)) || isSelfFound
+    if (wantsPane && !isFound && !(await read($, isIssueSession)) && (e.surface === 'desktop' || e.surface === 'terminal')) {
       await openPane($, options, false)
       armTimer($, options)
       schedule($, options, 400, 'tool')
     }
-    await applyStatus($, options, await read($, selfIssue), await read($, ownPhase))
+    const self = await read($, selfIssue)
+    if (self !== null) await applyStatus($, options, self, await read($, ownPhase))
 
     return attached
   })
@@ -3706,16 +3832,17 @@ export const register: Register = (on, given) => {
 
   // E12: the main loop's turns. Each hook passes the turn on first and does its work beside it (B-E12-5): an issue
   // session records what it is doing; a session not yet identified looks for its marker; a pane reads its rows' records.
+  // The work runs in hook order through one chain (R5-RT-2): a turn's end never lands after the next turn's start.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
-    if (e.agentId === undefined) void noteTurnStart($, options, e.turnId, e.text).catch(() => undefined)
+    if (e.agentId === undefined) void inOrder(() => noteTurnStart($, options, e.turnId, e.text))
 
     return started
   }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     const finished = await next(e)
-    if (e.agentId === undefined) void noteTurnEnd($, options, e.reason, e.answer).catch(() => undefined)
+    if (e.agentId === undefined) void inOrder(() => noteTurnEnd($, options, e.reason, e.answer))
 
     return finished
   }).catch(($, e, next) => next(e))
@@ -3724,9 +3851,9 @@ export const register: Register = (on, given) => {
   // approval is the proposal). The dialog's answer is the owner's; this hook only notes the state around it.
   on('tool.call', { tool: ['AskUserQuestion', 'ExitPlanMode'] }, async ($, e, next) => {
     if (e.agentId !== undefined || (await read($, selfIssue)) === null) return next(e)
-    await noteDialog($, options, String(e.tool), true)
+    await inOrder(() => noteDialog($, options, String(e.tool), true))
     const ran = await next(e)
-    await noteDialog($, options, String(e.tool), false)
+    await inOrder(() => noteDialog($, options, String(e.tool), false))
 
     return ran
   }).catch(($, e, next) => next(e))

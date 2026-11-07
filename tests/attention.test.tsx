@@ -22,6 +22,7 @@ import {
   foldFaded,
   markOf,
   nextFade,
+  paneLayout,
   readSeen,
   rowTops,
   rowsInView,
@@ -30,7 +31,7 @@ import {
   visibleMark,
   withRow,
 } from '../hooks/marks'
-import type { DrawnInput } from '../hooks/marks'
+import type { DrawnInput, PaneLike } from '../hooks/marks'
 import { asRecap, isBetterRecap, isRecapCurrent, isRecapUsable, recapIssue } from '../hooks/recap'
 import { DEFAULT_FILTER } from '../hooks/filter'
 import { GAP_CHARS, asTriage, labelSays, parseRecapAnswer } from '../hooks/triage'
@@ -576,6 +577,30 @@ test("the layout's estimate puts each row below the last, an opened one taller; 
   const base: SeenRecord = { v: 1, at: 1, newest: '2026-12-01T00:00:00Z', rows: {} }
   const folded = drawnRowsOf(drawn([section(rows)], { settings: { watch: [], consent: {}, collapsed: { [SECTION]: true } } }))
   expect(unreadCount(folded, { [SECTION]: base }, {}, NOW)).toBe(40)
+})
+
+test("the layout counts the session line a closed row keeps (E22-b), so the rows below sit where they are drawn (R5-INT-3)", () => {
+  // Twelve closed issues, of which the part draws the first ten.
+  const closedRows = Array.from({ length: 12 }, (_, index) => ({ number: index + 1, title: '', url: '', closedAt: '', stateReason: '', prs: [] }))
+  const reports = 'github.com/acme/reports'
+  const pane: PaneLike = {
+    ...drawn([section([row(42)]), section([row(12)], reports, { isCheckout: false })], {
+      settings: { watch: [], consent: {}, collapsed: {}, showClosed: { [SECTION]: true } },
+      closed: { [SECTION]: { v: 1, fetchedAt: NOW, since: '2026-10-30', rows: closedRows, count: 12 } },
+    }),
+    options: { closedDays: 7, recaps: false },
+    opened: '',
+    recaps: {},
+    details: {},
+    mappings: {},
+    isFilterOpen: false,
+    isSettingsOpen: false,
+    columns: 46,
+  }
+  const topOf = (given: PaneLike) => paneLayout(given).tops.find(found => found.sectionKey === reports)?.top ?? 0
+  const session = { v: 1, sessionId: 'local_s', title: 'x', startedAt: 1, startedFrom: 'local_pane', closedAt: NOW }
+  // Two drawn closed rows keep their session: two lines more above the next section; one past the ten drawn counts nothing.
+  expect(topOf({ ...pane, done: { [`${SECTION}#1`]: session, [`${SECTION}#3`]: session, [`${SECTION}#11`]: session } }) - topOf(pane)).toBe(2)
 })
 
 // E9: triage chips --------------------------------------------------------------

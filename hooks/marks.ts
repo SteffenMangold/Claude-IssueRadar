@@ -116,6 +116,8 @@ export type LayoutInput = {
   mappings: Readonly<Record<string, Mapping>>
   /** E1: rows without a mapping draw a line naming their last earlier attempt. */
   attempts?: Readonly<Record<string, readonly unknown[]>>
+  /** E22-b: per section, how many of its drawn closed rows draw their session's line (a third line, R5-INT-3). */
+  closedSessions?: Readonly<Record<string, number>>
   /** Sections that draw the consent block above their rows. */
   asking: ReadonlySet<string>
 }
@@ -158,7 +160,7 @@ export function rowTops(plan: DrawnPlan, layout: LayoutInput): RowTop[] {
       }
     }
     top += drawn.rest > 0 ? 1 : 0
-    top += 1 + (drawn.closed > 0 ? 1 + 2 * drawn.closed : 0)
+    top += 1 + (drawn.closed > 0 ? 1 + 2 * drawn.closed + Math.min(drawn.closed, layout.closedSessions?.[section.key] ?? 0) : 0)
   }
 
   return tops
@@ -194,6 +196,8 @@ export type PaneLike = Omit<DrawnInput, 'closedDays'> & {
   mappings: Readonly<Record<string, Mapping>>
   /** E1: the earlier attempts per row (their line counts in the layout). */
   attempts?: Readonly<Record<string, readonly unknown[]>>
+  /** E22-b: the closed issues' sessions per row (a drawn closed row with one draws a third line). */
+  done?: Readonly<Record<string, unknown>>
   isFilterOpen: boolean
   isSettingsOpen: boolean
   columns: number
@@ -205,7 +209,12 @@ export function paneLayout(pane: PaneLike): { plan: DrawnPlan; tops: RowTop[] } 
   const facet = pane.settings.boards === true ? pane.filter.board : ''
   const asking = new Set(pane.sections.filter(section => pane.options.recaps && section.info !== null && section.state.kind === 'ok' && pane.settings.consent[section.key] === undefined).map(section => section.key))
   const head = headRows(!isDefaultFilter({ ...pane.filter, board: facet }), pane.isFilterOpen, pane.isSettingsOpen)
-  const tops = rowTops(plan, { columns: pane.columns, head, opened: pane.opened, recaps: pane.recaps, details: pane.details, mappings: pane.mappings, ...(pane.attempts === undefined ? {} : { attempts: pane.attempts }), asking })
+  // E22-b (R5-INT-3): the drawn closed rows (the first of each expanded part, as the pane draws them) that keep a session.
+  const done = pane.done ?? {}
+  const closedSessions = Object.fromEntries(
+    plan.sections.map(drawn => [drawn.section.key, (pane.closed[drawn.section.key]?.rows ?? []).slice(0, drawn.closed).filter(row => done[rowKeyOf(drawn.section.key, row.number)] !== undefined).length]),
+  )
+  const tops = rowTops(plan, { columns: pane.columns, head, opened: pane.opened, recaps: pane.recaps, details: pane.details, mappings: pane.mappings, ...(pane.attempts === undefined ? {} : { attempts: pane.attempts }), closedSessions, asking })
 
   return { plan, tops }
 }

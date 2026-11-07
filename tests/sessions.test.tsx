@@ -4,14 +4,15 @@
 // the re-entry ladder (open, reopen, start afresh after a confirmation) with the
 // earlier attempts named in the brief, the adoption of a start without an id,
 // and E22-b's session line on a closed row. Asserted on keys and argv.
+import type { RenderSurface } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 import { GO_LINE, renderBackground, renderBrief, spikeBrief } from '../hooks/brief'
 import { strings } from '../hooks/i18n'
 import { askOf, parseMarker, phaseFor, phaseKind, proposalsDue, readPhase, statusText, toastRef } from '../hooks/phase'
-import { entryOf, parseSessions, readOpenAnswer } from '../hooks/session'
+import { entryOf, parseSessions, pressConsent, readOpenAnswer } from '../hooks/session'
 import { asAttempts, rowBadge, stateFamily, withAttempt } from '../hooks/tracking'
-import type { IssueRow, Mapping, PhaseRecord, PreviousAttempt, RepoInfo, SessionLive } from '../types'
+import type { IssueRow, Mapping, PhaseRecord, PreviousAttempt, RepoInfo, SeenRecord, SessionLive } from '../types'
 import type { Engine, McpAnswer, McpCall } from './harness'
 import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, mcpText, project, ran, started, tick } from './harness'
 
@@ -596,6 +597,359 @@ test('/issue-radar reset clears the records, the attempts and the closed issues 
   expect([...store.keys()].filter(key => /^(phase|attempts|done):/.test(key))).toEqual([])
 })
 
+// Review fixes (batch 5) ---------------------------------------------------------
+
+/** The last visit (E5): #7 seen at an older update, #42 never, so both rows carry a mark. */
+const LAST_VISIT: SeenRecord = { v: 1, at: 1, newest: '2026-10-15T00:00:00Z', rows: { '7': '2026-10-20T00:00:00Z' } }
+const CLOSED_7 = JSON.stringify([{ number: 7, title: 'Dark mode for the settings page', url: 'https://github.com/acme/widgets/issues/7', closedAt: '2026-11-06T11:00:00Z', stateReason: 'COMPLETED', closedByPullRequestsReferences: [] }])
+
+/** gh calls among the recorded argv. */
+function ghCalls(argv: readonly string[][]): number {
+  return argv.filter(call => call[0] === 'gh').length
+}
+
+test('a desktop that attaches while the start still reads the desktop id waits for that read: no pane, no gh (R5-RT-1)', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const answer = desktop({ selfId: 'local_xyz' })
+  const { opened, argv, statuses, mcp } = project(on, {
+    stored: { [`session:${ROW_42}`]: { ...OWN, sessionId: 'local_xyz' } },
+    mcp: async call => {
+      if (call.tool === 'get_session' && call.args['session_id'] === 'self') await clock.sleep(1_200)
+
+      return answer(call)
+    },
+  })
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  // The desktop attaches at once, while the start's read of the desktop id is still out.
+  const attaching = $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
+  await clock.advance(3_000)
+  await attaching
+  expect(opened).toHaveLength(0)
+  expect(ghCalls(argv)).toBe(0)
+  expect(statuses.at(-1)).toBe('Issue #42 · acme/widgets')
+  // One read of the desktop's id, which the start and the attach share.
+  expect(mcp.filter(call => call.tool === 'get_session' && call.args['session_id'] === 'self')).toHaveLength(1)
+})
+
+test('a slow desktop holds the first refresh back a moment only; an answer that comes later still stands the session down (B5-BEH-1)', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const answer = desktop({ selfId: 'local_xyz' })
+  const { opened, closed, argv, statuses } = project(on, {
+    stored: { [`session:${ROW_42}`]: { ...OWN, sessionId: 'local_xyz' } },
+    mcp: async call => {
+      if (call.tool === 'get_session' && call.args['session_id'] === 'self') await clock.sleep(4_000)
+
+      return answer(call)
+    },
+  })
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  // Plan 4.2: no desktop call blocks the GitHub part; the refresh at 600 ms waits 1.5 s at most.
+  await clock.advance(2_200)
+  expect(ghCalls(argv)).toBeGreaterThan(0)
+  expect(opened).toContain('issue-radar')
+  await clock.advance(2_500)
+  expect(closed).toContain('issue-radar')
+  expect(statuses.at(-1)).toBe('Issue #42 · acme/widgets')
+  // Stood down: no timer, no refresh.
+  const gh = ghCalls(argv)
+  await tick(clock)
+  expect(ghCalls(argv)).toBe(gh)
+})
+
+test("a turn that starts before the last one's end was written still reads working (R5-RT-2)", async ($, on) => {
+  const { store } = project(on, { stored: { [`session:${ROW_42}`]: OWN } })
+  const clock = await started($, on)
+  await $.turn.start({ text: '', turnId: 't1' })
+  await clock.settle()
+  // t1 ends on the proposal and the owner's queued "go" starts t2 at once.
+  await $.turn.complete({ answer: 'Plan …\n\nGo?', durationMs: 900, isAborted: false, turnId: 't1', reason: 'answer' })
+  await $.turn.start({ text: 'go', turnId: 't2' })
+  await clock.settle()
+  expect(store.get(`phase:${ROW_42}`)).toMatchObject({ activity: 'working', ask: 'none', turns: 1 })
+})
+
+test("where the mod's own route cannot reach the app, the click asks with the press's words and releases a deleted session (R5-INT-1)", async ($, on) => {
+  const { store, toolCalls, toasts } = project(on, {
+    stored: { [`session:${ROW_42}`]: MAPPED },
+    mcp: () => {
+      throw new Error('MCP server "ccd_session_mgmt" is not connected')
+    },
+    toolCall: input => {
+      if (String(input['tool']).endsWith('__get_session')) {
+        const text = `Session ${String(input['session_id'])} not found.`
+
+        return { result: { content: [{ type: 'text', text }], isError: true }, text, isError: true }
+      }
+
+      return { deny: 'no such tool' }
+    },
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // The polling raised nothing (the typed route would ask); the row looks as V1 drew it.
+  expect(toolCalls).toHaveLength(0)
+  expect(await labelOf(ui, `work:${ROW_42}`)).toBe(DE.openSession)
+
+  await ui.press({ key: `work:${ROW_42}` })
+  const typed = toolCalls.filter(call => String(call['tool']).startsWith('mcp__ccd_'))
+  expect(typed.map(call => call['tool'])).toEqual(['mcp__ccd_session_mgmt__get_session'])
+  expect(typed[0]?.['consent']).toBe(pressConsent(DE.openSession, `issue ${ROW_42}`))
+  expect(store.has(`session:${ROW_42}`)).toBe(false)
+  expect((store.get(`attempts:${ROW_42}`) as PreviousAttempt[])[0]).toMatchObject({ sessionId: 'local_abc123', endedAs: 'gone' })
+  expect(toasts.at(-1)).toBe(DE.released(42))
+  expect(await labelOf(ui, `work:${ROW_42}`)).toBe(DE.workOnIt)
+  await ui.unmount()
+})
+
+test('Wieder öffnen on a session the owner restored meanwhile opens it without unarchiving, and the listing is read again 3 s later (R5-RT-3)', async ($, on) => {
+  let isArchived = true
+  const { mcp, toasts } = project(on, {
+    stored: { [`session:${ROW_42}`]: MAPPED },
+    mcp: desktop({
+      list: () => (isArchived ? [] : [entry('local_abc123')]),
+      other: call => (call.tool === 'unarchive_session' && !isArchived ? mcpText('Session local_abc123 is not archived.', true) : undefined),
+    }),
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await labelOf(ui, `work:${ROW_42}`)).toBe(DE.reopen)
+
+  // Restored from the app's sidebar; no pass has run since.
+  isArchived = false
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(calls(mcp, 'unarchive_session')).toHaveLength(0)
+  expect(calls(mcp, 'open_session_in').map(call => call.args['session_id'])).toEqual(['local_abc123'])
+  expect(toasts.some(text => text.startsWith(DE.reopenFailed('').slice(0, 10)))).toBe(false)
+  expect(await labelOf(ui, `work:${ROW_42}`)).toBe(DE.openSession)
+  const listed = calls(mcp, 'list_sessions').length
+  await clock.advance(3_000)
+  expect(calls(mcp, 'list_sessions')).toHaveLength(listed + 1)
+  await ui.unmount()
+})
+
+test('a pass in flight neither undoes what Wieder öffnen found nor swallows its re-read (R5-RT-3)', async ($, on) => {
+  let isArchived = true
+  let delay = 0
+  const answer = desktop({ list: () => (isArchived ? [] : [entry('local_abc123')]) })
+  const clock = mock.clock(on, { now: NOW })
+  const { mcp } = project(on, {
+    stored: { [`session:${ROW_42}`]: MAPPED },
+    mcp: async call => {
+      // What the app says as it stands when asked, however long the answer takes.
+      const said = answer(call)
+      if (call.tool === 'list_sessions' && delay > 0) await clock.sleep(delay)
+
+      return said
+    },
+  })
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(1_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await badgeOf(ui, ROW_42)).toBe(DE.badges.archived)
+
+  // ↻ starts a pass whose listing takes 4.9 s; meanwhile the owner restores the session in the sidebar and presses
+  // Wieder öffnen, whose own listing (1 s) finds it listed.
+  delay = 4_900
+  const refreshing = ui.press({ key: 'refresh' })
+  await clock.advance(100)
+  const listed = calls(mcp, 'list_sessions').length
+  isArchived = false
+  delay = 1_000
+  const pressing = ui.press({ key: `work:${ROW_42}` })
+  await clock.advance(1_500)
+  await pressing
+  expect(calls(mcp, 'unarchive_session')).toHaveLength(0)
+  // The pass ends after the press: its older word does not undo the press's; the 3 s re-read, due while the pass ran,
+  // runs once it ends.
+  await clock.advance(3_500)
+  expect(await badgeOf(ui, ROW_42)).not.toBe(DE.badges.archived)
+  expect(await labelOf(ui, `work:${ROW_42}`)).toBe(DE.openSession)
+  await clock.advance(1_000)
+  await refreshing
+  expect(calls(mcp, 'list_sessions')).toHaveLength(listed + 2)
+  expect(await labelOf(ui, `work:${ROW_42}`)).toBe(DE.openSession)
+  await ui.unmount()
+})
+
+test('a refused unarchive opens the session where only the listing said archived, and stops where the app itself says so (R5-RT-3)', async ($, on) => {
+  let isFlagged = false
+  const { mcp, toasts } = project(on, {
+    stored: { [`session:${ROW_42}`]: MAPPED },
+    mcp: desktop({
+      get: id => mcpText(JSON.stringify(entry(id, isFlagged ? { archived: true } : {}))),
+      other: call => (call.tool === 'unarchive_session' ? mcpText('Refused: the session is busy.', true) : undefined),
+    }),
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await labelOf(ui, `work:${ROW_42}`)).toBe(DE.reopen)
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(calls(mcp, 'unarchive_session')).toHaveLength(1)
+  expect(calls(mcp, 'open_session_in')).toHaveLength(1)
+
+  isFlagged = true
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(calls(mcp, 'unarchive_session')).toHaveLength(2)
+  expect(calls(mcp, 'open_session_in')).toHaveLength(1)
+  expect(toasts.at(-1)).toBe(DE.reopenFailed('Refused: the session is busy.'))
+  await ui.unmount()
+})
+
+test('Wieder öffnen and a confirmed Neu starten acknowledge their row, as Work on it does (R5-INT-2)', async ($, on) => {
+  const { mcp } = project(on, {
+    stored: { [`seen:${SECTION}`]: LAST_VISIT, [`session:${ROW_42}`]: MAPPED, [`session:${ROW_7}`]: { ...MAPPED, sessionId: 'local_s7', title: '#7 Dark mode' } },
+    mcp: desktop({ get: id => (id === 'local_s7' ? mcpText(`Session ${id} not found.`, true) : undefined) }),
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await badgeOf(ui, ROW_42)).toBe(DE.badges.archived)
+  expect(await badgeOf(ui, ROW_7)).toBe(DE.badges.gone)
+  expect(await ui.find({ key: `mark:${ROW_42}` })).toBeDefined()
+  expect(await ui.find({ key: `mark:${ROW_7}` })).toBeDefined()
+
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(calls(mcp, 'unarchive_session')).toHaveLength(1)
+  expect(await ui.find({ key: `mark:${ROW_42}` })).toBeUndefined()
+
+  await ui.press({ key: `work:${ROW_7}` })
+  // B5-BEH-3: the confirmation says the earlier session no longer exists, in a sentence of its own.
+  expect((await ui.find({ key: `fresh-ask:${ROW_7}` }))?.text).toContain(DE.freshAsk(7, true))
+  expect(await ui.find({ key: `mark:${ROW_7}` })).toBeDefined()
+  await ui.press({ key: `fresh-confirm:${ROW_7}` })
+  expect(calls(mcp, 'start_session')).toHaveLength(1)
+  expect(await ui.find({ key: `mark:${ROW_7}` })).toBeUndefined()
+  await ui.unmount()
+})
+
+test("a closed issue's archived session is restored before it is opened, never called running (B5-BEH-2)", async ($, on) => {
+  const { mcp, toasts } = project(on, {
+    stored: {
+      [`done:${ROW_7}`]: { v: 1, sessionId: 'local_seven', title: '#7 Dark mode', startedAt: NOW - 3_600_000, startedFrom: 'local_pane', closedAt: NOW - 60_000 },
+      [SETTINGS]: { watch: [], consent: {}, collapsed: {}, showClosed: { [SECTION]: true } },
+    },
+    gh: args => (args[0] === 'issue' && args[1] === 'list' ? ran(args.includes('closed') ? CLOSED_7 : JSON.stringify([ROWS[0]])) : undefined),
+    // Archived: absent from a complete listing, found by get_session.
+    mcp: desktop({ get: id => mcpText(JSON.stringify(entry(id, { title: '#7 Dark mode' }))) }),
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const before = mcp.length
+  await ui.press({ key: `closed-session:${ROW_7}` })
+  const after = mcp.slice(before).map(call => `${call.tool}:${String(call.args['session_id'] ?? '')}`)
+  expect(after.filter(name => !name.startsWith('list_sessions') && !name.startsWith('get_status'))).toEqual(['get_session:local_seven', 'unarchive_session:local_seven', 'open_session_in:local_seven'])
+  expect(toasts).toContain(DE.reopened('#7 Dark mode'))
+  expect(toasts).not.toContain(DE.openElsewhere('#7 Dark mode'))
+  await ui.unmount()
+})
+
+test("a turn of the pane's own session reads its rows' records at once, before the 15 s sync", async ($, on) => {
+  const { store } = project(on, { stored: { [`session:${ROW_42}`]: MAPPED }, mcp: desktop({ list: () => [entry('local_abc123')] }) })
+  const clock = await started($, on)
+  store.set(`phase:${ROW_42}`, record({ ask: 'proposal', at: NOW + 500 }))
+  await turn($, 't1', 'ok')
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await badgeOf(ui, ROW_42)).toBe(DE.badges.proposal)
+  await ui.unmount()
+})
+
+test("a pane's start sweeps stale records: unmapped ones a day old, unreadable ones, and closed issues' sessions after two weeks", async ($, on) => {
+  const day = 24 * 3_600_000
+  const { store } = project(on, {
+    stored: {
+      [`session:${ROW_42}`]: MAPPED,
+      [`phase:${ROW_42}`]: record({ at: NOW - 2 * day }),
+      [`phase:${ROW_7}`]: record({ sessionId: 'local_s7', at: NOW - day - 3_600_000 }),
+      [`phase:${SECTION}#9`]: { v: 2 },
+      [`phase:${SECTION}#11`]: record({ sessionId: 'local_s11', at: NOW - 3_600_000 }),
+      [`done:${SECTION}#8`]: { v: 1, sessionId: 'local_s8', title: 'x', startedAt: 1, startedFrom: 'local_pane', closedAt: NOW - 15 * day },
+      [`done:${SECTION}#12`]: { v: 1, sessionId: 'local_s12', title: 'x', startedAt: 1, startedFrom: 'local_pane', closedAt: NOW - day },
+    },
+  })
+  await started($, on)
+  expect([...store.keys()].filter(key => /^(phase|done):/.test(key)).sort()).toEqual([`done:${SECTION}#12`, `phase:${SECTION}#11`, `phase:${ROW_42}`])
+})
+
+test('the listing is read again 8 s after a start', async ($, on) => {
+  const { mcp } = project(on, { mcp: desktop({ list: () => [entry('local_new456')] }) })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: `work:${ROW_42}` })
+  const listed = calls(mcp, 'list_sessions').length
+  await clock.advance(7_900)
+  expect(calls(mcp, 'list_sessions')).toHaveLength(listed)
+  await clock.advance(200)
+  expect(calls(mcp, 'list_sessions')).toHaveLength(listed + 1)
+  await ui.unmount()
+})
+
+test('Zur Session on a session the app calls archived keeps the mapping and offers Wieder öffnen (V1 released it)', async ($, on) => {
+  const { mcp, store, toasts } = project(on, {
+    stored: { [`session:${ROW_42}`]: MAPPED },
+    mcp: desktop({ list: () => [entry('local_abc123')], get: id => mcpText(JSON.stringify(entry(id, { archived: true }))) }),
+  })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await labelOf(ui, `work:${ROW_42}`)).toBe(DE.openSession)
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(store.get(`session:${ROW_42}`)).toEqual(MAPPED)
+  expect(toasts.at(-1)).toBe(DE.archivedChoose(42))
+  expect(await labelOf(ui, `work:${ROW_42}`)).toBe(DE.reopen)
+  expect(calls(mcp, 'open_session_in')).toHaveLength(0)
+  await ui.unmount()
+})
+
+test("a badge resting on the app's word is drawn subdued once the listing has failed for more than ten minutes", async ($, on) => {
+  let isDown = false
+  const answer = desktop({ list: () => [entry('local_abc123', { state: 'running' })] })
+  project(on, { stored: { [`session:${ROW_42}`]: MAPPED }, mcp: call => (isDown && call.tool === 'list_sessions' ? mcpText('unknown server ccd_session_mgmt', true) : answer(call)) })
+  const clock = await started($, on)
+  const inkOf = async (): Promise<unknown> => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const badge = (await ui.find({ key: `badge:${ROW_42}` })) as { children?: Array<{ props?: Record<string, unknown> }> } | undefined
+    await ui.unmount()
+
+    return badge?.children?.[0]?.props?.['color']
+  }
+  const fresh = await inkOf()
+  expect(fresh).toBeDefined()
+  isDown = true
+  await tick(clock, 3)
+  expect(await inkOf()).toBe(fresh)
+  await tick(clock, 1)
+  expect(await inkOf()).not.toBe(fresh)
+})
+
+test("a press from the terminal never opens the starter's session in the desktop window", async ($, on) => {
+  const { mcp, toasts } = project(on, { stored: { [`session:${ROW_42}`]: MAPPED }, mcp: desktop({ list: () => [entry('local_abc123')] }) })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: `work:${ROW_42}` })
+  expect(calls(mcp, 'open_session_in')).toHaveLength(0)
+  expect(toasts.at(-1)).toBe(DE.openElsewhere(TITLE_42))
+  await ui.unmount()
+})
+
+test("an issue's earlier attempts go when a complete list no longer holds it", async ($, on) => {
+  const { store } = project(on, {
+    stored: { [`attempts:${ROW_7}`]: [{ sessionId: 'local_old', title: '#7 Dark mode', startedAt: 1, endedAs: 'gone', at: 2 }], [`attempts:${ROW_42}`]: [{ sessionId: 'local_o42', title: TITLE_42, startedAt: 1, endedAs: 'gone', at: 2 }] },
+    gh: args => (args[0] === 'issue' && args[1] === 'list' && !args.includes('closed') ? ran(JSON.stringify([ROWS[0]])) : undefined),
+  })
+  await started($, on)
+  expect(store.has(`attempts:${ROW_7}`)).toBe(false)
+  expect(store.has(`attempts:${ROW_42}`)).toBe(true)
+})
+
+test('an issue session shows its line again when a desktop attaches after it began where no pane is drawn', async ($, on) => {
+  const surfaces: RenderSurface[] = ['vscode']
+  const { statuses } = project(on, { stored: { [`session:${ROW_42}`]: OWN }, surfaces })
+  await started($, on, 'vscode')
+  expect(statuses.filter(text => text !== undefined)).toHaveLength(0)
+  surfaces.push('desktop')
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
+  expect(statuses.at(-1)).toBe('Issue #42 · acme/widgets')
+})
+
 // The pure helpers -------------------------------------------------------------
 
 test('the pure helpers of the record, the marker and the badge behave', async () => {
@@ -666,6 +1020,9 @@ test('the pure helpers of the listing and the ladder behave', async () => {
   expect(badge({ mapping: { ...MAPPED, startedAt: NOW - 60_000 }, live: live({}) })).toBe('starting')
   expect(badge({ live: live({}) })).toBe('active')
   expect(badge({})).toBeNull()
+  // The app's word older than the stale age is drawn subdued; a record of the session's own never is.
+  const stale = (at: number) => rowBadge({ mapping: MAPPED, live: live({ state: 'working', at }), record: undefined, isSelf: false, now: NOW, staleMs: 600_000 })?.isStale
+  expect([stale(NOW - 600_001), stale(NOW - 600_000)]).toEqual([true, false])
 
   expect(readOpenAnswer({ ok: false, reason: 'Refused: the cursor is in a text field', text: '', via: 'mcp', isTransport: false }).outcome).toBe('refused')
   expect(readOpenAnswer({ ok: true, text: 'Already visible.', structured: undefined, via: 'mcp' }).outcome).toBe('already')

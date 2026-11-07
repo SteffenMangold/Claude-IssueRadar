@@ -167,6 +167,13 @@ function withTimeout<T>($: EngineInterface, work: Promise<T>, ms: number): Promi
   })
 }
 
+/** What `work` settles to, or `fallback` once `ms` passed on the engine's clock first (a rejection reads as `fallback`). */
+export async function settleWithin<T>($: EngineInterface, work: Promise<T>, ms: number, fallback: T): Promise<T> {
+  const settled = await withTimeout($, work, ms)
+
+  return settled === TIMED_OUT ? fallback : settled
+}
+
 function timedOut(via: DesktopRoute, ms: number): DesktopCall {
   return { ok: false, reason: `no answer within ${ms} ms`, text: '', via, isTransport: true }
 }
@@ -468,8 +475,12 @@ export async function listSessions($: EngineInterface, options: QuietOptions = {
   return { ok: true, entries, isFull: entries.length >= LIST_LIMIT, via: answer.via }
 }
 
-/** What one quiet get_session said of a session: found (with what it said), gone (the app's own words), or not known. */
-export type Peek = { kind: 'found'; entry: SessionEntry } | { kind: 'gone' } | { kind: 'unknown'; reason: string }
+/**
+ * What one get_session said of a session: found (with what it said), gone (the app's own words), or not known. An
+ * unknown one says whether the quiet route stopped short of the typed route because that would ask (`mayAsk`): a press
+ * may then ask there itself (peekForPress).
+ */
+export type Peek = { kind: 'found'; entry: SessionEntry } | { kind: 'gone' } | { kind: 'unknown'; reason: string; mayAsk: boolean }
 
 /**
  * One session read quietly (never a card): `gone` only when the app's own answer says this session does not exist
@@ -477,15 +488,32 @@ export type Peek = { kind: 'found'; entry: SessionEntry } | { kind: 'gone' } | {
  * without a readable entry is found, with what it said.
  */
 export async function peekSession($: EngineInterface, sessionId: string, options: QuietOptions = {}): Promise<Peek> {
-  const answer = await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: sessionId }, options)
+  return peekOf(await quietDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: sessionId }, options), sessionId)
+}
+
+/**
+ * A session read for a press (R5-INT-1): the quiet read first, so a desktop the mod reaches on its own raises no card
+ * (A-F13); only when that stopped short of the typed route because it would ask (the mod's own mcp route cannot reach the
+ * app, S1) is it read once more through callDesktop with the press's words (plan 4.2). A timeout is not asked again.
+ */
+export async function peekForPress($: EngineInterface, sessionId: string, consent: string): Promise<Peek> {
+  const quiet = await peekSession($, sessionId)
+  if (quiet.kind !== 'unknown' || !quiet.mayAsk) return quiet
+  const asked = peekOf(await callDesktop($, 'ccd_session_mgmt', 'get_session', { session_id: sessionId }, consent), sessionId)
+
+  return asked.kind === 'unknown' ? { ...asked, mayAsk: false } : asked
+}
+
+/** What a get_session answer says of `sessionId` (peekSession, peekForPress). */
+function peekOf(answer: DesktopCall, sessionId: string): Peek {
   if (!answer.ok) {
     if (!answer.isTransport && saysSessionGone(answer.text === '' ? answer.reason : answer.text, sessionId)) return { kind: 'gone' }
 
-    return { kind: 'unknown', reason: answer.reason }
+    return { kind: 'unknown', reason: answer.reason, mayAsk: answer.via === 'none' }
   }
   const data = parseObject(answer.structured, answer.text)
   const entry = entryOf(data) ?? entryOf({ ...data, sessionId })
-  if (entry === null) return { kind: 'unknown', reason: 'no readable answer' }
+  if (entry === null) return { kind: 'unknown', reason: 'no readable answer', mayAsk: false }
   // Only fall back to the prose when the answer carried no JSON: a parsed reply's `"archived": false` must not count.
   const prose = Object.keys(data).length === 0 && /\barchived\b/i.test(answer.text) && !/\b(?:not|un)archived\b/i.test(answer.text)
 
