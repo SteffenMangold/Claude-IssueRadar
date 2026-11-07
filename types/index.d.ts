@@ -741,6 +741,8 @@ declare module 'claude-code' {
       isSettingsOpen: boolean
       /** Recap tokens spent this session. */
       tokens: number
+      /** F-STATE-1: the store refused a write since the last refresh that wrote without a refusal. */
+      storeRefused: boolean
       version: string
       /** The checkout's resolved repository key; empty until resolved. */
       checkoutKey: string

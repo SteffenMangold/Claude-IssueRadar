@@ -163,7 +163,8 @@ export function asRecord(value: unknown): PrRecord | undefined {
 
 /**
  * Whether a repository's pull-request states are due for a read. Never while a back-off holds; at once when none was
- * read or tried; for a press, a command or a tool once the last read or try is 30 s old; else once it is ten minutes
+ * read or tried; for a press, a command or a changing tool once the last read or try is 30 s old; else (the timer, the
+ * start, an attach or a gh read: F-BUDGET-2) once it is ten minutes
  * old, or as soon as a listed issue is newer than the record (a changed issue may have a new pull request), unless the
  * last try failed: a failure always waits the full interval (E3-2).
  */

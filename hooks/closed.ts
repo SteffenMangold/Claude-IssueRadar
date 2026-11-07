@@ -23,7 +23,7 @@ export const CLOSED_MIN_MS = 30_000
 export const CLOSED_LOADING_MS = 60_000
 
 /** What asks for the closed list: a refresh's reason, or the owner expanding the part. */
-export type ClosedReason = 'start' | 'timer' | 'press' | 'manual' | 'tool' | 'expand'
+export type ClosedReason = 'start' | 'timer' | 'press' | 'manual' | 'tool' | 'attach' | 'expand'
 
 /** The first day of the window, as `closed:>=` takes it (a UTC date). */
 export function sinceDate(now: number, days: number): string {
@@ -83,7 +83,8 @@ export async function listClosed($: EngineInterface, info: RepoInfo, since: stri
  * Whether an expanded list is read again, timed from the last read of this window or the last try at it (`triedAt`,
  * answered or not), whichever is later, so a list that keeps failing waits as a read one does (E3-2): at once when
  * this window has neither; after an issue left the open list once 30 s passed; on expanding once 10 minutes passed;
- * for a press, a command or a tool once 30 s passed; on the timer and at the start once 15 minutes passed.
+ * for a press, a command or a changing tool once 30 s passed; on the timer, at the start and at an attach or a gh read
+ * (F-BUDGET-2) once 15 minutes passed.
  */
 export function isClosedDue(cache: ClosedCache | undefined, since: string, reason: ClosedReason, now: number, isNudged: boolean, triedAt?: number): boolean {
   const readAt = cache !== undefined && cache.since === since ? cache.fetchedAt : undefined

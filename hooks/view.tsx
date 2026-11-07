@@ -95,6 +95,8 @@ export type ViewState = {
   isRefreshing: boolean
   isSettingsOpen: boolean
   tokens: number
+  /** F-STATE-1: the store refused a write lately (past 4 MiB): mappings and settings are not kept. */
+  storeRefused: boolean
   version: string
   now: number
   columns: number
@@ -582,7 +584,8 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       parts.push(note(S.newLineHint, INK.muted))
     }
     if (open.kind === 'labels') {
-      const names = [...item.labels.map(label => label.name).filter(name => !open.remove.includes(name)), ...open.add]
+      // F-RUNTIME-2: each name once, so a pending add the list caught up with is one chip under one key.
+      const names = [...new Set([...item.labels.map(label => label.name).filter(name => !open.remove.includes(name)), ...open.add])]
       const known = state.repoLabels[section.key]
       parts.push(
         <Box key={`lbl-chips:${key}`} flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('xs', 1)} rowGap={step('xs', 0)}>
@@ -1753,7 +1756,8 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       { value: 'worktree', label: S.placeWorktree },
       // A Select's value must be among its options: a form that holds a choice keeps it listed while it may not start.
       ...(canShare || form.place === 'shared' ? [{ value: 'shared', label: S.placeShared }] : []),
-      ...(state.forkState === 'ok' || form.place === 'fork' ? [{ value: 'fork', label: S.placeFork }] : []),
+      // F-CONFORMANCE-3: offered while a turn runs too (the caption says to wait; Starten checks again).
+      ...(state.forkState === 'ok' || state.forkState === 'busy' || form.place === 'fork' ? [{ value: 'fork', label: S.placeFork }] : []),
     ]
     const models = modelChoices(facts?.model ?? '')
     const efforts = effortChoices(facts?.effort ?? '')
@@ -1764,7 +1768,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     if (isDesk && form.place === 'fork') {
       captions.push(state.forkState === 'busy' ? S.captionForkBusy : state.forkState === 'none' ? S.captionForkNone : S.captionFork(branch, tokens === null ? null : fmtK(tokens)))
       if (facts?.isDirty === true) captions.push(S.captionDirty)
-    }
+    } else if (isDesk && state.forkState === 'busy') captions.push(S.captionForkBusy)
     if (isDesk && form.place !== 'fork' && form.model !== 'inherit') captions.push(S.captionModel)
 
     return (
@@ -2317,6 +2321,11 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
       {sidebarAsk}
       {draftForm}
       <Box flexDirection="column" flexGrow={1} paddingY={step('sm', 0)} rowGap={step('sm', 0)}>
+        {state.storeRefused && (
+          <Box key="store-full" paddingX={step('sm', 1)}>
+            {note(S.storeFull, INK.warning)}
+          </Box>
+        )}
         {state.sections.length === 0 ? (
           <Box paddingX={step('sm', 1)}>
             <Text color={INK.secondary}>{S.loading('…')}</Text>

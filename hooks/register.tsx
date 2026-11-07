@@ -82,6 +82,14 @@ const PHASE_SYNC_MS = 15_000
 const PHASE_KEEP_MS = 24 * 60 * 60_000
 /** E22-b: how long the session of a closed issue stays reachable from its closed row. */
 const DONE_KEEP_MS = 14 * 24 * 60 * 60_000
+/**
+ * F-STATE-1: a repository's lists, recaps, pull-request states, closed list and seen record leave the store once none of
+ * them was written for this long (a repository no session lists any more); F-STATE-4: so do an issue's earlier attempts
+ * without a mapping, counted from the newest.
+ */
+const REPO_KEEP_MS = 90 * 24 * 60 * 60_000
+/** F-STATE-1: the store's per-repository keys (`<prefix><host/owner/name>`), swept together. */
+const REPO_PREFIXES = ['cache:', 'recaps:', 'prs:', 'seen:', 'closed:'] as const
 /** E1: the shortest gap between two tracking passes the mod asks for itself (a refresh's pass always runs). */
 const TRACK_GAP_MS = 10_000
 /** E1: how many sessions a pass reads one by one (get_session) beyond the listing, rotating. */
@@ -171,6 +179,8 @@ const starting = atom({ plugin: 'issue-radar', key: 'starting' } as const, {})
 const isRefreshing = atom({ plugin: 'issue-radar', key: 'isRefreshing' } as const, false)
 const isSettingsOpen = atom({ plugin: 'issue-radar', key: 'isSettingsOpen' } as const, false)
 const tokens = atom({ plugin: 'issue-radar', key: 'tokens' } as const, 0)
+/** F-STATE-1: the store refused a write since the last refresh that wrote without a refusal (the pane says so). */
+const storeRefused = atom({ plugin: 'issue-radar', key: 'storeRefused' } as const, false)
 const version = atom({ plugin: 'issue-radar', key: 'version' } as const, '')
 const checkoutKey = atom({ plugin: 'issue-radar', key: 'checkoutKey' } as const, '')
 const isIssueSession = atom({ plugin: 'issue-radar', key: 'isIssueSession' } as const, false)
@@ -263,6 +273,10 @@ let lastTrackAt = Number.NEGATIVE_INFINITY
 let trackDelayed: Timer | undefined
 /** E1: where the rotating get_session reads of a full listing go on. */
 let peekCursor = 0
+/** F-STATE-1: how many store writes were refused in this module's life (a refresh compares it before and after). */
+let refusedWrites = 0
+/** E7 (F-STATE-3): per repository, where the probe's rotating state asks of the mapped issues beyond its window go on. */
+const probeCursor = new Map<string, number>()
 /** E1: the session ids the last listing that answered held, and when: a start without a readable id is adopted only by a new one (A-F12). */
 let lastListed: { at: number; ids: Set<string> } | null = null
 /**
@@ -372,6 +386,13 @@ let mainTurn: { turnId: string; since: number } | null | undefined
  * from different dispatches, and each must build on the other's latest write, not on its dispatch's moment.
  */
 let ownLatest: PhaseRecord | null = null
+/**
+ * E10 (F-CONFORMANCE-2, A-F10): the tools whose permission prompt this issue session's main loop raised and whose call
+ * has not run or been refused yet, by name: the record says the session waits for the owner meanwhile.
+ */
+const permissionAsks: string[] = []
+/** The tools whose dialog noteDialog notes itself (the question, the plan approval): their prompt is no permission ask here. */
+const DIALOG_TOOLS: ReadonlySet<string> = new Set(['AskUserQuestion', 'ExitPlanMode'])
 /** E13: the tidy that runs after an identification or a main-loop turn (its own dispatch), one pending at a time. */
 let tidyTimer: Timer | undefined
 let isTidying = false
@@ -424,12 +445,25 @@ type Resolved = { spec: string; info: RepoInfo | null; state: RepoState; isCheck
 type Viewed = Awaited<ReturnType<typeof viewIssueNumber>>
 /**
  * Why a refresh runs: the session's start, the timer, the owner's ↻ (`press`, nothing else), a re-run the mod asks
- * for itself (`manual`: a consent, a watch change, a reset, a command, a state block's retry), or a tool or an attach.
+ * for itself (`manual`: a consent, a watch change, a reset, a command, a state block's retry), a Bash command of this
+ * session that can change an issue or a pull request, or pushes (`tool`), or (F-BUDGET-2) a desktop attach or a gh
+ * command that only reads (`attach`). Those two refresh the lists as V1's tool refresh did; only `tool` asks the
+ * pull-request states, the closed lists and the board status again after 30 or 60 s, while `attach` leaves them to
+ * their own intervals (plan 4.3: age-based gating at the start and the attach).
  */
-type Reason = 'start' | 'timer' | 'press' | 'manual' | 'tool'
+type Reason = 'start' | 'timer' | 'press' | 'manual' | 'tool' | 'attach'
+
+/** V1: a Bash command of the pane's session that may concern the listed issues: the list is read again soon after it. */
+const GH_COMMAND = /\bgh\s+(issue|pr)\b|\bgit\s+push\b/
+/**
+ * F-BUDGET-2: of those, the ones that can change an issue or a pull request, or push a branch: only these re-read the
+ * pull-request states, the closed lists and the board status after 30 or 60 s (a `tool` refresh). gh's own aliases
+ * (`new`) count; view, list, status, checks, diff and checkout are reads.
+ */
+const GH_CHANGE = /\bgh\s+(?:issue\s+(?:create|new|close|reopen|edit|comment|develop|transfer|delete|lock|unlock|pin|unpin)|pr\s+(?:create|new|merge|close|reopen|ready|edit|review|comment|update-branch))\b|\bgit\s+push\b/
 
 /** How much a reason asks for: a queued or merged refresh runs with the strongest reason it stands for. */
-const REASON_RANK: Record<Reason, number> = { timer: 0, tool: 1, start: 2, manual: 3, press: 4 }
+const REASON_RANK: Record<Reason, number> = { timer: 0, attach: 1, tool: 2, start: 3, manual: 4, press: 5 }
 
 function strongerReason(a: Reason | null, b: Reason): Reason {
   return a !== null && REASON_RANK[a] >= REASON_RANK[b] ? a : b
@@ -477,7 +511,10 @@ async function readStore<T>($: EngineInterface, key: string): Promise<T | undefi
   return value === undefined || value === null ? undefined : (value as T)
 }
 
-/** Writes one store key; false when the store refused it (a store past 4 MiB of JSON), which is logged and otherwise borne. */
+/**
+ * Writes one store key; false when the store refused it (a store past 4 MiB of JSON). That is logged, and the pane says
+ * so (F-STATE-1: mappings, settings and the sessions' records are then lost) until a refresh writes without a refusal.
+ */
 async function writeStore($: EngineInterface, key: string, value: unknown): Promise<boolean> {
   try {
     await $.store.set(key, value)
@@ -485,6 +522,8 @@ async function writeStore($: EngineInterface, key: string, value: unknown): Prom
     return true
   } catch (error) {
     $.ui.log(`${PLUGIN}: store write failed for ${key}: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
+    refusedWrites += 1
+    if (!(await read($, storeRefused).catch(() => true))) await update($, storeRefused, () => true).catch(() => undefined)
 
     return false
   }
@@ -658,13 +697,21 @@ async function releaseMapping($: EngineInterface, rowKey: string, mapping: Mappi
   await saveMapping($, rowKey, null)
 }
 
-/** E22-b: a mapping whose issue closed is kept as the closed row's session for two weeks, then released as before. */
+/**
+ * E22-b: a mapping whose issue closed is kept as the closed row's session for two weeks, then released as before. The
+ * issue's earlier attempts go with it (F-STATE-4), as a complete list's pruning takes them: every caller found the
+ * issue closed or gone (the probe, an opened row, a write's read-back, the pruning itself).
+ */
 async function retireMapping($: EngineInterface, rowKey: string, mapping: Mapping | undefined): Promise<void> {
   if (mapping !== undefined) {
     const record: DoneMapping = { v: 1, sessionId: mapping.sessionId, title: mapping.title, startedAt: mapping.startedAt, startedFrom: mapping.startedFrom, closedAt: await $.clock.now() }
     if (await writeStore($, storeKeyOf('done:', rowKey), record)) await update($, done, current => ({ ...current, [rowKey]: record }))
   }
   await saveMapping($, rowKey, null)
+  if ((await read($, attempts))[rowKey] !== undefined || (await $.store.get(storeKeyOf('attempts:', rowKey)).catch(() => undefined)) !== undefined) {
+    await $.store.delete(storeKeyOf('attempts:', rowKey)).catch(() => undefined)
+    await update($, attempts, current => withoutKey(current, rowKey))
+  }
 }
 
 /**
@@ -706,6 +753,7 @@ async function paneState($: EngineInterface, options: Options): Promise<PaneLike
     columns: viewport.columns,
     startForm: await read($, startForm),
     isSidebarAsking: await isSidebarAsking($),
+    storeRefused: await read($, storeRefused),
     ...(await writeLayout($, options)),
   }
 }
@@ -960,12 +1008,19 @@ type Probed = { section: Section; meta: Record<string, IssueMeta>; details: Map<
  */
 async function probeSection($: EngineInterface, options: Options, target: Resolved, info: RepoInfo, sectionKey: string, cache: RepoCache, before: Section | undefined, now: number, withLinks: boolean): Promise<Probed | null> {
   const all = await read($, mappings)
-  const mapped = Object.entries(all)
+  // F-STATE-3: an issue in the last window is open (the window lists open issues only), so its state is not asked; one
+  // that closes there leaves the window and is asked at the next probe. The rest take turns, the oldest mapping first,
+  // so ten mappings that stay open never keep a newer one from being asked (and released once it closed).
+  const inWindow = new Set(cache.rows.map(row => row.number))
+  const candidates = Object.entries(all)
     .filter(([rowKey]) => rowKey.startsWith(`${sectionKey}#`))
     .sort(([, a], [, b]) => a.startedAt - b.startedAt)
     .map(([rowKey]) => Number(rowKey.slice(sectionKey.length + 1)))
-    .filter(number => Number.isInteger(number) && number > 0)
-    .slice(0, MAPPED_MAX)
+    .filter(number => Number.isInteger(number) && number > 0 && !inWindow.has(number))
+  const turn = candidates.length > MAPPED_MAX ? (probeCursor.get(sectionKey) ?? 0) % candidates.length : 0
+  const mapped = [...candidates.slice(turn), ...candidates.slice(0, turn)].slice(0, MAPPED_MAX)
+  if (candidates.length > MAPPED_MAX) probeCursor.set(sectionKey, turn + MAPPED_MAX)
+  else probeCursor.delete(sectionKey)
   const hasPrFields = !prsOffHosts.has(info.host)
   const outcome = await runTiers($, { info, first: Math.min(PROBE_MAX, options.maxIssues), cache, mapped, withLinks, hasPrFields, now })
   // E22-b: their sessions stay reachable from the closed rows for a while.
@@ -1081,12 +1136,16 @@ function notePrFailure($: EngineInterface, section: Section, state: RepoState, n
  * query, and keeps the record in this module: the store's record stays the default list's (E14-1).
  */
 async function refreshPrs($: EngineInterface, current: readonly Section[], reason: Reason, now: number, probed: ReadonlySet<string>, log: Record<string, string>): Promise<void> {
+  const chosen = await read($, settings)
   for (const section of current) {
     if (section.state.kind !== 'ok' || section.info === null || section.rows.length === 0 || probed.has(section.key)) continue
     if (prsOffHosts.has(section.info.host)) continue
     const query = section.query
     const tried = filteredPrTried.get(section.key)
     const stored = query === undefined ? (await read($, prs))[section.key] : filteredRecordOf(section)
+    // F-BUDGET-3: a collapsed section draws no chip; its states are read once it is expanded again. Its first record is
+    // still read: it names the signed-in account, which E5 and E19 need for the host (an own new issue is no arrival).
+    if (chosen.collapsed[section.key] === true && stored !== undefined) continue
     const triedAt = query === undefined ? prTriedAt.get(section.key) : tried?.query === query ? tried.at : undefined
     if (!isPrsDue(stored, section.rows, reason, now, triedAt, backoffUntil.get(section.key) ?? 0)) continue
     if (query === undefined) prTriedAt.set(section.key, now)
@@ -1391,7 +1450,7 @@ async function isConsented($: EngineInterface, options: Options, repoKey: string
 async function refresh($: EngineInterface, options: Options, reason: Reason): Promise<void> {
   // X-1 (2): a tool's or an attach's refresh redraws what the owner is typing into; it runs once the field closes. Asked
   // first: the single-flight check and its claim below have no wait between them (R7-RT-2), so two never run at once.
-  if (reason === 'tool' && (await isTyping($, options))) {
+  if ((reason === 'tool' || reason === 'attach') && (await isTyping($, options))) {
     deferredReason = strongerReason(deferredReason, reason)
 
     return
@@ -1405,6 +1464,7 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
   isRunning = true
   /** Whether this refresh decides about the pane (the first one): an identification that lands during it stops it (B5-BEH-1). */
   const isFirst = !paneDecided
+  const refusedBefore = refusedWrites
   try {
     await update($, isRefreshing, () => true)
     const now = await $.clock.now()
@@ -1508,9 +1568,11 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
         continue
       }
       // E7: a large repository's timed or tool refresh asks the probe, and tier 2 only for what changed.
-      if ((reason === 'timer' || reason === 'tool') && cache !== undefined && probeEngaged(cache, options.maxIssues, now, probeOffUntil.get(sectionKey) ?? 0)) {
+      if ((reason === 'timer' || reason === 'tool' || reason === 'attach') && cache !== undefined && probeEngaged(cache, options.maxIssues, now, probeOffUntil.get(sectionKey) ?? 0)) {
         const stored = asRecord(await readStore<unknown>($, storeKeyOf('prs:', sectionKey)))
-        const withLinks = isShown && !prsOffHosts.has(target.info.host) && isPrsDue(stored, cachedRows, reason, now, prTriedAt.get(sectionKey), until)
+        // F-BUDGET-3: a collapsed section's probe asks no pull requests once a record names the account (as refreshPrs).
+        const isFolded = chosen.collapsed[sectionKey] === true && stored !== undefined
+        const withLinks = isShown && !isFolded && !prsOffHosts.has(target.info.host) && isPrsDue(stored, cachedRows, reason, now, prTriedAt.get(sectionKey), until)
         const done = await probeSection($, options, target, target.info, sectionKey, { ...cache, rows: cachedRows, meta: cachedMeta.get(sectionKey) ?? {} }, prior, now, withLinks)
         if (done !== null) {
           probed.add(sectionKey)
@@ -1608,7 +1670,7 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
         if (overlay.get(rowKey)?.isClosed !== true) hidden.add(rowKey)
       }
     }
-    await settleWrites($, live, hidden, now)
+    await settleWrites($, live, hidden, now, nextSections)
     // E5: each repository's baseline, before its rows are drawn, so a row is drawn with its mark from the start; the
     // glimpses whose hold has passed go into the baselines (R3-INT-3: a glimpse of a row no longer listed is kept, so
     // a row that leaves the list and comes back keeps its fade; written only when one faded, every write redraws).
@@ -1632,7 +1694,7 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     // E11 and E18 run before the details, their searches and reads only while the pane is shown (D X-1); a hidden pane
     // still draws the inbox another pane left in the store, which costs no GitHub call (B2-BEH-4).
     const inboxLog = await refreshInbox($, options, reason, now, isShown)
-    if (isShown) await refreshBoards($, nextSections, reason, now, false)
+    if (isShown) await refreshBoards($, nextSections, reason, now, false, undefined, Math.max(MIN_PERIOD_MS, options.refreshMinutes * 60_000 * 0.9))
     // E5: what arrived since this session's last list, once the pull-request read named the signed-in account.
     await announceArrivals($, options, nextSections, previous)
     // The last refresh's outcome, for the spike notes and a look at the store file.
@@ -1678,6 +1740,8 @@ async function refresh($: EngineInterface, options: Options, reason: Reason): Pr
     // E22 after the details: the expanded closed lists that are due, fetched only while the pane is shown (D X-1); the
     // store's lists are drawn either way (B2-BEH-4).
     await refreshClosed($, options, nextSections, reason, now, isShown)
+    // F-STATE-1: a refresh whose writes the store all took clears the pane's line about a full store.
+    if (refusedWrites === refusedBefore && (await read($, storeRefused))) await update($, storeRefused, () => false)
     // E5: the title's count as the refresh left it, and the next fade (a reload's lost timer is armed again here).
     await syncTitle($, options)
     armFade($, options, await read($, glimpsed), await $.clock.now())
@@ -2757,7 +2821,7 @@ async function listSubIssues($: EngineInterface, options: Options, rowKey: strin
  * the pull-request read, E4, E6 or this one), and a rate limit or no network met here sets it as a failed list does; after
  * another failure the timer, a tool and the re-runs wait BOARDS_FAILED_MS.
  */
-async function refreshBoards($: EngineInterface, current: readonly Section[], reason: Reason, now: number, force: boolean, onlyHost?: string): Promise<void> {
+async function refreshBoards($: EngineInterface, current: readonly Section[], reason: Reason, now: number, force: boolean, onlyHost?: string, period = BOARDS_MIN_MS): Promise<void> {
   const chosen = await read($, settings)
   if (chosen.boards !== true) return
   for (const section of current) {
@@ -2771,7 +2835,8 @@ async function refreshBoards($: EngineInterface, current: readonly Section[], re
     if (!force && reason !== 'start' && reason !== 'press') {
       if ((await read($, boards)).scope[info.host] === 'missing') continue
       if (now < (boardsHeldUntil.get(section.key) ?? 0)) continue
-      if (last !== undefined && last.rows === asked && now - last.at < BOARDS_MIN_MS) continue
+      // F-BUDGET-2: an attach or a gh read waits for the timer's cadence; a changing gh command, 60 s.
+      if (last !== undefined && last.rows === asked && now - last.at < (reason === 'attach' ? Math.max(BOARDS_MIN_MS, period) : BOARDS_MIN_MS)) continue
     }
     boardsReadAt.set(section.key, { at: now, rows: asked })
     const fetched = await fetchBoards($, info, numbers)
@@ -4159,6 +4224,21 @@ function inOrder(work: () => Promise<void>): Promise<void> {
   return next
 }
 
+/**
+ * F-CONFORMANCE-2 (A-F10): a permission prompt in an issue session's main loop opens (the session waits for the owner:
+ * question), or the last call that raised one has run or was refused (working again, unless something else was written
+ * meanwhile, such as the turn's end).
+ */
+async function notePermission($: EngineInterface, options: Options, isOpen: boolean): Promise<void> {
+  if (isOpen) {
+    await writePhase($, options, 'waiting', 'question', false)
+
+    return
+  }
+  const latest = ownLatest ?? (await read($, ownPhase))
+  if (latest !== null && latest.activity === 'waiting' && latest.ask === 'question') await writePhase($, options, 'working', 'none', false)
+}
+
 /** A question dialog (AskUserQuestion) or a plan approval (ExitPlanMode) opens or closes in an issue session's main loop. */
 async function noteDialog($: EngineInterface, options: Options, tool: string, isOpen: boolean): Promise<void> {
   if (isOpen) await writePhase($, options, 'waiting', tool === 'ExitPlanMode' ? 'proposal' : 'question', false)
@@ -4177,9 +4257,16 @@ async function noteDialog($: EngineInterface, options: Options, tool: string, is
 async function syncPhases($: EngineInterface, options: Options): Promise<void> {
   if (await read($, isIssueSession)) return
   const all = await read($, mappings)
+  const tries = await read($, attempts)
+  const finished = await read($, done)
   const found: Record<string, PhaseRecord> = {}
   for (const [rowKey, mapping] of Object.entries(all)) {
-    const accepted = phaseFor(readPhase(await readStore<unknown>($, storeKeyOf('phase:', rowKey))), mapping)
+    // F-STATE-5: the sessions the row knows as others (its earlier attempts, its closed issue's session, the sessions of
+    // other rows) never speak for this one, whenever they wrote.
+    const closedOne = finished[rowKey]
+    const others = new Set([...(tries[rowKey] ?? []).map(attempt => attempt.sessionId), ...(closedOne === undefined ? [] : [closedOne.sessionId]), ...Object.entries(all).filter(([key]) => key !== rowKey).map(([, other]) => other.sessionId)])
+    others.delete(mapping.sessionId)
+    const accepted = phaseFor(readPhase(await readStore<unknown>($, storeKeyOf('phase:', rowKey))), mapping, others)
     if (accepted !== null) found[rowKey] = accepted
   }
   if (!samePhases(await read($, phases), found)) await update($, phases, () => found)
@@ -4866,6 +4953,21 @@ async function editRowLabel($: EngineInterface, rowKey: string, name: string, is
   })
 }
 
+/**
+ * F-RUNTIME-2: the labels editor against the row as listed now. A pending add the row already carries and a pending
+ * removal of a label it no longer carries would change nothing on GitHub, so they go; a chip then means what it shows
+ * (its ✕ takes the label off). The same editor when nothing changes (an atom write redraws).
+ */
+function settleLabels(current: RowEditor, row: IssueRow): RowEditor {
+  if (current.kind !== 'labels') return current
+  const carried = new Set(row.labels.map(label => label.name))
+  const add = current.add.filter(name => !carried.has(name))
+  const remove = current.remove.filter(name => carried.has(name))
+  if (add.length === current.add.length && remove.length === current.remove.length) return current
+
+  return { ...current, add, remove }
+}
+
 /** The close editor's reason; what was typed into its fields stays drawn (X-1 (1)). */
 async function pickReason($: EngineInterface, rowKey: string, value: string): Promise<void> {
   await touchWrite($)
@@ -4901,8 +5003,11 @@ async function reviewEditor($: EngineInterface, options: Options, rowKey: string
     return
   }
   if (current.kind === 'labels') {
-    if (current.add.length === 0 && current.remove.length === 0) return void (await say(S.labelsUnchanged))
-    await reviewWrite($, { kind: 'labels', target: rowKey, repoKey: found.section.key, number, argv: labelsArgv(spec, number, current.add, current.remove), summary: S.sumLabels(number), isPublic: false, secrets: [], warnings: [], notes: [] })
+    // F-RUNTIME-2: what the row carries now decides; a change GitHub already has is not sent again.
+    const settled = settleLabels(current, found.row)
+    if (settled !== current) await update($, editor, had => (had === null || had.rowKey !== rowKey ? had : settleLabels(had, found.row)))
+    if (settled.add.length === 0 && settled.remove.length === 0) return void (await say(S.labelsUnchanged))
+    await reviewWrite($, { kind: 'labels', target: rowKey, repoKey: found.section.key, number, argv: labelsArgv(spec, number, settled.add, settled.remove), summary: S.sumLabels(number), isPublic: false, secrets: [], warnings: [], notes: [] })
 
     return
   }
@@ -5472,7 +5577,7 @@ async function afterCreate($: EngineInterface, options: Options, card: PendingWr
  * (X-4). A row a filter merely hides (`hidden`: in its repository's stored default list, not closed by this pane) has
  * not left: its editor and its typing stay for when the filter goes (R7-INT-4).
  */
-async function settleWrites($: EngineInterface, live: ReadonlySet<string>, hidden: ReadonlySet<string>, now: number): Promise<void> {
+async function settleWrites($: EngineInterface, live: ReadonlySet<string>, hidden: ReadonlySet<string>, now: number, listed: readonly Section[]): Promise<void> {
   const isGone = (rowKey: string) => !live.has(rowKey) && !hidden.has(rowKey)
   const card = await read($, pendingWrite)
   if (card !== null && card.phase === 'confirm' && ((!card.target.startsWith('create:') && isGone(card.target)) || now - card.createdAt >= CONFIRM_TTL_MS)) {
@@ -5482,20 +5587,71 @@ async function settleWrites($: EngineInterface, live: ReadonlySet<string>, hidde
   if (open !== null && isGone(open.rowKey)) await dropEditor($, open.rowKey)
   // A hidden row's field is drawn afresh when the filter goes: it draws what was typed (X-1 (1)).
   else if (open !== null && !live.has(open.rowKey)) await update($, editor, had => (had === null || had.rowKey !== open.rowKey ? had : foldEditorTyped(had)))
+  // F-RUNTIME-2: the labels editor follows the row as listed now (GitHub or another pane may have made its change).
+  else if (open !== null && open.kind === 'labels') {
+    const found = findRow(listed, sectionOfRow(open.rowKey), numberOfRow(open.rowKey))
+    if (found !== null && settleLabels(open, found.row) !== open) await update($, editor, had => (had === null || had.rowKey !== open.rowKey ? had : settleLabels(had, found.row)))
+  }
   await pruneOutcomes($)
 }
 
+/**
+ * When a stored per-repository record was last written: its `fetchedAt`, `at` or `triedAt`, and for a list the latest
+ * time one of its issues was shown (E14-1's `seenAt`, which a filtered list stamps without a fetch); -Infinity for none.
+ */
+function storedAt(value: unknown): number {
+  if (typeof value !== 'object' || value === null) return Number.NEGATIVE_INFINITY
+  const given = value as Record<string, unknown>
+  let latest = Number.NEGATIVE_INFINITY
+  for (const field of ['fetchedAt', 'at', 'triedAt']) {
+    const time = given[field]
+    if (typeof time === 'number' && Number.isFinite(time) && time > latest) latest = time
+  }
+  const meta = given['meta']
+  if (typeof meta === 'object' && meta !== null) {
+    for (const entry of Object.values(meta as Record<string, unknown>)) {
+      const seen = typeof entry === 'object' && entry !== null ? (entry as { seenAt?: unknown }).seenAt : undefined
+      if (typeof seen === 'number' && Number.isFinite(seen) && seen > latest) latest = seen
+    }
+  }
+
+  return latest
+}
+
+/**
+ * The store's hygiene at a session's start: records of sessions no mapping names, closed issues' sessions past two
+ * weeks, and (F-STATE-1, F-STATE-4) whatever no session has touched for 90 days: a repository's five keys together,
+ * judged by its list (`cache:`, written at every list of it) and the newest of its other records, and an issue's
+ * earlier attempts without a mapping. A repository without a stored list is left as it is.
+ */
 async function sweepStale($: EngineInterface, now: number): Promise<void> {
   const keys = await $.store.keys().catch(() => [] as string[])
+  const repoKeys = new Map<string, string[]>()
+  const repoAt = new Map<string, number>()
   for (const key of keys) {
-    if (key.startsWith('phase:')) {
+    const prefix = REPO_PREFIXES.find(found => key.startsWith(found))
+    if (prefix !== undefined) {
+      const repo = key.slice(prefix.length)
+      repoKeys.set(repo, [...(repoKeys.get(repo) ?? []), key])
+      // The recaps are not read (the largest key): they are as old as the list they were made for.
+      if (prefix !== 'recaps:') repoAt.set(repo, Math.max(repoAt.get(repo) ?? Number.NEGATIVE_INFINITY, storedAt(await readStore<unknown>($, key))))
+    } else if (key.startsWith('phase:')) {
       const record = readPhase(await readStore<unknown>($, key))
       const isMapped = asMapping(await readStore<unknown>($, storeKeyOf('session:', key.slice('phase:'.length)))) !== undefined
       if (record === null || (!isMapped && now - record.at > PHASE_KEEP_MS)) await $.store.delete(key).catch(() => undefined)
     } else if (key.startsWith('done:')) {
       const record = asDone(await readStore<unknown>($, key))
       if (record === undefined || now - record.closedAt > DONE_KEEP_MS) await $.store.delete(key).catch(() => undefined)
+    } else if (key.startsWith('attempts:')) {
+      const list = asAttempts(await readStore<unknown>($, key))
+      const isMapped = asMapping(await readStore<unknown>($, storeKeyOf('session:', key.slice('attempts:'.length)))) !== undefined
+      const latest = list.reduce((found, attempt) => Math.max(found, attempt.at), Number.NEGATIVE_INFINITY)
+      if (list.length === 0 || (!isMapped && now - latest > REPO_KEEP_MS)) await $.store.delete(key).catch(() => undefined)
     }
+  }
+  for (const [repo, found] of repoKeys) {
+    if (!found.includes(storeKeyOf('cache:', repo)) || now - (repoAt.get(repo) ?? Number.NEGATIVE_INFINITY) <= REPO_KEEP_MS) continue
+    for (const key of found) await $.store.delete(key).catch(() => undefined)
   }
 }
 
@@ -5539,6 +5695,7 @@ async function resetStore($: EngineInterface): Promise<void> {
   await update($, settings, () => DEFAULT_SETTINGS)
   await update($, opened, () => '')
   await update($, tokens, () => 0)
+  await update($, storeRefused, () => false)
   await update($, prs, () => ({}))
   await update($, sessionPrs, () => ({}))
   // The saved views went with the settings: the filter starts over, and so do the lists' side data.
@@ -5561,6 +5718,7 @@ async function resetStore($: EngineInterface): Promise<void> {
   unparsed.clear()
   lastListed = null
   peekCursor = 0
+  probeCursor.clear()
   await update($, phases, () => ({}))
   await update($, sessionLive, () => ({}))
   await update($, attempts, () => ({}))
@@ -5787,7 +5945,7 @@ export const register: Register = (on, given) => {
     if (wantsPane && !isFound && !(await read($, isIssueSession)) && (e.surface === 'desktop' || e.surface === 'terminal')) {
       await openPane($, options, false)
       armTimer($, options)
-      schedule($, options, 400, 'tool')
+      schedule($, options, 400, 'attach')
     }
     const self = await read($, selfIssue)
     if (self !== null) await applyStatus($, options, self, await read($, ownPhase))
@@ -5838,6 +5996,7 @@ export const register: Register = (on, given) => {
     const started = await next(e)
     // E21: the running turn, at once and in module memory (a press's dispatch would not see the state's write).
     if (e.agentId === undefined) mainTurn = { turnId: e.turnId, since: await $.clock.now() }
+    if (e.agentId === undefined) permissionAsks.length = 0
     if (e.agentId === undefined) void inOrder(() => noteTurnStart($, options, e.turnId, e.text))
 
     return started
@@ -5846,6 +6005,7 @@ export const register: Register = (on, given) => {
   on('turn.complete', async ($, e, next) => {
     const finished = await next(e)
     if (e.agentId === undefined) mainTurn = null
+    if (e.agentId === undefined) permissionAsks.length = 0
     // E16-2: when the main loop last finished a turn (the fork's cache lapses some minutes after).
     if (e.agentId === undefined) lastTurnEndAt = await $.clock.now()
     if (e.agentId === undefined) void inOrder(() => noteTurnEnd($, options, e.reason, e.answer))
@@ -5862,6 +6022,18 @@ export const register: Register = (on, given) => {
     await inOrder(() => noteDialog($, options, String(e.tool), false))
 
     return ran
+  }).catch(($, e, next) => next(e))
+
+  // E10/E12 (F-CONFORMANCE-2, A-F10): a permission prompt in an issue session's main loop: the session waits for the
+  // owner until the call has run or was refused (the tool.call hook below notes that). The question dialog and the plan
+  // approval are noted by their own hook. The ask is passed on untouched; the record is written beside it.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    if (e.agent_id === undefined && !DIALOG_TOOLS.has(e.tool_name) && (await read($, selfIssue)) !== null) {
+      permissionAsks.push(e.tool_name)
+      void inOrder(() => notePermission($, options, true))
+    }
+
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   // E2: the `#` typeahead, only while the setting is on (the engine raises the event only while a plugin hooks it). The
@@ -5929,9 +6101,19 @@ export const register: Register = (on, given) => {
 
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
+    // F-CONFORMANCE-2: a call whose permission prompt this issue session raised has run or was refused: working again.
+    if (e.agentId === undefined && permissionAsks.length > 0) {
+      const at = permissionAsks.indexOf(String(e.tool))
+      if (at >= 0) {
+        permissionAsks.splice(at, 1)
+        if (permissionAsks.length === 0) void inOrder(() => notePermission($, options, false))
+      }
+    }
     const input = e as unknown as Record<string, unknown>
     const text = typeof input['command'] === 'string' ? input['command'] : ''
-    if (String(e.tool) === 'Bash' && /\bgh\s+(issue|pr)\b|\bgit\s+push\b/.test(text) && wantsPane && !(await read($, isIssueSession))) schedule($, options, 2_500, 'tool')
+    // V1: a gh issue or pr command, or a push, refreshes the list; F-BUDGET-2: only one that can change something is a
+    // `tool` refresh (the pull-request states and the closed lists after 30 s), a read is an `attach` one.
+    if (String(e.tool) === 'Bash' && GH_COMMAND.test(text) && wantsPane && !(await read($, isIssueSession))) schedule($, options, 2_500, GH_CHANGE.test(text) ? 'tool' : 'attach')
 
     return ran
   }).catch(($, e, next) => next(e))
@@ -5997,6 +6179,7 @@ export const register: Register = (on, given) => {
         isRefreshing: await read($, isRefreshing),
         isSettingsOpen: await read($, isSettingsOpen),
         tokens: await read($, tokens),
+        storeRefused: await read($, storeRefused),
         version: await read($, version),
         now: await $.clock.now(),
         columns: e.props.bodyColumns,

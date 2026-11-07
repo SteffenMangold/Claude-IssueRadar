@@ -443,13 +443,16 @@ test('a fork carries the conversation from a session in its own worktree, only b
   await ui.press({ key: `opts:${ROW_42}` })
   await ui.press({ key: `opts:${ROW_42}` })
   expect(await optionsOf(ui, `form-place:${ROW_42}`)).toEqual(['worktree', 'shared', 'fork'])
-  // While a turn of this conversation runs, it is not offered.
+  expect((await ui.find({ key: `form:${ROW_42}` }))?.text).not.toContain(DE.captionForkBusy)
+  // While a turn of this conversation runs, it is offered with the caption that says to wait (F-CONFORMANCE-3).
   await $.turn.start({ text: 'x', turnId: 'p1' })
   await clock.settle()
-  expect(await optionsOf(ui, `form-place:${ROW_42}`)).toEqual(['worktree', 'shared'])
+  expect(await optionsOf(ui, `form-place:${ROW_42}`)).toEqual(['worktree', 'shared', 'fork'])
+  expect((await ui.find({ key: `form:${ROW_42}` }))?.text).toContain(DE.captionForkBusy)
   await $.turn.complete({ answer: 'ok', durationMs: 900, isAborted: false, turnId: 'p1', reason: 'answer' })
   await clock.settle()
   expect(await optionsOf(ui, `form-place:${ROW_42}`)).toEqual(['worktree', 'shared', 'fork'])
+  expect((await ui.find({ key: `form:${ROW_42}` }))?.text).not.toContain(DE.captionForkBusy)
 
   await ui.select({ key: `form-place:${ROW_42}`, value: 'fork' })
   expect(await ui.find({ key: `form-model:${ROW_42}` })).toBeUndefined()

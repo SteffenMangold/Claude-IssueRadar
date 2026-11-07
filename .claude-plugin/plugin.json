@@ -23,7 +23,7 @@
     "maxIssues": {
       "type": "number",
       "title": "Issue cap",
-      "description": "How many open issues are listed per repository, the most recently updated first.",
+      "description": "How many open issues are listed per repository, the most recently updated first. Values above 100 cost store space: the store keeps up to three lists' worth of issue data per repository and holds 4 MiB in all.",
       "default": 30
     },
     "recaps": {

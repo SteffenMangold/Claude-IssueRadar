@@ -134,6 +134,8 @@ export const FORM_ROWS = 14
 export const WRITE_ROWS = 10
 /** E16: how many rows the new issue's form adds above the sections, about (closed: none). */
 export const DRAFT_ROWS = 16
+/** F-STATE-1: how many rows the line about a store that refuses writes takes above the sections, about (wrapped). */
+export const STORE_FULL_ROWS = 3
 
 /**
  * Rows above the sections beyond the title bar: the filter line, the filter panel, the settings panel (with E20's
@@ -219,6 +221,8 @@ export type PaneLike = Omit<DrawnInput, 'closedDays'> & {
   isSidebarAsking?: boolean
   /** E16: whether the new issue's form is drawn above the sections. */
   isDraftOpen?: boolean
+  /** F-STATE-1: whether the line about a store that refuses writes is drawn above the sections. */
+  storeRefused?: boolean
   /** Batch 7: the row whose editor, confirmation card or outcome line is drawn beneath it. */
   writeAt?: string
   isFilterOpen: boolean
@@ -231,7 +235,7 @@ export function paneLayout(pane: PaneLike): { plan: DrawnPlan; tops: RowTop[] } 
   const plan = drawnRowsOf({ ...pane, closedDays: pane.options.closedDays })
   const facet = pane.settings.boards === true ? pane.filter.board : ''
   const asking = new Set(pane.sections.filter(section => pane.options.recaps && section.info !== null && section.state.kind === 'ok' && pane.settings.consent[section.key] === undefined).map(section => section.key))
-  const head = headRows(!isDefaultFilter({ ...pane.filter, board: facet }), pane.isFilterOpen, pane.isSettingsOpen, pane.isSidebarAsking === true, pane.isDraftOpen === true)
+  const head = headRows(!isDefaultFilter({ ...pane.filter, board: facet }), pane.isFilterOpen, pane.isSettingsOpen, pane.isSidebarAsking === true, pane.isDraftOpen === true) + (pane.storeRefused === true ? STORE_FULL_ROWS : 0)
   // E22-b (R5-INT-3): the drawn closed rows (the first of each expanded part, as the pane draws them) that keep a session.
   const done = pane.done ?? {}
   const closedSessions = Object.fromEntries(

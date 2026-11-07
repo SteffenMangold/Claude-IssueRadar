@@ -932,7 +932,7 @@ test("a press from the terminal never opens the starter's session in the desktop
 
 test("an issue's earlier attempts go when a complete list no longer holds it", async ($, on) => {
   const { store } = project(on, {
-    stored: { [`attempts:${ROW_7}`]: [{ sessionId: 'local_old', title: '#7 Dark mode', startedAt: 1, endedAs: 'gone', at: 2 }], [`attempts:${ROW_42}`]: [{ sessionId: 'local_o42', title: TITLE_42, startedAt: 1, endedAs: 'gone', at: 2 }] },
+    stored: { [`attempts:${ROW_7}`]: [{ sessionId: 'local_old', title: '#7 Dark mode', startedAt: 1, endedAs: 'gone', at: NOW - 60_000 }], [`attempts:${ROW_42}`]: [{ sessionId: 'local_o42', title: TITLE_42, startedAt: 1, endedAs: 'gone', at: NOW - 60_000 }] },
     gh: args => (args[0] === 'issue' && args[1] === 'list' && !args.includes('closed') ? ran(JSON.stringify([ROWS[0]])) : undefined),
   })
   await started($, on)
@@ -1014,7 +1014,14 @@ test('the pure helpers of the listing and the ladder behave', async () => {
   expect(badge({ live: live({ presence: 'archived', sessionId: 'local_other' }) })).toBeNull()
   expect(badge({ live: live({ state: 'working', at: NOW }), record: record({ at: NOW - 1 }) })).toBe('working')
   expect(badge({ live: live({ state: 'idle', at: NOW }), record: record({ ask: 'proposal', at: NOW - 1 }) })).toBe('proposal')
-  expect(badge({ live: live({ state: 'idle', at: NOW }), record: record({ ask: 'question', at: NOW - 1 }) })).toBe('idle')
+  // F-CONFORMANCE-1: a finished turn is idle to the app; the record that waits for the owner stands against it.
+  expect(badge({ live: live({ state: 'idle', at: NOW }), record: record({ ask: 'question', at: NOW - 1 }) })).toBe('question')
+  expect(badge({ live: live({ state: 'idle', at: NOW }), record: record({ activity: 'error', at: NOW - 1 }) })).toBe('error')
+  expect(badge({ live: live({ state: 'idle', at: NOW }), record: record({ at: NOW - 1 }) })).toBe('waiting')
+  expect(badge({ live: live({ state: 'waiting', at: NOW }), record: record({ ask: 'question', at: NOW - 1 }) })).toBe('question')
+  // A record left at working (a session that ended without its turn's end) yields to a newer idle; failed wins too.
+  expect(badge({ live: live({ state: 'idle', at: NOW }), record: record({ activity: 'working', at: NOW - 1 }) })).toBe('idle')
+  expect(badge({ live: live({ state: 'failed', at: NOW }), record: record({ ask: 'question', at: NOW - 1 }) })).toBe('error')
   expect(badge({ live: live({ state: 'idle', at: NOW - 1 }), record: record({ ask: 'question', at: NOW }) })).toBe('question')
   expect(badge({ live: live({}), record: record({ activity: 'error' }) })).toBe('error')
   expect(badge({ mapping: { ...MAPPED, startedAt: NOW - 60_000 }, live: live({}) })).toBe('starting')

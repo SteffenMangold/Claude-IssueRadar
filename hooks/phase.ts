@@ -87,12 +87,15 @@ export function readPhase(value: unknown): PhaseRecord | null {
 
 /**
  * The record a mapped row may draw: one written under the mapping's session id (the desktop's, or the engine's where
- * the two differ, S4); otherwise one written since the mapping's start (a session that knows only its engine id);
- * none else, so an earlier session's record never speaks for the current one.
+ * the two differ, S4); otherwise one written since the mapping's start (a session that knows only its engine id),
+ * unless it names a session the row knows as another (`others`: an earlier attempt, the closed issue's session, another
+ * row's mapping; F-STATE-5: an old session used again writes the same key); none else, so an earlier session's record
+ * never speaks for the current one.
  */
-export function phaseFor(record: PhaseRecord | null, mapping: Mapping): PhaseRecord | null {
+export function phaseFor(record: PhaseRecord | null, mapping: Mapping, others: ReadonlySet<string> = new Set()): PhaseRecord | null {
   if (record === null) return null
   if (record.sessionId === mapping.sessionId || record.engineId === mapping.sessionId) return record
+  if (others.has(record.sessionId) || (record.engineId !== undefined && others.has(record.engineId))) return null
 
   return record.at >= mapping.startedAt ? record : null
 }

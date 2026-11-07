@@ -82,8 +82,10 @@ export type BadgeInput = {
 
 /**
  * The row's one badge (plan 4.5): this session; then gone or archived from the app; otherwise the newer of the record
- * and the app's state word, except that a proposal stands while the app says only waiting or idle (the listing cannot
- * see a proposal); a record alone; the app's word alone; starting for two minutes after a start; active while listed.
+ * and the app's state word, except that a record that waits for the owner (a proposal, a question, a summary, an error)
+ * stands while the app says only waiting or idle (F-CONFORMANCE-1: a finished turn is idle to the app, so that word
+ * says nothing against it; the listing cannot see what the session asks); a record alone; the app's word alone;
+ * starting for two minutes after a start; active while listed. A record left at working yields to a newer idle.
  * Null when nothing is known (no route to the app, no record): the row looks as V1 drew it.
  */
 export function rowBadge(input: BadgeInput): Badge | null {
@@ -98,7 +100,7 @@ export function rowBadge(input: BadgeInput): Badge | null {
   if (record !== null) {
     const kind = phaseKind(record)
     if (app === null || live === undefined || record.at >= live.at) return { kind, since: record.at, isStale: false }
-    if (kind === 'proposal' && (app === 'waiting' || app === 'idle')) return { kind, since: record.at, isStale: false }
+    if (kind !== 'working' && (app === 'waiting' || app === 'idle')) return { kind, since: record.at, isStale: false }
 
     return { kind: appKind(app), since: null, isStale }
   }
