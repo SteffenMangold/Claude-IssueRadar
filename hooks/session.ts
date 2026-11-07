@@ -41,7 +41,7 @@ export type DesktopCall =
 export type StartOutcome = {
   route: StartRoute
   sessionId: string | null
-  /** What the app answered, cut short, for the spike notes and the debug log. */
+  /** What the app answered, cut short (a refusal's words too), for the spike notes and the debug log. */
   raw: string
   /** Why no route started a session. */
   reason?: string
@@ -293,7 +293,8 @@ export async function startDesktopSession($: EngineInterface, args: StartArgs, c
   if (!answer.ok) {
     $.ui.log(`issue-radar: start_session failed (${answer.via}): ${answer.reason}`, { to: 'debug' })
 
-    return { route: 'none', sessionId: null, raw: '', reason: answer.reason }
+    // The refusal's own words, longer than the reason: an unknown model's lists the ids the app takes (S23).
+    return { route: 'none', sessionId: null, raw: answer.text.slice(0, 400), reason: answer.reason }
   }
   knownRoute = answer.via
   $.ui.log(`issue-radar: start_session via ${answer.via}: ${answer.text.slice(0, 400)}`, { to: 'debug' })

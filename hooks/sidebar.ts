@@ -125,8 +125,13 @@ export function isOffScreen(structured: unknown, text: string): boolean | null {
 
 /** The group the stored record names (`sidebar:group`), or null. */
 export function storedGroupId(stored: unknown): string | null {
-  if (typeof stored !== 'object' || stored === null) return null
-  const id = (stored as Record<string, unknown>)['id']
+  return storedGroup(stored)?.id ?? null
+}
 
-  return typeof id === 'string' && id !== '' ? id : null
+/** The stored record (`sidebar:group`): the group's id and when an issue session stored it (0 when it does not say); null for none. */
+export function storedGroup(stored: unknown): { id: string; at: number } | null {
+  if (typeof stored !== 'object' || stored === null) return null
+  const { id, at } = stored as Record<string, unknown>
+
+  return typeof id === 'string' && id !== '' ? { id, at: typeof at === 'number' && Number.isFinite(at) ? at : 0 } : null
 }

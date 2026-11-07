@@ -17,7 +17,7 @@ import { INBOX_CAP } from './inbox'
 import { cardRowsOf, isFilteredList, paneLayout, rowKeyOf, unreadCount, visibleMark } from './marks'
 import { linksOf, prCardLine, prChip, prLine, prRefOf } from './prs'
 import type { PrTone, ShownPr } from './prs'
-import { asEffort, asModel, effortChoices, modelChoices } from './startform'
+import { asEffort, asModel, canShareBranch, effortChoices, modelChoices } from './startform'
 import { clean, cleanLine } from './text'
 import { isOwnSession, rowBadge } from './tracking'
 import type { Badge, BadgeKind } from './tracking'
@@ -142,6 +142,8 @@ export type ViewActions = {
   patchForm: (rowKey: string, patch: Partial<StartChoice>) => void
   draftNote: (rowKey: string, text: string) => void
   keepNote: (rowKey: string, text: string) => void
+  /** The kept note's ✕: drops it on purpose (an emptied field keeps it, B6-BEH-3). */
+  dropNote: (rowKey: string) => void
   startFromForm: (rowKey: string, label: string, surface: RenderSurface) => void
   hereFromForm: (rowKey: string) => void
   cancelForm: (rowKey: string) => void
@@ -324,9 +326,11 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   const savedViews = settings.views ?? []
   /** E18's facet while the feature is on; empty keeps every row. */
   const boardFacet = settings.boards === true ? state.filter.board : ''
+  // E13: the sidebar question, asked once for the installation, on the desktop, once an issue has a session.
+  const isSidebarAsking = state.surface === 'desktop' && state.sidebar === 'unasked' && Object.keys(state.mappings).length > 0
   // The rows drawn, in order, within the row budget, and where each sits: the one rule a look (E5) and the cards (E4)
-  // read too, so they always agree with the drawing.
-  const { plan, tops } = paneLayout(state)
+  // read too, so they always agree with the drawing (the question above the sections counts, R6-INT-4).
+  const { plan, tops } = paneLayout({ ...state, isSidebarAsking })
   const planOf = new Map(plan.sections.map(drawn => [drawn.section.key, drawn]))
   /** E14-5: a section listed for another filter than the current one is drawn as loading until its own list comes. */
   const isStale = (section: Section) => planOf.get(section.key)?.isStale ?? false
@@ -698,21 +702,20 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
   ) : null
 
   // E13: asked once for the installation, on the desktop, once an issue has a session ------------------
-  const sidebarAsk =
-    state.surface === 'desktop' && state.sidebar === 'unasked' && Object.keys(state.mappings).length > 0 ? (
-      <Box key="sidebar-ask" flexDirection="column" rowGap="xs" marginX="sm" marginY="xs" paddingX="md" paddingY="sm" borderStyle="round" borderColor={tint(HUE.blue, 0.45)} backgroundColor={tint(HUE.blue, 0.06)}>
-        <Text size="footnote" weight="semibold" wrap="wrap">
-          {S.sidebarAskTitle}
-        </Text>
-        <Text size="caption" color={INK.secondary} wrap="wrap">
-          {S.sidebarAskDetail}
-        </Text>
-        <Box flexDirection="row" flexWrap="wrap" columnGap="xs" rowGap="xs">
-          <Button key="sidebar-on" label={S.sidebarAskOn} variant="primary" onPress={() => actions.sidebarChoice(true)} />
-          <Button key="sidebar-off" label={S.sidebarAskOff} onPress={() => actions.sidebarChoice(false)} />
-        </Box>
+  const sidebarAsk = isSidebarAsking ? (
+    <Box key="sidebar-ask" flexDirection="column" rowGap="xs" marginX="sm" marginY="xs" paddingX="md" paddingY="sm" borderStyle="round" borderColor={tint(HUE.blue, 0.45)} backgroundColor={tint(HUE.blue, 0.06)}>
+      <Text size="footnote" weight="semibold" wrap="wrap">
+        {S.sidebarAskTitle}
+      </Text>
+      <Text size="caption" color={INK.secondary} wrap="wrap">
+        {S.sidebarAskDetail}
+      </Text>
+      <Box flexDirection="row" flexWrap="wrap" columnGap="xs" rowGap="xs">
+        <Button key="sidebar-on" label={S.sidebarAskOn} variant="primary" onPress={() => actions.sidebarChoice(true)} />
+        <Button key="sidebar-off" label={S.sidebarAskOff} onPress={() => actions.sidebarChoice(false)} />
       </Box>
-    ) : null
+    </Box>
+  ) : null
 
   // States ---------------------------------------------------------------
   const stateBlock = (section: Section) => {
@@ -1317,10 +1320,13 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     const isTerminal = state.surface === 'terminal'
     const facts = state.startFacts
     const branch = clean(facts === null || facts.branch === '' ? S.unknownBranch : facts.branch)
+    // B6-BEH-2: this checkout can hold the work only on a branch of its own, never on the default branch (the brief's code repository's).
+    const defaultBranch = (state.sections.find(found => found.isCheckout)?.info ?? section.info)?.defaultBranch ?? ''
+    const canShare = facts !== null && canShareBranch(facts.branch, defaultBranch)
     const placeChoices = [
       { value: 'worktree', label: S.placeWorktree },
-      { value: 'shared', label: S.placeShared },
-      // A Select's value must be among its options: a form that holds the fork keeps it listed while it may not start.
+      // A Select's value must be among its options: a form that holds a choice keeps it listed while it may not start.
+      ...(canShare || form.place === 'shared' ? [{ value: 'shared', label: S.placeShared }] : []),
       ...(state.forkState === 'ok' || form.place === 'fork' ? [{ value: 'fork', label: S.placeFork }] : []),
     ]
     const models = modelChoices(facts?.model ?? '')
@@ -1328,7 +1334,7 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
     const tokens = facts?.contextTokens ?? null
     const captions: string[] = []
     if (form.mode === 'fix') captions.push(S.captionFix)
-    if (isDesk && form.place === 'shared') captions.push(S.captionShared(branch, facts?.isWorktree === true))
+    if (isDesk && form.place === 'shared') captions.push(canShare ? S.captionShared(branch, facts?.isWorktree === true) : S.captionSharedDefault(facts === null || facts.branch === '' ? null : branch))
     if (isDesk && form.place === 'fork') {
       captions.push(state.forkState === 'busy' ? S.captionForkBusy : state.forkState === 'none' ? S.captionForkNone : S.captionFork(branch, tokens === null ? null : fmtK(tokens)))
       if (facts?.isDirty === true) captions.push(S.captionDirty)
@@ -1381,9 +1387,14 @@ export function renderPane(ui: Table, state: ViewState, actions: ViewActions): R
           <Input key={`form-note:${key}`} rows={2} placeholder={S.formNote} submitLabel={S.formNoteKeep} onInput={value => actions.draftNote(key, value)} onSubmit={value => actions.keepNote(key, value)} />
         )}
         {form.note !== '' && (
-          <Text size="caption" color={INK.muted} wrap="wrap">
-            {S.formNoteKept(cut(cleanLine(form.note), 200))}
-          </Text>
+          <Box key={`form-note-kept:${key}`} flexDirection="row" alignItems="flex-start" columnGap={step('sm', 1)}>
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Text size="caption" color={INK.muted} wrap="wrap">
+                {S.formNoteKept(cut(cleanLine(form.note), 200))}
+              </Text>
+            </Box>
+            <Button key={`form-note-clear:${key}`} plain label={isRich ? '✕' : `✕ ${S.guidanceClear}`} onPress={() => actions.dropNote(key)} />
+          </Box>
         )}
         {captions.map(text => note(text, INK.muted))}
         <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={step('sm', 1)} rowGap={step('xs', 0)}>

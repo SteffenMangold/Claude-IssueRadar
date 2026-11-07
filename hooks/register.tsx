@@ -23,14 +23,15 @@ import { ARRIVAL_TOAST_MS, LOOK_THROTTLE_MS, MARK_HOLD_MS, SEEN_KEEP_FACTOR, arr
 import type { PaneLike, RowTop } from './marks'
 import { briefIssueKey, describeIssue, findMentions, infoFromIssueUrl, isRecentlyAttached, keyOfRemote, mentionRef, parseMentionToken, resolveMentions, suggestIssues, withAttached } from './mentions'
 import type { KnownIssue } from './mentions'
-import { askOf, parseMarker, phaseFor, proposalsDue, readPhase, samePhases, statusText, toastRef } from './phase'
+import { askOf, isSameHandOff, parseMarker, phaseFor, proposalsDue, readPhase, samePhases, statusText, toastRef } from './phase'
 import type { Marker } from './phase'
 import { asRecord, isPrsDue, mergeLinks, recordOf } from './prs'
 import { RECAP_VERSION, asRecap, isBetterRecap, isRecapCurrent, isRecapFor, isRecapUsable, recapIssue } from './recap'
-import { commandConsent, detachQuietly, detachSession, isTypingRefusal, listSessions, lookUpSession, openSessionIn, parseObject, peekForPress, peekSession, pressConsent, quietDesktop, readPrStatus, readSelfId, routeInUse, settleWithin, startDesktopSession, unarchiveSession } from './session'
+import { callDesktop, commandConsent, detachQuietly, detachSession, isTypingRefusal, listSessions, lookUpSession, openSessionIn, parseObject, peekForPress, peekSession, pressConsent, quietDesktop, readPrStatus, readSelfId, routeInUse, settleWithin, startDesktopSession, unarchiveSession } from './session'
 import type { Listing, OpenOutcome, Peek, SessionEntry, StartArgs, StartOutcome } from './session'
-import { FILE_TRIES, SIDEBAR_GROUP, TITLE_GAP_MS, asSidebarChoice, groupFor, isOffScreen, parseGroupId, parseGroups, parseSections, storedGroupId, viewShowsGroup } from './sidebar'
-import { DEFAULT_CHOICE, GUIDANCE_CHARS, asEffort, asModel, asksOptions, cleanGuidance, cleanNote, forkState, looksSecret, optionsHeld, parseGitFacts } from './startform'
+import { FILE_TRIES, SIDEBAR_GROUP, TITLE_GAP_MS, asSidebarChoice, groupFor, isOffScreen, parseGroupId, parseGroups, parseSections, storedGroup, storedGroupId, viewShowsGroup } from './sidebar'
+import type { SidebarGroup } from './sidebar'
+import { DEFAULT_CHOICE, FORM_HOLD_MS, GUIDANCE_CHARS, asEffort, asModel, asksOptions, canShareBranch, cleanGuidance, cleanNote, forkState, looksSecret, noteOf, optionsHeld, parseGitFacts } from './startform'
 import { clean } from './text'
 import { probeEngaged, runTiers } from './tiers'
 import { offerToast, takeToast } from './toasts'
@@ -164,6 +165,7 @@ const done = atom({ plugin: 'issue-radar', key: 'done' } as const, {}, { shape: 
 const startForm = atom({ plugin: 'issue-radar', key: 'startForm' } as const, null, { shape: 'start-form-1' })
 const startFacts = atom({ plugin: 'issue-radar', key: 'startFacts' } as const, null, { shape: 'start-facts-1' })
 const sidebar = atom({ plugin: 'issue-radar', key: 'sidebar' } as const, { choice: 'unasked' }, { shape: 'sidebar-1' })
+const isCarried = atom({ plugin: 'issue-radar', key: 'isCarried' } as const, false)
 
 // Module state: lost on a hot reload, which is fine, since the next refresh rebuilds it.
 let timer: Timer | undefined
@@ -217,8 +219,9 @@ let lastListed: { at: number; ids: Set<string> } | null = null
 /**
  * E1 (A-F12): starts whose answer carried no readable session id, by row key: looked for by name or title in the next
  * listings for ten minutes, and no second start meanwhile. Module memory: a reload forgets them (the toast said so).
+ * The start's mode and place travel along (B6-BEH-5): the adopted mapping says what a parsed start's would.
  */
-const unparsed = new Map<string, { title: string; name: string; branch: string; at: number; before: Set<string> | null }>()
+const unparsed = new Map<string, { title: string; name: string; branch: string; at: number; before: Set<string> | null; mode: StartChoice['mode']; place: StartChoice['place'] }>()
 /** E12: the identification by the desktop's id in flight (the start refresh waits for it before it decides about the pane). */
 let identifying: Promise<boolean> | null = null
 /** E12: how many main-loop turns of an unidentified session asked; when a failed read of the desktop id may be tried again. */
@@ -323,6 +326,13 @@ let tidyTimer: Timer | undefined
 let isTidying = false
 /** E13: when the issue session last compared its title with its issue's (at most every ten minutes). */
 let lastTitleCheck = Number.NEGATIVE_INFINITY
+/**
+ * E20 (F X-1 (3), R6-RT-1): when the owner last touched the start form (opened it, picked, typed); it holds the timed
+ * refresh for FORM_HOLD_MS after that at most. A hot reload forgets it, so a form a reload left behind holds nothing.
+ */
+let formTouchedAt = Number.NEGATIVE_INFINITY
+/** E12 with E21 (B6-BEH-1): this module saw a hand-off arrive as a later prompt (the state's isCarried keeps it across a reload). */
+let carriedSeen = false
 
 type Resolved = { spec: string; info: RepoInfo | null; state: RepoState; isCheckout: boolean }
 /** What one `gh issue view` of the tool came back with. */
@@ -684,12 +694,24 @@ async function mayRunInBackground($: EngineInterface): Promise<boolean> {
 
 /**
  * Whether the owner is typing in the pane: an inline editor or a form with an Input is open. Timed refreshes wait
- * while it holds, so a redraw never races the typing (F X-1): E20's start form under a row. The settings panel's
- * fields (the watch list, E20's guidance) draw no value and keep their text across redraws, so they do not count; the
- * filter panel neither (E14). Batch 7's editors add their atoms here.
+ * while it holds, so a redraw never races the typing (F X-1): E20's start form under a row, but only while that row is
+ * drawn (a collapsed section, a board facet or the row budget hides it with its form, R6-INT-1, B6-BEH-4) and only for
+ * FORM_HOLD_MS after the owner last touched it (F X-1 (3): a form left open never stops the timer for good, R6-RT-1; the
+ * form's Input draws no value, so a later redraw keeps its text). The settings panel's fields (the watch list, E20's
+ * guidance) draw no value and keep their text across redraws, so they do not count; the filter panel neither (E14).
+ * Batch 7's editors add their atoms here.
  */
-async function isEditing($: EngineInterface): Promise<boolean> {
-  return (await read($, startForm)) !== null
+async function isEditing($: EngineInterface, options: Options): Promise<boolean> {
+  const form = await read($, startForm)
+  if (form === null || (await $.clock.now()) - formTouchedAt >= FORM_HOLD_MS) return false
+  const { plan } = paneLayout(await paneState($, options))
+
+  return plan.sections.some(drawn => drawn.rows.some(row => rowKeyOf(drawn.section.key, row.number) === form.rowKey))
+}
+
+/** The owner touched the start form (opened it, picked, typed): it holds the timed refresh for FORM_HOLD_MS from now. */
+async function touchForm($: EngineInterface): Promise<void> {
+  formTouchedAt = await $.clock.now()
 }
 
 async function isPaneOpen($: EngineInterface): Promise<boolean> {
@@ -714,7 +736,7 @@ function armTimer($: EngineInterface, options: Options): void {
   if (options.refreshMinutes <= 0) return
   timer = $.clock.every(Math.max(MIN_PERIOD_MS, Math.round(options.refreshMinutes * 60_000)), () => {
     void (async () => {
-      if ((await mayRunInBackground($)) && !(await isEditing($))) await refresh($, options, 'timer')
+      if ((await mayRunInBackground($)) && !(await isEditing($, options))) await refresh($, options, 'timer')
     })()
   })
 }
@@ -1122,7 +1144,18 @@ async function adoptUnparsed($: EngineInterface, options: Options, entries: read
     if (matches.length !== 1 || entry === undefined) continue
     unparsed.delete(rowKey)
     const held = await read($, checkoutKey)
-    const adopted: Mapping = { sessionId: entry.id, title: start.title, startedAt: start.at, startedFrom: myId, detached: entry.detached === true, branch: start.branch, ...(held === '' ? {} : { checkoutKey: held }) }
+    // As a parsed start's mapping (B6-BEH-5): only an own worktree's branch is the slug; the mode and the place go along.
+    const adopted: Mapping = {
+      sessionId: entry.id,
+      title: start.title,
+      startedAt: start.at,
+      startedFrom: myId,
+      detached: entry.detached === true,
+      ...(start.place === 'worktree' ? { branch: start.branch } : {}),
+      mode: start.mode,
+      place: start.place,
+      ...(held === '' ? {} : { checkoutKey: held }),
+    }
     await saveMapping($, rowKey, adopted)
     if (entry.detached !== true && (await detachQuietly($, entry.id))) await saveMapping($, rowKey, { ...adopted, detached: true })
     $.ui.toast(clean(S.adopted(start.title)), { timeoutMs: 6_000 })
@@ -1720,6 +1753,8 @@ async function freshDetails($: EngineInterface, options: Options, section: Secti
   if (settled.state.toUpperCase() !== 'OPEN') {
     $.ui.toast(S.closedMeanwhile(row.number))
     await update($, sections, current => current.map(found => (found.key === section.key ? { ...found, rows: found.rows.filter(item => item.number !== row.number) } : found)))
+    // E20 (R6-INT-1): the row's start form goes with the row (it would hold nothing drawn, and come back with a reopen).
+    await closeForm($, rowKey)
     await retireMapping($, rowKey, (await read($, mappings))[rowKey])
     // E22: the repository's closed list, when expanded, is read again on the next refresh (once it is 30 s old).
     closedNudge.add(section.key)
@@ -1797,6 +1832,13 @@ async function startIssueSession($: EngineInterface, options: Options, sectionKe
   const root = checkout?.root ?? (await $.session.root())
   // E20/E21: a shared checkout and a fork name this session's branch as it is now, not as it was when the form opened.
   const facts = choice.place === 'worktree' ? null : await readStartFacts($, root)
+  // B6-BEH-2: a shared checkout on the default branch (or one not known) cannot hold the work: nothing is started, the form stays.
+  const defaultBranch = (input.codeRepo ?? input.issueRepo).defaultBranch
+  if (choice.place === 'shared' && !canShareBranch(facts?.branch ?? '', defaultBranch)) {
+    $.ui.toast(clean(S.captionSharedDefault(facts === null || facts.branch === '' ? null : facts.branch)), { timeoutMs: 8_000 })
+
+    return 'kept'
+  }
   // E6: Phase 1 names the issue tool where this session's model can call it (the issue session's own is not known here).
   const briefing: BriefOptions = {
     issueTool: await issueToolOf($),
@@ -1854,7 +1896,7 @@ async function startIssueSession($: EngineInterface, options: Options, sectionKe
   }
   if (outcome.sessionId === null) {
     $.ui.toast(S.noIdParsed, { timeoutMs: 8_000 })
-    unparsed.set(rowKey, { title, name, branch, at: now, before })
+    unparsed.set(rowKey, { title, name, branch, at: now, before, mode: choice.mode, place: choice.place })
     scheduleTrack($, options, TRACK_AFTER_START_MS)
 
     return 'started'
@@ -1928,14 +1970,15 @@ async function holdsOptions($: EngineInterface, sessionId: string, choice: Start
 
 /**
  * E20/E21: what the form reads of this session: its branch and whether its folder is a linked worktree (one local git
- * call, repo hooks off), whether tracked files are dirty (another), the context's tokens and the model (the engine), the
- * effort (one quiet get_session 'self'). Each failure leaves its field empty.
+ * call, repo hooks off), whether tracked files are dirty (another, without optional locks), the context's tokens and the
+ * model (the engine), the effort (one quiet get_session 'self'). Each failure leaves its field empty.
  */
 async function readStartFacts($: EngineInterface, root: string): Promise<StartFacts> {
   const now = await $.clock.now()
   const head = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD', '--path-format=absolute', '--git-dir', '--git-common-dir'], { cwd: root, timeoutMs: 5_000 }).catch(() => null)
   const git = parseGitFacts(head !== null && head.exitCode === 0 ? head.stdout : '')
-  const status = head !== null && head.exitCode === 0 ? await $.process.run(['git', 'status', '--porcelain', '--untracked-files=no'], { cwd: root, timeoutMs: 5_000 }).catch(() => null) : null
+  // R6-RT-6: a status read in the background never takes the index lock a git command of this session's own may need.
+  const status = head !== null && head.exitCode === 0 ? await $.process.run(['git', '--no-optional-locks', 'status', '--porcelain', '--untracked-files=no'], { cwd: root, timeoutMs: 5_000 }).catch(() => null) : null
   const usage = await $.session.usage().catch(() => null)
   const model = await $.session.model().catch(() => '')
   const self = await peekSession($, 'self')
@@ -1954,8 +1997,9 @@ async function readStartFacts($: EngineInterface, root: string): Promise<StartFa
 
 /**
  * E21: whether the form may carry this conversation now (startform.ts forkState). The running turn comes from the turn
- * hooks' module memory where this module saw one, else from the state (which a drawing reads, so it redraws at a turn's
- * end).
+ * hooks' module memory where this module saw one (it runs however long it takes: the hook that heard its start hears its
+ * end, R6-RT-5), else from the state after a hot reload (which a drawing reads, so it redraws at a turn's end; it counts
+ * for TURN_STALE_MS at most).
  */
 async function forkStateOf($: EngineInterface, surface: RenderSurface, facts: StartFacts | null): Promise<ForkState> {
   const held = await read($, turnRunning)
@@ -1966,7 +2010,7 @@ async function forkStateOf($: EngineInterface, surface: RenderSurface, facts: St
     isIssueSession: await read($, isIssueSession),
     isWorktree: facts?.isWorktree === true,
     turns,
-    running: mainTurn === undefined ? held : mainTurn,
+    running: mainTurn === undefined ? held : mainTurn === null ? null : { since: mainTurn.since, isHeard: true },
     now: await $.clock.now(),
   })
 }
@@ -1985,6 +2029,7 @@ async function toggleStartForm($: EngineInterface, rowKey: string, surface: Rend
   noteDrafts.delete(rowKey)
   const chosen = await read($, settings)
   const form: StartForm = { rowKey, ...DEFAULT_CHOICE, beside: chosen.beside === true }
+  await touchForm($)
   await update($, startForm, () => form)
   if (surface === 'desktop') {
     const facts = await readStartFacts($, checkout?.root ?? (await $.session.root()))
@@ -1998,22 +2043,41 @@ async function closeForm($: EngineInterface, rowKey: string): Promise<void> {
   await update($, startForm, current => (current !== null && current.rowKey === rowKey ? null : current))
 }
 
+/** Closes whichever start form is open (the pane's ✕). */
+async function closeOpenForm($: EngineInterface): Promise<void> {
+  noteDrafts.clear()
+  await update($, startForm, () => null)
+}
+
 /** A choice picked in the form of `rowKey`. */
 async function patchForm($: EngineInterface, rowKey: string, patch: Partial<StartChoice>): Promise<void> {
+  await touchForm($)
   await update($, startForm, current => (current === null || current.rowKey !== rowKey ? current : { ...current, ...patch }))
 }
 
-/** Enter in the note: kept in the state (drawn as a caption); the typing itself only in the module's drafts. */
+/**
+ * Enter in the note: kept in the state (drawn as a caption); the typing itself only in the module's drafts. The draft is
+ * spent with it (B6-BEH-3): what a start sends is what the form draws, until the owner types again.
+ */
 async function keepNote($: EngineInterface, rowKey: string, text: string): Promise<void> {
-  noteDrafts.set(rowKey, text)
+  noteDrafts.delete(rowKey)
   await patchForm($, rowKey, { note: cleanNote(text) })
 }
 
-/** The form's choice with the note as typed (a draft not yet kept counts); null when the note looks like a secret (told). */
+/** The kept note's ✕: the owner drops the note on purpose (an emptied field does not, B6-BEH-3). */
+async function dropNote($: EngineInterface, rowKey: string): Promise<void> {
+  noteDrafts.delete(rowKey)
+  await patchForm($, rowKey, { note: '' })
+}
+
+/**
+ * The form's choice with the note: the text typed since the last Enter where it says anything, else the kept one the form
+ * draws (B6-BEH-3); null when the note looks like a secret (told).
+ */
 async function formChoice($: EngineInterface, options: Options, rowKey: string): Promise<StartChoice | null> {
   const form = await read($, startForm)
   if (form === null || form.rowKey !== rowKey) return null
-  const note = cleanNote(noteDrafts.get(rowKey) ?? form.note)
+  const note = noteOf(noteDrafts.get(rowKey), form.note)
   if (looksSecret(note)) {
     $.ui.toast(strings(options.language).noteSecret, { timeoutMs: 6_000 })
 
@@ -3753,6 +3817,40 @@ async function firstUserText($: EngineInterface, fallback: string): Promise<stri
   return messages.find(message => message.role === 'user')?.text ?? fallback
 }
 
+/** The transcript's first and latest user messages, each the prompt at hand when the transcript holds none yet. */
+async function userTexts($: EngineInterface, fallback: string): Promise<{ first: string; latest: string }> {
+  const users = (await $.session.messages().catch(() => [])).filter(message => message.role === 'user')
+
+  return { first: users[0]?.text ?? fallback, latest: users.at(-1)?.text ?? fallback }
+}
+
+/**
+ * B6-BEH-1: a hand-off reached this session as a later prompt: its conversation was carried (E21's fork, whose transcript
+ * opens with the pane session's) or the brief was pasted. Its first user message is another session's from now on, and
+ * never names this session's issue (plan 4.5 (b)); only a mapping does (a). Kept in the state, so a reload knows it too.
+ */
+async function noteCarried($: EngineInterface): Promise<void> {
+  if (carriedSeen) return
+  carriedSeen = true
+  await update($, isCarried, () => true)
+}
+
+/** Whether this session's conversation was carried (noteCarried): the module's note, else the state's after a reload. */
+async function isCarriedNow($: EngineInterface): Promise<boolean> {
+  return carriedSeen || (await read($, isCarried))
+}
+
+/**
+ * Whether `prompt` is a hand-off of another session's that is not this session's first message (`first`): a carried
+ * conversation. The first message holding that same hand-off (a byte changed on its way) is no carried one.
+ */
+async function isLaterHandOff($: EngineInterface, prompt: string, first: string): Promise<boolean> {
+  if (prompt === first || !prompt.trimStart().startsWith(MARKER) || isSameHandOff(prompt, first)) return false
+  const marker = parseMarker(prompt)
+
+  return marker !== null && !(await isOwnBrief($, prompt, marker))
+}
+
 /**
  * E12's one write point (plan 4.5): the issue session's own record under `phase:<rowKey>`, with its state, what its last
  * finished turn asked, and when. A start of a turn or dialog that changes nothing is not written; a turn's end always
@@ -3797,16 +3895,22 @@ async function applyStatus($: EngineInterface, options: Options, self: SelfIssue
 }
 
 /**
- * A main-loop turn starts. An issue session records that it works; a session not identified yet looks at its first
- * user message for the marker, then (at its first three turns) at the mappings for its id (B-E12-1: the mapping may land
- * after the session started). Runs beside the turn, never in its way (B-E12-5).
+ * A main-loop turn starts. An issue session records that it works; a session not identified yet (at its first three
+ * turns: B-E12-1, the mapping may land after the session started) looks for strong evidence first, a mapping that names
+ * its id (plan 4.5 (a)), and only then at its first user message for the marker (b). A conversation carried into this
+ * session (B6-BEH-1: a later prompt, or the one at hand, is another session's hand-off, as in E21's fork) is never
+ * identified by its first message, which is another session's. Runs beside the turn, never in its way (B-E12-5).
  */
 async function noteTurnStart($: EngineInterface, options: Options, turnId: string, text: string): Promise<void> {
   const now = await $.clock.now()
   await update($, turnRunning, () => ({ turnId, since: now }))
   if ((await read($, selfIssue)) === null && identifyTurns < IDENTIFY_TURNS) {
     identifyTurns += 1
-    if (!(await identifyByMarker($, options, await firstUserText($, text)))) await identifyByMapping($, options)
+    if (!(await identifyByMapping($, options))) {
+      const { first, latest } = await userTexts($, text)
+      if (await isLaterHandOff($, text === '' ? latest : text, first)) await noteCarried($)
+      if (!(await isCarriedNow($))) await identifyByMarker($, options, first)
+    }
   }
   if ((await read($, selfIssue)) !== null) await writePhase($, options, 'working', 'none', false)
 }
@@ -3914,15 +4018,18 @@ function scheduleTidy($: EngineInterface, options: Options, delayMs: number, rea
  * E13, inside an issue session only and only for 'self' (plan section 3): while the owner said yes (read from the store
  * each time, so a later yes reaches running sessions), the session files itself under "Issues" once, follows a GitHub
  * rename of its issue while its title is still the one the mod gave it, and after a finished turn marks itself unread
- * when the app says it is open nowhere. Every call quiet (never a card). Nothing before the session's first record (its
- * first turn's end), and nothing for the spike's session.
+ * when the app says it is open nowhere. Every call quiet (never a card). Nothing before the session's first turn has
+ * ended (R6-RT-3: the record is written at the first turn's start already, while the pane that started the session may
+ * still be opening it beside itself and detaching it), and nothing for the spike's session.
  */
 async function tidySelf($: EngineInterface, options: Options, reason: TurnCompleteReason | undefined): Promise<void> {
   const self = await read($, selfIssue)
   if (self === null || self.isSpike || isTidying) return
   if (asSidebarChoice(await readStore<unknown>($, 'sidebar:choice')) !== 'on') return
+  // The turn hooks' writes still in the chain land first: the record read next is the latest.
+  await inOrder(() => Promise.resolve())
   const record = ownLatest ?? (await read($, ownPhase))
-  if (record === null) return
+  if (record === null || record.turns < 1) return
   isTidying = true
   try {
     const now = await $.clock.now()
@@ -3944,8 +4051,17 @@ async function tidySelf($: EngineInterface, options: Options, reason: TurnComple
   }
 }
 
-/** An E13 field in the session's own record, through its one write point; the state stays as it is (writePhase keeps its time). */
+/**
+ * An E13 field in the session's own record, through its one write point and in the turn hooks' order (R6-RT-2): the
+ * state is taken inside the chain from the last record written, so a stamp never writes an older state over a turn's,
+ * a turn never loses a stamp, and the state's time stays (writePhase keeps it: no pane takes a stamp for news).
+ */
 async function stampSelf($: EngineInterface, options: Options, extra: Partial<Pick<PhaseRecord, 'title' | 'filedGroupId' | 'filedAt' | 'fileTries'>>): Promise<void> {
+  await inOrder(() => stampLatest($, options, extra))
+}
+
+/** stampSelf's step in the chain: the latest record's state, unchanged, with `extra`. */
+async function stampLatest($: EngineInterface, options: Options, extra: Partial<Pick<PhaseRecord, 'title' | 'filedGroupId' | 'filedAt' | 'fileTries'>>): Promise<void> {
   const before = ownLatest ?? (await read($, ownPhase))
   if (before === null) return
   await writePhase($, options, before.activity, before.ask, false, extra)
@@ -3976,24 +4092,34 @@ async function fileSelf($: EngineInterface, options: Options, me: Peek, record: 
   const sectionsAnswer = await quietDesktop($, 'ccd_sidebar', 'list_sections', {})
   const listed = sectionsAnswer.ok ? parseSections(sectionsAnswer.structured, sectionsAnswer.text) : null
   if (listed === null) return
-  const groupsAnswer = await quietDesktop($, 'ccd_sidebar', 'list_groups', {})
-  const groups = groupsAnswer.ok ? parseGroups(groupsAnswer.structured, groupsAnswer.text) : null
+  const listedAt = await $.clock.now()
+  let groups = await listGroups($)
   if (groups === null) {
     await countTry()
 
     return
   }
-  const storedId = storedGroupId(await readStore<unknown>($, 'sidebar:group'))
-  if (storedId !== null && !groups.some(group => group.id === storedId)) {
-    await $.store.delete('sidebar:group').catch(() => undefined)
-    await $.store.delete('sidebar:choice').catch(() => undefined)
-    $.ui.log(`${PLUGIN}: the sidebar group ${storedId} is gone; issue sessions file themselves again only after a new yes`, { to: 'debug' })
+  const stored = storedGroup(await readStore<unknown>($, 'sidebar:group'))
+  if (stored !== null && !groups.some(group => group.id === stored.id)) {
+    // R6-RT-4: another issue session may have made and stored the group after this list was asked: not removed, and the
+    // next turn files into it. An older one the list lacks is asked about once more before it counts as removed.
+    if (stored.at >= listedAt) return
+    const again = await listGroups($)
+    if (again === null) return
+    if (!again.some(group => group.id === stored.id)) {
+      await $.store.delete('sidebar:group').catch(() => undefined)
+      await $.store.delete('sidebar:choice').catch(() => undefined)
+      $.ui.log(`${PLUGIN}: the sidebar group ${stored.id} is gone; issue sessions file themselves again only after a new yes`, { to: 'debug' })
 
-    return
+      return
+    }
+    groups = again
   }
-  let group = groupFor(groups, storedId)
+  let group = groupFor(groups, stored?.id ?? null)
   if (!viewShowsGroup(listed, group?.id ?? null)) return
   if (group === undefined) {
+    // R6-RT-4: another issue session may have made one since: none is made then, and the next turn files into it.
+    if (stored === null && storedGroupId(await readStore<unknown>($, 'sidebar:group')) !== null) return
     const created = await quietDesktop($, 'ccd_sidebar', 'create_group', { name: SIDEBAR_GROUP })
     const id = created.ok ? parseGroupId(created.structured, created.text) : null
     if (id === null) {
@@ -4001,13 +4127,22 @@ async function fileSelf($: EngineInterface, options: Options, me: Peek, record: 
 
       return
     }
-    group = { id, name: SIDEBAR_GROUP, order: groups.length }
     $.ui.toast(S.groupCreated)
+    // Two sessions that made one each at once both file into the lowest-order "Issues" the list names afterwards.
+    const after = await listGroups($)
+    group = (after === null ? undefined : groupFor(after, null)) ?? { id, name: SIDEBAR_GROUP, order: groups.length }
   }
-  await writeStore($, 'sidebar:group', { id: group.id, name: group.name, at: now })
+  await writeStore($, 'sidebar:group', { id: group.id, name: group.name, at: await $.clock.now() })
   const moved = await quietDesktop($, 'ccd_sidebar', 'move_sessions', { session_ids: ['self'], group_id: group.id })
   if (moved.ok) await stampSelf($, options, { filedAt: now, filedGroupId: group.id })
   else await countTry()
+}
+
+/** The sidebar's groups (list_groups, quiet); null when the answer cannot be read (unknown, never empty). */
+async function listGroups($: EngineInterface): Promise<SidebarGroup[] | null> {
+  const answer = await quietDesktop($, 'ccd_sidebar', 'list_groups', {})
+
+  return answer.ok ? parseGroups(answer.structured, answer.text) : null
 }
 
 /**
@@ -4157,11 +4292,22 @@ async function runSpike($: EngineInterface, command: string): Promise<string> {
   else {
     lines.push(`start_session via ${outcome.route} (use_worktree: true); session id ${outcome.sessionId ?? 'not parsed'}.`, `Answer: ${outcome.raw || '(empty)'}`)
     if (outcome.sessionId !== null) {
+      // S25 (E8, A-F17 (d)): the production order, split before the detach, then the window's layout, then the split
+      // closed again (the session keeps running; only the pane goes).
+      const split = await openSessionIn($, outcome.sessionId, 'split', consent)
+      lines.push(`open_session_in split: ${split.outcome}${split.reason === '' ? '' : ` (${split.reason})`}`)
       const detached = await detachSession($, outcome.sessionId, consent)
       lines.push(detached.ok ? 'detach_session: ok.' : `detach_session refused: ${detached.reason ?? '?'}`)
+      lines.push(await layoutLine($, outcome.sessionId))
+      if (split.outcome !== 'refused') {
+        const closed = await callDesktop($, 'ccd_window', 'close_split', { session_id: outcome.sessionId }, consent)
+        lines.push(closed.ok ? `close_split: ${closed.text.split('\n')[0]?.slice(0, 120) || 'ok'}` : `close_split refused: ${closed.reason}`)
+      }
       const look = await lookUpSession($, outcome.sessionId, consent)
       lines.push(look.exists ? `get_session: state ${look.state || '?'}, title "${look.title}", archived ${look.isArchived}` : 'get_session: not found')
     }
+    // S23 (E20, B-E20-4): the form's cheaper model and lowest effort, measured apart from the plain start above.
+    lines.push(...(await optionsSpike($, consent, brief)))
   }
   // The route the mod's own reads take (S1 for quiet calls) and what the app tells a session about itself (S4). A
   // measurement: it tries mcp even while an earlier transport failure holds quiet calls back from it.
@@ -4205,6 +4351,33 @@ async function runSpike($: EngineInterface, command: string): Promise<string> {
   lines.push(await issueToolLine($), `last prompt origin: ${lastPromptOrigin || 'none yet'}`)
 
   return clean(lines.join('\n'))
+}
+
+/** S25 (E8): what the window's layout says after the split and the detach: its keys and whether it names the session. Quiet, the mcp route alone. */
+async function layoutLine($: EngineInterface, sessionId: string): Promise<string> {
+  const layout = await quietDesktop($, 'ccd_window', 'get_window_layout', {}, { isMeasurement: true, isMcpOnly: true })
+  if (!layout.ok) return `get_window_layout (quiet, mcp only): not read (${layout.reason})`
+  const keys = Object.keys(parseObject(layout.structured, layout.text))
+  const names = layout.text.includes(sessionId) || JSON.stringify(layout.structured ?? null).includes(sessionId)
+
+  return `get_window_layout (quiet, via mcp): ${keys.length === 0 ? 'no JSON' : `keys ${keys.slice(0, 20).join(', ')}`}; names the session: ${names ? 'yes' : 'no'}`
+}
+
+/**
+ * S23 (E20, B-E20-4): one more throw-away session with the form's cheapest choices (model haiku, effort low), so a
+ * refusal names what the app takes (its model ids) and a start says through get_session what the session runs on. The
+ * owner archives both spike sessions.
+ */
+async function optionsSpike($: EngineInterface, consent: string, brief: ReturnType<typeof spikeBrief>): Promise<string[]> {
+  const asked = 'model haiku, effort low'
+  const outcome = await startDesktopSession($, { ...brief, title: `${brief.title} (haiku, low)`, name: 'issue-radar-spike-opts', use_worktree: true, branch_name: 'issue-radar-spike-opts', model: 'haiku', effort: 'low' }, consent)
+  if (outcome.route === 'none') return [`start_session with ${asked} (S23): refused: ${outcome.raw || outcome.reason || '?'}`]
+  if (outcome.sessionId === null) return [`start_session with ${asked} (S23) via ${outcome.route}: session id not parsed; answer: ${outcome.raw || '(empty)'}`]
+  const detached = await detachSession($, outcome.sessionId, consent)
+  const child = await peekSession($, outcome.sessionId, { isMeasurement: true, isMcpOnly: true })
+  const runs = child.kind === 'found' ? `model ${child.entry.model ?? '?'}, effort ${child.entry.effort ?? '?'}` : child.kind === 'gone' ? 'not found' : `not read (${child.reason})`
+
+  return [`start_session with ${asked} (S23) via ${outcome.route}: session id ${outcome.sessionId}; ${detached.ok ? 'detached' : `detach refused: ${detached.reason ?? '?'}`}; get_session (quiet, mcp only): ${runs}`]
 }
 
 /** `/issue-radar` and `/issues`: opens the pane, or `reset` clears the store, or `spike` measures the session tools. Top-level, as the engine requires of a function `$` is passed to. */
@@ -4311,8 +4484,11 @@ export const register: Register = (on, given) => {
       const marker = parseMarker(e.text)
       if (!(await isOwnBrief($, e.text, marker))) {
         // E12 (plan 4.5): the marker as the session's FIRST user message makes it the issue session (its line, its
-        // record); a marker in a later prompt only stands the session down, as V1 did (A-F5).
-        const isFirst = (await firstUserText($, e.text)) === e.text
+        // record); a marker in a later prompt only stands the session down, as V1 did (A-F5), and says the conversation
+        // was carried (B6-BEH-1: E21's fork opens with the pane session's transcript), so its first message never counts.
+        const first = await firstUserText($, e.text)
+        const isFirst = first === e.text
+        if (!isFirst && marker !== null && !isSameHandOff(e.text, first)) await noteCarried($)
         if (!(isFirst && (await identifyByMarker($, options, e.text))) && !(await read($, isIssueSession))) {
           await update($, isIssueSession, () => true)
           standDown()
@@ -4504,6 +4680,8 @@ export const register: Register = (on, given) => {
         close: () => {
           wantsPane = false
           void $.ui.close({ id: PANE }).catch(() => undefined)
+          // E20 (R6-RT-1): a closed pane keeps no start form (the state would draw it again at the next /issues).
+          void closeOpenForm($)
         },
         toggleSection: key => void toggleSection($, key),
         toggleRow: key => void toggleRow($, options, key),
@@ -4533,8 +4711,10 @@ export const register: Register = (on, given) => {
         patchForm: (rowKey, patch) => void patchForm($, rowKey, patch),
         draftNote: (rowKey, text) => {
           noteDrafts.set(rowKey, text)
+          void touchForm($)
         },
         keepNote: (rowKey, text) => void keepNote($, rowKey, text),
+        dropNote: rowKey => void dropNote($, rowKey),
         startFromForm: (rowKey, label, surface) => void startFromForm($, options, rowKey, label, surface),
         hereFromForm: rowKey => void hereFromForm($, options, rowKey),
         cancelForm: rowKey => void closeForm($, rowKey),

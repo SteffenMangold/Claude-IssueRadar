@@ -700,6 +700,11 @@ declare module 'claude-code' {
       startFacts: Shaped<StartFacts | null>
       /** E13: the installation-wide sidebar choice, mirrored from the store's `sidebar:choice`. */
       sidebar: Shaped<{ choice: SidebarChoice }>
+      /**
+       * E12 with E21 (B6-BEH-1): a hand-off reached this session as a later prompt, so its conversation was carried (a
+       * fork) or the brief was pasted: its first user message is another session's and never names its issue.
+       */
+      isCarried: boolean
     }
   }
 }

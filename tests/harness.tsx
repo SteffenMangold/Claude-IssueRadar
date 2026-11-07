@@ -171,6 +171,11 @@ export type Setup = {
    * slow store, so two readers both see what was there); undefined answers at once, as the default does for every key.
    */
   storeDelay?: (key: string) => Promise<unknown> | undefined
+  /**
+   * Holds a `$.store.set` of a key until the promise it returns settles, the value written only then (a slow write, so
+   * another writer can land first); undefined writes at once, as the default does for every key.
+   */
+  storeSetDelay?: (key: string) => Promise<unknown> | undefined
   /** The text the model answers a `$.model.complete` with, per request; the default is V1's plain German recap. */
   model?: (request: { prompt: string; system: string }) => string
   /** The main conversation's messages `$.session.messages()` answers until `setMessages` changes them; none by default. */
@@ -283,6 +288,14 @@ export function project(on: On, setup: Setup = {}): Project {
   })
   on('store.set', (_, e) => {
     if (setup.storeRefuses?.(e.key) === true) throw new Error('the store is over 4 MiB of JSON text')
+    const held = setup.storeSetDelay?.(e.key)
+    if (held !== undefined) {
+      return held.then(() => {
+        store.set(e.key, e.value)
+
+        return { value: undefined }
+      })
+    }
     store.set(e.key, e.value)
 
     return { value: undefined }

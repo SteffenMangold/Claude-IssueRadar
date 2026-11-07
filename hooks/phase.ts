@@ -32,6 +32,18 @@ export function parseMarker(text: string): Marker | null {
   return { kind: 'issue', spec, number, rowKey: `${key}#${number}`, repo: parts.slice(-2).join('/'), fromId: found[3] ?? '' }
 }
 
+/**
+ * Whether two texts open with the same hand-off: the same issue (or the spike) from the same pane. A brief the host
+ * passed on with a byte changed is still that brief; another issue's brief, or none, is another prompt (B6-BEH-1).
+ */
+export function isSameHandOff(a: string, b: string): boolean {
+  const x = parseMarker(a)
+  const y = parseMarker(b)
+  if (x === null || y === null || x.kind !== y.kind || x.fromId !== y.fromId) return false
+
+  return x.kind === 'spike' || (y.kind === 'issue' && x.rowKey === y.rowKey)
+}
+
 /** Markdown, quote marks and blockquote marks a model may wrap a line in. */
 const WRAPPING = /[*_`>#~"'„“”«»]/g
 

@@ -16,8 +16,11 @@ export const DEFAULT_CHOICE: StartChoice = { mode: 'understand', place: 'worktre
 /** The efforts the desktop names, lowest first (start_session's `effort`). */
 export const EFFORTS: readonly Exclude<StartEffort, 'inherit'>[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
-/** How long a main-loop turn counts as running for E21 at most: a lost turn.complete never blocks the fork for good. */
+/** How long a running turn only the state remembers (after a hot reload) counts for E21 at most: a lost end never blocks the fork for good. */
 export const TURN_STALE_MS = 30 * 60_000
+
+/** How long an untouched start form holds the timed refresh (F X-1 (3)): a form left open never stops it for good. */
+export const FORM_HOLD_MS = 10 * 60_000
 
 /**
  * The cheaper models the form offers beside the session's own (start_session takes `same family or cheaper than
@@ -73,6 +76,17 @@ export function cleanNote(text: string): string {
 }
 
 /**
+ * The note a start sends (B6-BEH-3): what the owner typed since the last Enter, when it says anything, else the note
+ * kept with Enter, which the form draws as its caption. An emptied field never drops the kept note unseen: the caption's
+ * ✕ does that.
+ */
+export function noteOf(draft: string | undefined, kept: string): string {
+  const typed = cleanNote(draft ?? '')
+
+  return typed !== '' ? typed : cleanNote(kept)
+}
+
+/**
  * Whether a text looks like it holds a secret, which the mod refuses to keep or send with a brief: a GitHub token
  * (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and 20+ characters; `github_pat_…`), an API key (`sk-…`), a private key block.
  * A heuristic: the owner is told it cannot prove a paragraph is free of secrets.
@@ -101,8 +115,12 @@ export type ForkInput = {
   isWorktree: boolean
   /** The owner's prompts so far ($.session.turns). */
   turns: number
-  /** The main loop's running turn, if any. */
-  running: { since: number } | null
+  /**
+   * The main loop's running turn, if any. `isHeard`: this module's own turn hook heard its start, so it hears its end
+   * too (the engine's promise), and the turn runs however long it takes; otherwise it is the state's note from before a
+   * hot reload, which a lost end could leave behind, and counts for TURN_STALE_MS at most (R6-RT-5).
+   */
+  running: { since: number; isHeard?: boolean } | null
   now: number
 }
 
@@ -110,12 +128,27 @@ export type ForkInput = {
  * E21: whether the form offers to carry this conversation. Only on the desktop, outside issue sessions, from a
  * session in its own worktree (a fork from a shared checkout cannot be detached and would wake this session after
  * every turn, plan section 3), once the owner wrote at least one prompt; `busy` while a main-loop turn runs (the
- * carried conversation would be cut mid-turn), at most TURN_STALE_MS.
+ * carried conversation would be cut mid-turn): a turn this module heard start for as long as it runs, one only the
+ * state remembers for TURN_STALE_MS at most.
  */
 export function forkState(input: ForkInput): ForkState {
   if (input.surface !== 'desktop' || input.isIssueSession || !input.isWorktree || input.turns < 1) return 'none'
+  const { running } = input
+  if (running === null) return 'ok'
 
-  return input.running !== null && input.now - input.running.since < TURN_STALE_MS ? 'busy' : 'ok'
+  return running.isHeard === true || input.now - running.since < TURN_STALE_MS ? 'busy' : 'ok'
+}
+
+/**
+ * B6-BEH-2: whether a checkout an issue session would share can hold its work: only on a branch of its own, never on
+ * the default branch (a commit there skips review, and no pull request can be opened from it) nor on an unknown or
+ * detached one. An unknown default branch cannot be told apart, so it holds nothing either.
+ */
+export function canShareBranch(branch: string, defaultBranch: string): boolean {
+  const name = branch.trim().toLowerCase()
+  const base = defaultBranch.trim().toLowerCase()
+
+  return name !== '' && name !== 'head' && base !== '' && name !== base
 }
 
 /** Whether a start's choice asks for a model or an effort of its own. */

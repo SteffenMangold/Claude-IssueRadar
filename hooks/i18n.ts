@@ -255,6 +255,10 @@ const DE = {
   captionFork: (branch: string, tokens: string | null) =>
     `Nimmt dieses Gespräch mit${tokens === null ? '' : ` (${tokens} Tokens)`}; die neue Session liest es noch einmal ein. Neuer Worktree ab ${branch}, nicht vom Standard-Branch. Bleibt sie verknüpft, macht diese Session nach jedem ihrer Züge weiter.`,
   captionForkBusy: 'Mitnehmen geht, sobald der laufende Zug fertig ist.',
+  captionSharedDefault: (branch: string | null) =>
+    branch === null
+      ? 'Der Branch dieses Checkouts ist nicht bekannt: eine Session hier könnte auf dem Standard-Branch committen. Für die Arbeit „Neu, eigener Worktree“ wählen.'
+      : `Dieser Checkout steht auf ${branch}, dem Standard-Branch: eine Session hier könnte nur dort committen. Für die Arbeit „Neu, eigener Worktree“ wählen.`,
   captionForkNone: 'Mitnehmen geht nur aus einer Session mit eigenem Worktree, nach deiner ersten Nachricht.',
   captionDirty: 'Nicht committete Änderungen bleiben hier.',
   captionModel: 'Ein teureres Modell als das dieser Session ignoriert die App.',
@@ -535,6 +539,10 @@ const EN: typeof DE = {
   captionFork: (branch: string, tokens: string | null) =>
     `Carries this conversation${tokens === null ? '' : ` (${tokens} tokens)`}, which the new session reads once more. New worktree cut from ${branch}, not from the default branch. If it stays linked, this session continues after each of its turns.`,
   captionForkBusy: 'Carrying works once the running turn has finished.',
+  captionSharedDefault: (branch: string | null) =>
+    branch === null
+      ? `This checkout's branch is not known: a session here could commit to the default branch. Choose "New, own worktree" for the work.`
+      : `This checkout is on ${branch}, the default branch: a session here could only commit there. Choose "New, own worktree" for the work.`,
   captionForkNone: 'Carrying works only from a session in its own worktree, after your first message.',
   captionDirty: 'Uncommitted changes stay here.',
   captionModel: "The app ignores a model above this session's.",

@@ -11,13 +11,13 @@ import { DEFAULT_FILTER } from '../hooks/filter'
 import { strings } from '../hooks/i18n'
 import { FORM_ROWS, headRows, paneLayout } from '../hooks/marks'
 import type { PaneLike } from '../hooks/marks'
-import { askOf, statusText } from '../hooks/phase'
+import { askOf, isSameHandOff, statusText } from '../hooks/phase'
 import { entryOf, isTypingRefusal } from '../hooks/session'
-import { asSidebarChoice, groupFor, isOffScreen, parseGroupId, parseGroups, parseSections, viewShowsGroup } from '../hooks/sidebar'
-import { asksOptions, cleanGuidance, cleanNote, effortChoices, forkState, looksSecret, modelChoices, optionsHeld, parseGitFacts } from '../hooks/startform'
+import { asSidebarChoice, groupFor, isOffScreen, parseGroupId, parseGroups, parseSections, storedGroup, viewShowsGroup } from '../hooks/sidebar'
+import { asksOptions, canShareBranch, cleanGuidance, cleanNote, effortChoices, forkState, looksSecret, modelChoices, noteOf, optionsHeld, parseGitFacts } from '../hooks/startform'
 import type { IssueRow, Mapping, PhaseRecord, RepoInfo, RepoSettings, Section } from '../types'
 import type { Engine, McpAnswer, McpCall } from './harness'
-import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, count, linkedWorktree, mcpText, project, ran, started, tick } from './harness'
+import { ISSUES, NOW, PANE, ROW_42, ROW_7, SECTION, command, count, issueView, linkedWorktree, mcpText, plainCheckout, project, ran, started, tick } from './harness'
 
 const DE = strings('de')
 const SETTINGS = 'settings:github.com/acme/widgets'
@@ -74,6 +74,8 @@ async function turn($: Engine, id: string, answer: string, reason: 'answer' | 'a
 
 test('the start form maps its choices to start_session: just fix it, in this checkout, a cheaper model, a lower effort and a note', async ($, on) => {
   const { store, mcp, argv, toasts, toolCalls } = project(on, {
+    // This checkout is on a branch of its own (B6-BEH-2: one on the default branch is never shared).
+    git: args => (args[0] === 'rev-parse' ? plainCheckout('feature/y') : undefined),
     // A side session that shares the checkout cannot be detached (B-E20-7).
     mcp: desktop({ detach_session: () => mcpText("Refused: a side session that shares another session's worktree cannot be detached.", true) }),
   })
@@ -86,6 +88,8 @@ test('the start form maps its choices to start_session: just fix it, in this che
   expect(await ui.find({ key: `work:${ROW_42}` })).toBeUndefined()
   expect(await ui.find({ key: `here:${ROW_42}` })).toBeUndefined()
   expect(argv.find(call => call[0] === 'git' && call[1] === 'rev-parse')).toEqual(['git', 'rev-parse', '--abbrev-ref', 'HEAD', '--path-format=absolute', '--git-dir', '--git-common-dir'])
+  // R6-RT-6: the status read never takes the index lock a git command of this session's own may need.
+  expect(argv.find(call => call[0] === 'git' && call.includes('status'))).toEqual(['git', '--no-optional-locks', 'status', '--porcelain', '--untracked-files=no'])
   // The model offers only what is cheaper than this session's (claude-opus-test); the effort all five while unknown.
   expect(await optionsOf(ui, `form-model:${ROW_42}`)).toEqual(['inherit', 'sonnet', 'haiku'])
   expect(await optionsOf(ui, `form-effort:${ROW_42}`)).toEqual(['inherit', 'low', 'medium', 'high', 'xhigh', 'max'])
@@ -115,7 +119,7 @@ test('the start form maps its choices to start_session: just fix it, in this che
   expect(prompt).toContain(GO_LINE)
   expect(prompt).toContain(PUSH_LINE)
   // B-E20-2: the shared checkout's branch only; no branch is created or switched.
-  expect(prompt).toContain('work on `main` only, and never create, switch or check out a branch')
+  expect(prompt).toContain('work on `feature/y` only, and never create, switch or check out a branch')
   expect(prompt).not.toContain('first create `issue-42')
   expect(prompt).toMatch(/<owner-note>\n> Only touch the exporter\.\n<\/owner-note>$/)
   expect(store.get(`session:${ROW_42}`)).toMatchObject({ sessionId: 'local_abc123', mode: 'fix', place: 'shared', detached: false })
@@ -165,6 +169,7 @@ test("the repository's guidance is kept with its settings and closes every brief
 test('a model or effort the app refuses is dropped once, never on the typed route; another refusal lands in this prompt box', async ($, on) => {
   let refuseAll = false
   const { mcp, toolCalls, toasts, store, filled } = project(on, {
+    git: args => (args[0] === 'rev-parse' ? plainCheckout('feature/y') : undefined),
     mcp: desktop({
       start_session: call =>
         refuseAll
@@ -295,6 +300,135 @@ test('the open form holds the timer; a start that never reached the app keeps it
   await ui.unmount()
 })
 
+test('a checkout on its default branch is never shared: not offered, and refused at Starten when the branch moved there (B6-BEH-2)', async ($, on) => {
+  let branch = 'main'
+  const { mcp, toasts } = project(on, { git: args => (args[0] === 'rev-parse' ? plainCheckout(branch) : undefined) })
+  await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  // On main, the default branch: only a worktree of its own.
+  await ui.press({ key: `opts:${ROW_42}` })
+  expect(await optionsOf(ui, `form-place:${ROW_42}`)).toEqual(['worktree'])
+  await ui.press({ key: `opts:${ROW_42}` })
+  // On a branch of its own it may be shared; the branch moves to main before Starten: nothing starts, the form stays.
+  branch = 'feature/y'
+  await ui.press({ key: `opts:${ROW_42}` })
+  await ui.select({ key: `form-mode:${ROW_42}`, value: 'fix' })
+  await ui.select({ key: `form-place:${ROW_42}`, value: 'shared' })
+  branch = 'main'
+  await ui.press({ key: `form-start:${ROW_42}` })
+  expect(starts(mcp)).toHaveLength(0)
+  expect(toasts.at(-1)).toBe(DE.captionSharedDefault('main'))
+  expect(await ui.find({ key: `form:${ROW_42}` })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the form holds the timer only while its row is drawn and for ten minutes after the last touch; ✕ takes it along (R6-RT-1, R6-INT-1)', async ($, on) => {
+  const { argv } = project(on)
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const lists = () => count(argv, 'issue', 'list')
+
+  // Its section collapsed: neither the row nor the form is drawn, and the timer runs.
+  await ui.press({ key: `opts:${ROW_42}` })
+  await ui.press({ key: `section:${SECTION}` })
+  expect(await ui.find({ key: `form:${ROW_42}` })).toBeUndefined()
+  let before = lists()
+  await tick(clock)
+  expect(lists()).toBe(before + 1)
+  await ui.press({ key: `section:${SECTION}` })
+  expect(await ui.find({ key: `form:${ROW_42}` })).toBeDefined()
+
+  // Drawn and touched: held; left untouched for ten minutes, the timer runs again and the form stays.
+  await ui.select({ key: `form-mode:${ROW_42}`, value: 'fix' })
+  before = lists()
+  await tick(clock, 3)
+  expect(lists()).toBe(before)
+  await tick(clock, 2)
+  expect(lists()).toBeGreaterThan(before)
+  expect(await ui.find({ key: `form:${ROW_42}` })).toBeDefined()
+
+  // The pane's ✕ takes the form along: /issues draws none.
+  await ui.press({ key: 'close' })
+  await ui.unmount()
+  await command($, 'issues')
+  await clock.advance(1_000)
+  const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await again.find({ key: `form:${ROW_42}` })).toBeUndefined()
+  expect(await again.find({ key: `row-title:${ROW_42}` })).toBeDefined()
+  await again.unmount()
+})
+
+test('an issue that closed before Starten takes its form along, and the timer runs again (R6-INT-1)', async ($, on) => {
+  let isClosed = false
+  const { argv, mcp, toasts } = project(on, { gh: args => (args[0] === 'issue' && args[1] === 'view' && args[2] === '7' && isClosed ? ran(issueView(7, 'CLOSED')) : undefined) })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `opts:${ROW_7}` })
+  isClosed = true
+  await ui.press({ key: `form-start:${ROW_7}` })
+  expect(toasts).toContain(DE.closedMeanwhile(7))
+  expect(starts(mcp)).toHaveLength(0)
+  expect(await ui.find({ key: `form:${ROW_7}` })).toBeUndefined()
+  const before = count(argv, 'issue', 'list')
+  await tick(clock)
+  expect(count(argv, 'issue', 'list')).toBe(before + 1)
+  // The list names the issue again (reopened): its row comes back without the old form.
+  expect(await ui.find({ key: `row-title:${ROW_7}` })).toBeDefined()
+  expect(await ui.find({ key: `form:${ROW_7}` })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a kept note is what the form draws and what the brief carries: an emptied field keeps it, its ✕ drops it (B6-BEH-3)', async ($, on) => {
+  const { filled } = project(on)
+  await started($, on, 'terminal')
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  await ui.press({ key: `opts:${ROW_42}` })
+  await ui.input({ key: `form-note:${ROW_42}`, text: 'Only touch the exporter.' })
+  await ui.input({ key: `form-note:${ROW_42}`, text: 'Al', kind: 'change' })
+  await ui.input({ key: `form-note:${ROW_42}`, text: '', kind: 'change' })
+  expect((await ui.find({ key: `form:${ROW_42}` }))?.text).toContain(DE.formNoteKept('Only touch the exporter.'))
+  await ui.press({ key: `form-here:${ROW_42}` })
+  expect(filled[0]).toContain('<owner-note>\n> Only touch the exporter.\n</owner-note>')
+
+  // Kept, then dropped on purpose: no note.
+  await ui.press({ key: `opts:${ROW_7}` })
+  await ui.input({ key: `form-note:${ROW_7}`, text: 'Keep the theme.' })
+  await ui.press({ key: `form-note-clear:${ROW_7}` })
+  expect((await ui.find({ key: `form:${ROW_7}` }))?.text).not.toContain(DE.formNoteKept('Keep the theme.'))
+  await ui.press({ key: `form-here:${ROW_7}` })
+  expect(filled).toHaveLength(2)
+  expect(filled[1]).not.toContain('<owner-note>')
+  await ui.unmount()
+})
+
+test('a shared start whose answer carried no id is adopted with its mode and place and without a branch slug (B6-BEH-5)', async ($, on) => {
+  let isListed = false
+  const { store, toasts } = project(on, {
+    git: args => (args[0] === 'rev-parse' ? plainCheckout('feature/y') : undefined),
+    mcp: desktop({
+      start_session: () => mcpText('Started.'),
+      list_sessions: () => mcpText(JSON.stringify(isListed ? [{ sessionId: 'local_xyz', title: TITLE_42, name: 'issue-42-widgets', startedBy: 'local_pane' }] : [])),
+    }),
+  })
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `opts:${ROW_42}` })
+  await ui.select({ key: `form-mode:${ROW_42}`, value: 'fix' })
+  await ui.select({ key: `form-place:${ROW_42}`, value: 'shared' })
+  await ui.press({ key: `form-start:${ROW_42}` })
+  expect(toasts).toContain(DE.noIdParsed)
+  isListed = true
+  await clock.advance(8_000)
+  const adopted = store.get(`session:${ROW_42}`) as Mapping
+  expect(adopted).toMatchObject({ sessionId: 'local_xyz', mode: 'fix', place: 'shared' })
+  expect(adopted.branch).toBeUndefined()
+  await ui.unmount()
+})
+
 // E21: carry this conversation ---------------------------------------------------------
 
 test('a fork carries the conversation from a session in its own worktree, only between turns: context fork and nothing fresh-only', async ($, on) => {
@@ -388,6 +522,89 @@ test('a refused fork is never started fresh: the brief lands in this prompt box,
   expect(store.has(`session:${ROW_42}`)).toBe(false)
   expect(toasts.at(-1)).toBe(DE.sessionNotStarted('Refused: a mod cannot fork this session.'))
   await ui.unmount()
+})
+
+test('a turn this session heard start holds the fork however long it runs (R6-RT-5)', async ($, on) => {
+  const { mcp, setTurns, toasts } = project(on, { git: args => (args[0] === 'rev-parse' ? linkedWorktree() : undefined) })
+  setTurns(1)
+  const clock = await started($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: `opts:${ROW_42}` })
+  await ui.select({ key: `form-place:${ROW_42}`, value: 'fork' })
+  await $.turn.start({ text: 'refactor everything', turnId: 'long' })
+  await clock.advance(31 * 60_000)
+  await ui.press({ key: `form-start:${ROW_42}` })
+  expect(starts(mcp)).toHaveLength(0)
+  expect(toasts.at(-1)).toBe(DE.captionForkBusy)
+  await ui.unmount()
+})
+
+/** The brief the pane session took here for #7 as its first message, and the fork brief for #42 it later carried along. */
+const TAKEN_7 = renderBrief(
+  { issueRepo: WIDGETS, codeRepo: WIDGETS, row: { number: 7, title: 'Dark mode for the settings page', url: 'https://github.com/acme/widgets/issues/7', createdAt: '2026-10-01T10:00:00Z', updatedAt: '2026-11-01T09:00:00Z', author: 'designer', labels: [], assignees: [], milestone: null, isPinned: true }, details: { updatedAt: '', state: 'OPEN', commentCount: 0, comments: [], excerpt: '', body: 'Dark.', linkedPrs: [], fetchedAt: 1 }, fetchedAt: '2026-11-06T11:00:00.000Z' },
+  { fromId: 'local_pane', place: 'here' },
+)
+const FORK_42 = renderBrief(
+  { issueRepo: WIDGETS, codeRepo: WIDGETS, row: { number: 42, title: 'Export fails for empty folders', url: 'https://github.com/acme/widgets/issues/42', createdAt: '2026-11-03T10:00:00Z', updatedAt: '2026-11-05T09:00:00Z', author: 'reporter', labels: [], assignees: [], milestone: null, isPinned: false }, details: { updatedAt: '', state: 'OPEN', commentCount: 0, comments: [], excerpt: '', body: 'Export.', linkedPrs: [], fetchedAt: 1 }, fetchedAt: '2026-11-06T12:00:00.000Z' },
+  { fromId: 'local_pane', place: 'fork', sourceBranch: 'feature/x', isSourceWorktree: true, mode: 'fix' },
+)
+/** The fork's transcript as it starts: the pane session's conversation, which opened with the #7 brief. */
+const CARRIED = [
+  { role: 'user' as const, text: TAKEN_7 },
+  { role: 'assistant' as const, text: 'Summary of #7 …' },
+]
+/** #7's own issue session, which another pane started an hour ago. */
+const MAPPED_7: Mapping = { sessionId: 'local_seven', title: '#7 Dark mode for the settings page', startedAt: NOW - 3_600_000, startedFrom: 'local_other', detached: true }
+
+test("a fork whose carried conversation opens with another issue's brief is the issue session of its own mapping only (B6-BEH-1)", async ($, on) => {
+  const { store, statuses } = project(on, { sessionId: 'local_fork', messages: CARRIED, stored: { [`session:${ROW_7}`]: MAPPED_7 } })
+  const clock = await started($, on)
+
+  // The fork's own first prompt is the hand-off for #42; the pane saves the mapping only once start_session answered.
+  await $.prompt.submit({ text: FORK_42, wait: false, origin: { kind: 'sdk' } })
+  await turn($, 't1', 'Summary …\n\nWhich archive format do you expect?')
+  await clock.settle()
+  // Never #7's: its issue session's record and line stay its own.
+  expect(store.has(`phase:${ROW_7}`)).toBe(false)
+  expect(statuses.filter(text => text !== undefined)).toHaveLength(0)
+
+  // The mapping lands: the next turn finds the fork by it, with its mode.
+  store.set(`session:${ROW_42}`, { sessionId: 'local_fork', title: TITLE_42, startedAt: NOW, startedFrom: 'local_pane', detached: false, mode: 'fix', place: 'fork' } satisfies Mapping)
+  await $.turn.start({ text: 'zip', turnId: 't2' })
+  await clock.settle()
+  await $.turn.complete({ answer: 'Plan …\n\nGo?', durationMs: 900, isAborted: false, turnId: 't2', reason: 'answer' })
+  await clock.settle()
+  expect(store.has(`phase:${ROW_7}`)).toBe(false)
+  expect(store.get(`phase:${ROW_42}`)).toMatchObject({ sessionId: 'local_fork', activity: 'waiting', ask: 'proposal' })
+  expect(statuses.at(-1)).toBe(`Issue #42 · acme/widgets${DE.statusFix}${DE.statusProposal}`)
+})
+
+test('a fork seen by its first turn alone is carried as well: the first message never names its issue (B6-BEH-1)', async ($, on) => {
+  const { store, statuses } = project(on, { sessionId: 'local_fork', messages: CARRIED, stored: { [`session:${ROW_7}`]: MAPPED_7 } })
+  const clock = await started($, on)
+
+  await $.turn.start({ text: FORK_42, turnId: 't1' })
+  await clock.settle()
+  await $.turn.complete({ answer: 'Plan …\n\nGo?', durationMs: 900, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.settle()
+  expect(store.has(`phase:${ROW_7}`)).toBe(false)
+  expect(statuses.filter(text => text !== undefined)).toHaveLength(0)
+})
+
+test('a fresh issue session whose transcript holds its own brief with a byte changed is no carried one: found by it (B6-BEH-1)', async ($, on) => {
+  const { store, statuses } = project(on, { sessionId: 'local_child', messages: [{ role: 'user', text: `${FORK_42}\n` }] })
+  const clock = await started($, on)
+
+  await $.turn.start({ text: FORK_42, turnId: 't1' })
+  await clock.settle()
+  await $.turn.complete({ answer: 'Plan …\n\nGo?', durationMs: 900, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.settle()
+  expect(store.get(`phase:${ROW_42}`)).toMatchObject({ sessionId: 'local_child', activity: 'waiting', ask: 'proposal' })
+  expect(statuses.at(-1)).toBe(`Issue #42 · acme/widgets${DE.statusFix}${DE.statusProposal}`)
+  expect(isSameHandOff(FORK_42, `${FORK_42}\n`)).toBe(true)
+  expect(isSameHandOff(FORK_42, TAKEN_7)).toBe(false)
+  expect(isSameHandOff(FORK_42, 'What is open here?')).toBe(false)
 })
 
 // E8: open beside ----------------------------------------------------------------------
@@ -561,17 +778,22 @@ test('an issue session files itself under Issues once, follows its issue rename 
   })
   const clock = await started($, on)
   await clock.advance(2_000)
-  // Nothing before the session's first record (its first turn's end).
-  expect(tools(mcp, 'list_groups', 'move_sessions')).toEqual([])
+  // Nothing before the session's first turn has ended (R6-RT-3), though its start wrote the first record already.
+  await $.turn.start({ text: '', turnId: 't1' })
+  await clock.advance(1_500)
+  expect(store.get(`phase:${ROW_42}`)).toMatchObject({ activity: 'working', turns: 0 })
+  expect(tools(mcp, 'list_sections', 'list_groups', 'move_sessions')).toEqual([])
 
-  await turn($, 't1', 'Summary …\n\nWhich archive format do you expect?')
+  await $.turn.complete({ answer: 'Summary …\n\nWhich archive format do you expect?', durationMs: 900, isAborted: false, turnId: 't1', reason: 'answer' })
   await clock.settle()
   const ended = store.get(`phase:${ROW_42}`) as PhaseRecord
   await clock.advance(1_000)
+  // The group made, the list asked again (another session may have made one at once, R6-RT-4), then the move.
   expect(tools(mcp, 'list_sections', 'list_groups', 'create_group', 'move_sessions', 'set_session_title', 'get_layout', 'set_unread')).toEqual([
     'list_sections',
     'list_groups',
     'create_group',
+    'list_groups',
     'move_sessions',
     'set_session_title',
     'get_layout',
@@ -675,6 +897,88 @@ test('a group the owner removed is never made again: the choice is forgotten and
   expect(store.has('sidebar:group')).toBe(false)
 })
 
+test('a group another issue session made a moment ago is no group the owner removed; two made at once end in one (R6-RT-4)', async ($, on) => {
+  let held: Map<string, unknown> | undefined
+  let groups = (): McpAnswer => {
+    // No "Issues" group when this list is read; another issue session makes one and stores it right after.
+    held?.set('sidebar:group', { id: 'grp_B', name: 'Issues', at: NOW + 3_600_000 })
+
+    return mcpText('[]')
+  }
+  const { store, mcp } = project(on, {
+    stored: { [`session:${ROW_42}`]: OWN, 'sidebar:choice': { file: true, at: 1 } },
+    mcp: sidebarDesktop({ self: {}, sections: CUSTOM_LIST, groups: () => groups(), views: [] }),
+  })
+  held = store
+  const clock = await started($, on)
+
+  await turn($, 't1', 'One.')
+  await clock.advance(1_000)
+  expect(tools(mcp, 'create_group', 'move_sessions')).toEqual([])
+  expect(store.get('sidebar:choice')).toMatchObject({ file: true })
+  expect(store.get('sidebar:group')).toMatchObject({ id: 'grp_B' })
+  // The next turn files into it.
+  groups = () => mcpText('[{"id":"grp_B","name":"Issues","order":0}]')
+  await turn($, 't2', 'Two.')
+  await clock.advance(1_000)
+  expect(mcp.some(call => call.tool === 'create_group')).toBe(false)
+  expect(mcp.find(call => call.tool === 'move_sessions')?.args).toEqual({ session_ids: ['self'], group_id: 'grp_B' })
+})
+
+test('two sessions that each made a group at once both file into the lowest-order one (R6-RT-4)', async ($, on) => {
+  let isMade = false
+  const answer = sidebarDesktop({
+    self: {},
+    sections: CUSTOM_LIST,
+    groups: () => mcpText(isMade ? '[{"id":"grp_0","name":"Issues","order":0},{"id":"grp_1","name":"Issues","order":1}]' : '[]'),
+    views: [],
+  })
+  const { store, mcp } = project(on, {
+    stored: { [`session:${ROW_42}`]: OWN, 'sidebar:choice': { file: true, at: 1 } },
+    mcp: call => {
+      if (call.tool === 'create_group') isMade = true
+
+      return answer(call)
+    },
+  })
+  const clock = await started($, on)
+
+  await turn($, 't1', 'One.')
+  await clock.advance(1_000)
+  expect(mcp.find(call => call.tool === 'move_sessions')?.args).toEqual({ session_ids: ['self'], group_id: 'grp_0' })
+  expect(store.get('sidebar:group')).toMatchObject({ id: 'grp_0' })
+})
+
+test("a sidebar stamp in flight when the next turn starts never writes the older state over the turn's (R6-RT-2)", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let holdOnce = false
+  const { store } = project(on, {
+    stored: { [`session:${ROW_42}`]: OWN, 'sidebar:choice': { file: true, at: 1 } },
+    // get_session self names no group: the window has not reported groups yet, so the tidy counts a try (a stamp).
+    mcp: sidebarDesktop({ self: { group: undefined }, sections: CUSTOM_LIST, groups: () => mcpText('[]'), views: [{ window: 'main' }] }),
+    // The next record write after the switch is slow: one host call held two seconds.
+    storeSetDelay: key => {
+      if (!holdOnce || !key.startsWith('phase:')) return undefined
+      holdOnce = false
+
+      return clock.sleep(2_000)
+    },
+  })
+  await $.session.start({ cwd: 'D:\\proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(3_000)
+
+  await turn($, 't1', 'Plan …\n\nGo?')
+  await clock.settle()
+  expect(store.get(`phase:${ROW_42}`)).toMatchObject({ activity: 'waiting', ask: 'proposal' })
+  // The tidy runs 400 ms later; its stamp's write is in flight when the owner's "go" starts turn t2.
+  holdOnce = true
+  await clock.advance(400)
+  await $.turn.start({ text: 'go', turnId: 't2' })
+  await clock.advance(2_000)
+  await clock.settle()
+  expect(store.get(`phase:${ROW_42}`)).toMatchObject({ activity: 'working', ask: 'none', fileTries: 1 })
+})
+
 test('with the choice off an issue session asks nothing of the sidebar; a later yes reaches it at its next turn', async ($, on) => {
   const { store, mcp } = project(on, {
     stored: { [`session:${ROW_42}`]: OWN, 'sidebar:choice': { file: false, at: 1 } },
@@ -701,7 +1005,11 @@ test('a session known by its brief alone files itself but is never retitled; the
   })
   const clock = await started($, on)
   await $.prompt.submit({ text: 'Issue Radar hand-off: acme/widgets#42 (from local_other)\n\nWork on GitHub issue #42.', wait: false, origin: { kind: 'sdk' } })
-  await turn($, 't1', 'One.')
+  // R6-RT-3: the tidy armed by the identification finds the record its first turn's start wrote, and waits for the end.
+  await $.turn.start({ text: '', turnId: 't1' })
+  await clock.advance(1_500)
+  expect(tools(mcp, 'list_sections', 'list_groups', 'create_group', 'move_sessions')).toEqual([])
+  await $.turn.complete({ answer: 'One.', durationMs: 900, isAborted: false, turnId: 't1', reason: 'answer' })
   await clock.advance(1_000)
   expect(mcp.filter(call => call.tool === 'move_sessions')).toHaveLength(1)
   expect(mcp.some(call => call.tool === 'set_session_title')).toBe(false)
@@ -721,6 +1029,35 @@ test("the spike reads the sidebar's layout over mcp alone and says what it found
   await started($, on)
   const text = await command($, 'issue-radar', 'spike')
   expect(text).toContain('sidebar (quiet, mcp only): sections pinned:builtin:none, sessions:builtin:custom; groups 1; get_layout views empty')
+  expect(checks).toHaveLength(0)
+})
+
+test('the spike measures the split in production order and a start with the cheapest options apart (S25, S23; B6-BEH-6)', async ($, on) => {
+  const { mcp, checks } = project(on, {
+    mcp: desktop({
+      get_window_layout: () => mcpText('{"main":{"sessionId":"local_pane"},"splits":[{"sessionId":"local_abc123"}]}'),
+      get_session: call => (call.args['session_id'] === 'local_abc123' ? mcpText('{"sessionId":"local_abc123","model":"claude-haiku-4-5","effort":"low"}') : undefined),
+    }),
+  })
+  await started($, on)
+  const text = await command($, 'issue-radar', 'spike')
+  expect(tools(mcp, 'start_session', 'open_session_in', 'detach_session', 'get_window_layout', 'close_split')).toEqual([
+    'start_session',
+    'open_session_in',
+    'detach_session',
+    'get_window_layout',
+    'close_split',
+    'start_session',
+    'detach_session',
+  ])
+  expect(mcp.find(call => call.tool === 'close_split')?.args).toEqual({ session_id: 'local_abc123' })
+  // The first start asks for nothing beyond V1's (S1); the second for the form's cheapest choices (S23).
+  expect(starts(mcp)[0]?.args['model']).toBeUndefined()
+  expect(starts(mcp)[1]?.args).toMatchObject({ model: 'haiku', effort: 'low', use_worktree: true })
+  expect(text).toContain('open_session_in split: shown')
+  expect(text).toContain('get_window_layout (quiet, via mcp): keys main, splits; names the session: yes')
+  expect(text).toContain('start_session with model haiku, effort low (S23) via mcp: session id local_abc123; detached; get_session (quiet, mcp only): model claude-haiku-4-5, effort low')
+  // Its reads stay quiet over mcp alone: no permission check is asked.
   expect(checks).toHaveLength(0)
 })
 
@@ -780,6 +1117,22 @@ test('the brief: every field left out keeps it byte-identical; the fix, shared a
   // A fork from a plain checkout shares the folder: the shared rule (the form never offers it).
   expect(renderBrief(INPUT, { place: 'fork', sourceBranch: 'main' })).toContain('never create, switch or check out a branch')
 
+  // B6-BEH-2: a shared checkout on the default branch, or on one not known, holds no work: no edit, no commit, no push.
+  for (const mode of ['fix', 'understand'] as const) {
+    for (const sourceBranch of ['main', '']) {
+      const stop = renderBrief(INPUT, { mode, place: 'shared', root: 'D:/proj', sourceBranch })
+      expect(stop).toContain('never edit files there, commit to or push that branch')
+      expect(stop).toContain('recommend that I start this issue again with its own worktree')
+      expect(stop).not.toContain('push the branch')
+      expect(stop).not.toContain('commit locally')
+      expect(stop).not.toContain(PUSH_LINE)
+      expect(stop).not.toContain('implement the proposal in this session and')
+      expect(stop).not.toContain('work on `main` only')
+    }
+  }
+  expect(renderBrief(INPUT, { place: 'shared', sourceBranch: 'main' })).toContain('which is on `main`, the default branch')
+  expect(renderBrief(INPUT, { place: 'fork', sourceBranch: '' })).toContain('a branch that is not known (it may be `main`, the default branch)')
+
   const owned = renderBrief(INPUT, { guidance: 'Small PRs.\r\nRun the tests.', note: 'Only the exporter.' })
   expect(owned.endsWith('<owner-guidance>\n> Small PRs.\n> Run the tests.\n</owner-guidance>\n\nThe owner\'s note for this issue, given when starting this session:\n<owner-note>\n> Only the exporter.\n</owner-note>')).toBe(true)
 })
@@ -806,6 +1159,18 @@ test('the form helpers: models, efforts, the cleaning, secrets, git facts, the f
   expect(forkState(gate)).toBe('ok')
   expect(forkState({ ...gate, running: { since: NOW - 60_000 } })).toBe('busy')
   expect(forkState({ ...gate, running: { since: NOW - 31 * 60_000 } })).toBe('ok')
+  // R6-RT-5: a turn this module heard start runs however long it takes; only the state's note after a reload goes stale.
+  expect(forkState({ ...gate, running: { since: NOW - 31 * 60_000, isHeard: true } })).toBe('busy')
+  // B6-BEH-2: only a branch of its own may be shared.
+  expect(canShareBranch('feature/y', 'main')).toBe(true)
+  expect(canShareBranch('Main', 'main')).toBe(false)
+  expect(canShareBranch('', 'main')).toBe(false)
+  expect(canShareBranch('HEAD', 'main')).toBe(false)
+  expect(canShareBranch('feature/y', '')).toBe(false)
+  // B6-BEH-3: an emptied field keeps the kept note; text typed since wins.
+  expect(noteOf('', 'Kept.')).toBe('Kept.')
+  expect(noteOf(undefined, 'Kept.')).toBe('Kept.')
+  expect(noteOf('  New. ', 'Kept.')).toBe('New.')
   expect(forkState({ ...gate, isWorktree: false })).toBe('none')
   expect(forkState({ ...gate, turns: 0 })).toBe('none')
   expect(forkState({ ...gate, isIssueSession: true })).toBe('none')
@@ -845,6 +1210,9 @@ test('the sidebar helpers read the app defensively: unknown is never empty', () 
   expect(asSidebarChoice({ file: true })).toBe('on')
   expect(asSidebarChoice({ file: false })).toBe('off')
   expect(asSidebarChoice(undefined)).toBe('unasked')
+  expect(storedGroup({ id: 'g1', name: 'Issues', at: 5 })).toEqual({ id: 'g1', at: 5 })
+  expect(storedGroup({ id: 'g1' })).toEqual({ id: 'g1', at: 0 })
+  expect(storedGroup({ id: '' })).toBeNull()
   const entry = entryOf({ sessionId: 's', group: null, pinned: true, model: 'claude-haiku', effort: 'LOW' })
   expect(entry).toMatchObject({ group: null, pinned: true, model: 'claude-haiku', effort: 'low' })
   expect(entryOf({ sessionId: 's' })?.group).toBeUndefined()
